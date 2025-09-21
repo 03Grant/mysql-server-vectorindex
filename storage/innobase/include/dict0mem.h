@@ -110,9 +110,11 @@ constexpr uint32_t DICT_VIRTUAL = 128;
 constexpr uint32_t DICT_SDI = 256;
 /** Multi-value index */
 constexpr uint32_t DICT_MULTI_VALUE = 512;
+/** Vector index; can't be combined with the other flags */
+constexpr uint32_t DICT_VECINDEX = 1024;
 
 /** number of bits used for SYS_INDEXES.TYPE */
-constexpr uint32_t DICT_IT_BITS = 10;
+constexpr uint32_t DICT_IT_BITS = 11;
 /** @} */
 
 #if 0                         /* not implemented, retained for history */
@@ -261,7 +263,7 @@ ROW_FORMAT=REDUNDANT.  InnoDB engines do not check these flags
 for unknown bits in order to protect backward incompatibility. */
 /** @{ */
 /** Total number of bits in table->flags2. */
-constexpr uint32_t DICT_TF2_BITS = 11;
+constexpr uint32_t DICT_TF2_BITS = 12;
 constexpr uint32_t DICT_TF2_UNUSED_BIT_MASK = ~0U << DICT_TF2_BITS;
 constexpr uint32_t DICT_TF2_BIT_MASK = ~DICT_TF2_UNUSED_BIT_MASK;
 
@@ -300,6 +302,9 @@ constexpr uint32_t DICT_TF2_AUX = 512;
 /** Table is opened by resurrected trx during crash recovery. */
 constexpr uint32_t DICT_TF2_RESURRECT_PREPARED = 1024;
 /** @} */
+
+/** The table has a vector index */
+constexpr uint32_t DICT_TF2_VECINDEX = 2048;
 
 /** Tables could be chained together with Foreign key constraint. When
 first load the parent table, we would load all of its descedents.
@@ -1028,6 +1033,9 @@ namespace dd {
 class Spatial_reference_system;
 }
 
+struct vec_index_ctx_t;
+struct vec_params_t;
+
 #ifdef UNIV_DEBUG
 /** Value of dict_index_t::magic_n */
 constexpr uint32_t DICT_INDEX_MAGIC_N = 76789786;
@@ -1224,6 +1232,12 @@ struct dict_index_t {
 
   /** tracking all R-Tree search cursors */
   rtr_info_track_t *rtr_track;
+
+  /** vector index context */
+  vec_index_ctx_t*  vec_runtime{nullptr};
+  
+  /** vector index parameters */
+  vec_params_t* vec_params{nullptr};
 
   /** id of the transaction that created this index, or 0 if the index existed
   when InnoDB was started up */

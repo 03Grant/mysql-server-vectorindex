@@ -108,7 +108,8 @@ enum ha_key_alg {
   HA_KEY_ALG_BTREE = 1,   /* B-tree. */
   HA_KEY_ALG_RTREE = 2,   /* R-tree, for spatial searches */
   HA_KEY_ALG_HASH = 3,    /* HASH keys (HEAP, NDB). */
-  HA_KEY_ALG_FULLTEXT = 4 /* FULLTEXT. */
+  HA_KEY_ALG_FULLTEXT = 4, /* FULLTEXT. */
+  HA_KEY_ALG_VECINDEX = 5    /* VECTOR. */
 };
 
 /* Storage media types */
@@ -517,11 +518,14 @@ enum ha_base_keytype {
 #define HA_USES_COMMENT (1 << 12)
 /** Key was automatically created to support Foreign Key constraint. */
 #define HA_GENERATED_KEY (1 << 13)
+/** Vector (VECINDEX) key.*/
+#define HA_VECINDEX (1 << 30)
 
 /* The combination of the above can be used for key type comparison. */
 #define HA_KEYFLAG_MASK                                                       \
   (HA_NOSAME | HA_PACK_KEY | HA_AUTO_KEY | HA_BINARY_PACK_KEY | HA_FULLTEXT | \
-   HA_UNIQUE_CHECK | HA_SPATIAL | HA_NULL_ARE_EQUAL | HA_GENERATED_KEY)
+   HA_UNIQUE_CHECK | HA_SPATIAL | HA_NULL_ARE_EQUAL | HA_GENERATED_KEY |     \
+   HA_VECINDEX)
 
 /** Fulltext index uses [pre]parser */
 #define HA_USES_PARSER (1 << 14)

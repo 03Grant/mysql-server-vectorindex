@@ -5085,8 +5085,9 @@ static bool prepare_key_column(THD *thd, HA_CREATE_INFO *create_info,
     return true;
   }
 
-  // VECTOR columns cannot be used as keys
-  if (sql_field->sql_type == MYSQL_TYPE_VECTOR) {
+  // VECTOR columns cannot be used as keys unless paired with a vector index
+  if (sql_field->sql_type == MYSQL_TYPE_VECTOR &&
+      key->type != KEYTYPE_VECINDEX) {
     my_error(ER_NON_SCALAR_USED_AS_KEY, MYF(0), column->get_field_name());
     return true;
   }
@@ -6450,7 +6451,7 @@ const dd::Index *find_fk_parent_key(THD *thd, handlerton *hton,
   for (const dd::Index *idx : parent_table_def->indexes()) {
     // We can't use FULLTEXT or SPATIAL indexes.
     if (idx->type() == dd::Index::IT_FULLTEXT ||
-        idx->type() == dd::Index::IT_SPATIAL)
+        idx->type() == dd::Index::IT_SPATIAL || idx->type() == dd::Index::IT_VECINDEX)
       continue;
 
     if (hton->foreign_keys_flags &
@@ -6534,7 +6535,7 @@ static const dd::Index *find_fk_supporting_key(handlerton *hton,
   for (const dd::Index *idx : table_def->indexes()) {
     // We can't use FULLTEXT or SPATIAL indexes.
     if (idx->type() == dd::Index::IT_FULLTEXT ||
-        idx->type() == dd::Index::IT_SPATIAL)
+        idx->type() == dd::Index::IT_SPATIAL || idx->type() == dd::Index::IT_VECINDEX)
       continue;
 
     // We also can't use hidden indexes.
@@ -7610,6 +7611,17 @@ static bool prepare_key(
       }
       key_info->flags |= HA_SPATIAL;
       break;
+    case KEYTYPE_VECINDEX:
+      if (!(file->ha_table_flags() & HA_CAN_VECINDEX)) {
+        my_error(ER_TABLE_CANT_HANDLE_VECINDEX, MYF(0));
+        return true;
+      }
+      if (key->columns.size() != 1) {
+        my_error(ER_TOO_MANY_KEY_PARTS, MYF(0), 1);
+        return true;
+      }
+      key_info->flags |= HA_VECINDEX;
+      break;
     case KEYTYPE_PRIMARY:
     case KEYTYPE_UNIQUE:
       key_info->flags |= HA_NOSAME;
@@ -7644,6 +7656,9 @@ static bool prepare_key(
   } else if (key_info->flags & HA_FULLTEXT) {
     assert(!key->key_create_info.is_algorithm_explicit);
     key_info->algorithm = HA_KEY_ALG_FULLTEXT;
+  } else if (key_info->flags & HA_VECINDEX) {
+    assert(!key->key_create_info.is_algorithm_explicit);
+    key_info->algorithm = HA_KEY_ALG_VECINDEX;
   } else {
     if (key->key_create_info.is_algorithm_explicit) {
       if (key->key_create_info.algorithm != HA_KEY_ALG_RTREE) {
@@ -7710,7 +7725,7 @@ static bool prepare_key(
   key_info->actual_flags = key_info->flags;
 
   if (key_info->key_length > file->max_key_length() &&
-      key->type != KEYTYPE_FULLTEXT) {
+      key->type != KEYTYPE_FULLTEXT && key->type != KEYTYPE_VECINDEX) {
     my_error(ER_TOO_LONG_KEY, MYF(0), file->max_key_length());
     if (thd->is_error())  // May be silenced - see Bug#20629014
       return true;
@@ -10070,6 +10085,28 @@ bool mysql_create_table_no_lock(THD *thd, const char *db,
   }
 
   if (thd->is_plugin_fake_ddl()) no_ha_table = true;
+
+  // {
+  //   const Mem_root_array<Key_spec*>& keys = alter_info->key_list;
+  //   for (size_t i = 0; i < keys.size(); ++i) {
+  //     Key_spec* ks = keys.at(i);
+  //     if (ks == nullptr) continue;
+
+  //     if (ks->type == KEYTYPE_VECINDEX) {
+  //       const KEY_CREATE_INFO* kci = &ks->key_create_info;
+  //       const LEX_CSTRING json = (kci ? kci->comment : LEX_CSTRING{NullS, 0});
+  //       push_warning_printf(thd, Sql_condition::SL_NOTE, ER_NOT_SUPPORTED_YET,
+  //                           "Grant He want to create vecindex: %.*s",
+  //                           (int)(json.length ? json.length : 0),
+  //                           (json.str ? json.str : ""));
+  //       sql_print_information("Grant He want to create vecindex: %.*s",
+  //                             (int)(json.length ? json.length : 0),
+  //                             (json.str ? json.str : ""));
+  //       my_error(ER_NOT_SUPPORTED_YET, MYF(0), "VECINDEX");
+  //       return true;
+  //     }
+  //   }
+  // }
 
   return create_table_impl(
       thd, *schema, db, table_name, table_name, path, create_info, alter_info,

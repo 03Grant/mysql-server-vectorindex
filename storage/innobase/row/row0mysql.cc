@@ -81,6 +81,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ut0cpu_cache.h"
 #include "ut0new.h"
 
+#include "storage/innobase/vec/vec_index_adapter.h"
+#include "storage/innobase/vec/vec_aux_tables.h"
+
 #include "current_thd.h"
 #include "my_dbug.h"
 #include "my_io.h"
@@ -2893,6 +2896,7 @@ dberr_t row_create_index_for_mysql(
   index_name = mem_strdup(index->name);
 
   auto is_fts = (index->type == DICT_FTS);
+  auto is_vec = (index->type == DICT_VECINDEX);
 
   if (handler != nullptr && handler->is_intrinsic()) {
     table = handler;
@@ -2990,6 +2994,20 @@ dberr_t row_create_index_for_mysql(
       dict_index_remove_from_cache(table, index);
       dict_sys_mutex_exit();
     }
+  }
+
+  /* Create the index specific vector index and table. */
+  if (err == DB_SUCCESS && is_vec) {
+    dict_index_t *idx;
+
+    idx = dict_table_get_index_on_name(table, index_name);
+
+    err = vec_create_index_low(idx);
+    ib::warn() << "Ready to create aux table . ";
+    ut_ad(idx);
+    ib::warn() << "Ready to create aux table .. ";
+    err = vec_create_index_tables_low(trx, idx, table->name.m_name, table->id);
+    ib::warn() << "Successfully created aux table. ";
   }
 
   /* Create the index specific FTS auxiliary tables. */

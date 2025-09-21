@@ -386,6 +386,11 @@ enum class SelectExecutedIn : bool { kPrimaryEngine, kSecondaryEngine };
  */
 #define HA_BINLOG_FLAGS (HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE)
 
+/*
+  Does the storage engine support vector indexes.
+*/
+#define HA_CAN_VECINDEX (1LL << 40)
+
 /**
   The handler supports read before write removal optimization
 
@@ -3362,6 +3367,9 @@ struct HA_CREATE_INFO {
   PT_create_external_file_format *file_format{nullptr};
   PT_create_external_files *external_files{nullptr};
   LEX_CSTRING auto_refresh_event_source = NULL_CSTR;
+
+  // GrantHe: for the parameters of vector index.
+  LEX_CSTRING vecindex_json = NULL_CSTR; 
 
   // Position in query text where column definitions end and table options start
   size_t create_table_columns_end_pos{0};

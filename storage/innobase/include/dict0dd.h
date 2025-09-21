@@ -1375,6 +1375,13 @@ static inline const char *dd_tablespace_get_filename(
   return ((*dd_space->files().begin())->filename().c_str());
 }
 
+/** Create dd table for vec index table
+@param[in]      parent_table    parent table of vec table
+@param[in,out]  table           vec table
+@return true on success, false on failure */
+bool dd_create_vec_index_table(const dict_table_t* parent_table,
+                               dict_table_t* table);
+
 /** Check if the InnoDB table is consistent with dd::Table
 @tparam         Table           dd::Table or dd::Partition
 @param[in]      table                   InnoDB table

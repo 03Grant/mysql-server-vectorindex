@@ -267,7 +267,16 @@ SET(INNOBASE_SOURCES
   ut/ut0vec.cc
   ut/ut0wqueue.cc)
 
-# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=98753
+
+option(WITH_VECINDEX "Enable InnoDB Vector Index (FAISS)" ON)
+
+# only add vec if faiss is also enabled at top level and external/faiss exists
+if (WITH_VECINDEX AND WITH_FAISS)
+  add_subdirectory(vec)
+endif()
+
+
+  # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=98753
 IF(MY_COMPILER_IS_GNU)
   ADD_COMPILE_FLAGS(
     pars/pars0grm.cc
@@ -353,6 +362,11 @@ MYSQL_ADD_PLUGIN(innobase
   MODULE_OUTPUT_NAME ha_innodb
   LINK_LIBRARIES sql_dd sql_gis ext::zlib ext::lz4 ${NUMA_LIBRARY}
                  extra::rapidjson library_mysys)
+
+# if vecindex is enabled and the lib was built, append it to innobase plugin
+if (WITH_VECINDEX AND TARGET innobase_vec)
+  target_link_libraries(innobase innobase_vec)
+endif()
 
 # On linux: /usr/include/stdio.h:#define BUFSIZ 8192
 # On Solaris: /usr/include/iso/stdio_iso.h:#define    BUFSIZ  1024

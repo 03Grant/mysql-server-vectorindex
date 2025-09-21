@@ -53,6 +53,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "log0chkp.h"
 #include "log0write.h"
 #include "my_dbug.h"
+#include "vec/vec_params.h"
 
 #ifndef UNIV_HOTBACKUP
 #include "clone0api.h"
@@ -2473,6 +2474,13 @@ dberr_t dict_index_add_to_cache_w_vcol(dict_table_t *table, dict_index_t *index,
     new_index = dict_index_build_internal_clust(table, index);
   } else {
     new_index = dict_index_build_internal_non_clust(table, index);
+  }
+
+  if (index->vec_params != nullptr) {
+    auto *vec = static_cast<vec_params_t *>(
+        mem_heap_zalloc(new_index->heap, sizeof(vec_params_t)));
+    *vec = *index->vec_params;
+    new_index->vec_params = vec;
   }
 
   /* Set the n_fields value in new_index to the actual defined

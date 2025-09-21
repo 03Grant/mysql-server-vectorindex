@@ -200,6 +200,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "univ.i"
 #endif /* !UNIV_HOTBACKUP */
 
+#include "storage/innobase/vec/vec_params.h"
+#include "storage/innobase/vec/vec_aux_tables.h"
+
+#include "sql/field.h"
+
 #include "log0files_io.h"
 
 #include "sql-common/json_binary.h"
@@ -2964,7 +2969,7 @@ ha_innobase::ha_innobase(handlerton *hton, TABLE_SHARE *table_arg)
           HA_ATTACHABLE_TRX_COMPATIBLE | HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN |
           HA_DESCENDING_INDEX | HA_MULTI_VALUED_KEY_SUPPORT |
           HA_BLOB_PARTIAL_UPDATE | HA_SUPPORTS_GEOGRAPHIC_GEOMETRY_COLUMN |
-          HA_SUPPORTS_DEFAULT_EXPRESSION),
+          HA_SUPPORTS_DEFAULT_EXPRESSION | HA_CAN_VECINDEX),
       m_start_of_scan(),
       m_stored_select_lock_type(LOCK_NONE_UNSET),
       m_mysql_has_locked() {}
@@ -12197,6 +12202,7 @@ inline int create_index(
   uint32_t srid = 0;
   bool has_srid = false;
   bool multi_val_idx = false;
+  vec_params_t vec_param{};
 
   DBUG_TRACE;
 
@@ -12214,6 +12220,8 @@ inline int create_index(
     ind_type = DICT_SPATIAL;
   } else if (key->flags & HA_FULLTEXT) {
     ind_type = DICT_FTS;
+  } else if (key->flags & HA_VECINDEX){
+    ind_type = DICT_VECINDEX;
   }
 
   if (ind_type == DICT_SPATIAL) {
@@ -12233,6 +12241,93 @@ inline int create_index(
     has_srid = col.srs_id().has_value();
     srid = has_srid ? col.srs_id().value() : 0;
   }
+
+  // get parameters and do some checks for vector index
+  if (ind_type == DICT_VECINDEX) {
+    ulint dd_index_num = key_num + ((form->s->primary_key == MAX_KEY) ? 1 : 0);
+
+    const auto *dd_index_auto = dd_table->indexes()[dd_index_num];
+
+    const dd::Index *dd_index = get_my_dd_index(dd_index_auto);
+    ut_ad(dd_index->name() == key->name);
+
+    const dd::String_type &cmt = dd_index->comment();
+    std::string vec_json =
+        cmt.empty() ? std::string() : std::string(cmt.c_str());
+
+    std::string why;
+    dberr_t pe = vec_params_from_string(vec_json, &vec_param, &why);
+    if (pe != DB_SUCCESS) {
+      ib::warn() << "parameters are not valid! ->" << why.c_str();
+      return DB_ERROR;
+    }
+
+    const uint64_t expected_length =
+        static_cast<uint64_t>(vec_param.dim) * sizeof(float);
+
+    auto signal_vec_error = [&](const std::string &detail,
+                                const char *what, size_t size) -> int {
+      ib::warn() << detail;
+      my_error(ER_DATA_INCOMPATIBLE_WITH_VECTOR, MYF(0), what, size);
+      return DB_ERROR;
+    };
+
+    if (key->user_defined_key_parts != 1 || key->key_part == nullptr ||
+        key->key_part->field == nullptr) {
+      std::ostringstream msg;
+      msg << "Vector index definition is invalid for index '" << key->name
+          << "': missing column definition for length validation.";
+      return signal_vec_error(msg.str(), "column-meta", 0U);
+    }
+
+    Field *vector_field = key->key_part[0].field;
+    const enum_field_types real_type = vector_field->real_type();
+    const enum_field_types field_type = vector_field->type();
+
+    const bool is_vector_type = (real_type == MYSQL_TYPE_VECTOR);
+    const bool is_binary_string =
+        (real_type == MYSQL_TYPE_STRING || real_type == MYSQL_TYPE_VAR_STRING ||
+         real_type == MYSQL_TYPE_VARCHAR) &&
+        vector_field->binary();
+
+    if (!is_vector_type && !is_binary_string) {
+      std::ostringstream msg;
+      msg << "Vector index column '" << vector_field->field_name
+          << "' uses unsupported data type " << field_type
+          << " (real type " << real_type << ") for vector validation.";
+      return signal_vec_error(msg.str(), "column-type",
+                              static_cast<size_t>(real_type));
+    }
+
+    uint64_t actual_length = 0;
+    if (is_vector_type) {
+      auto *vector_column = static_cast<Field_vector *>(vector_field);
+      const uint32_t column_dim = vector_column->get_max_dimensions();
+      if (column_dim == UINT32_MAX) {
+        std::ostringstream msg;
+        msg << "Vector column '" << vector_field->field_name << "' length "
+            << vector_column->field_length
+            << " is not aligned to sizeof(float).";
+        return signal_vec_error(msg.str(), "column-bytes",
+                                static_cast<size_t>(vector_column->field_length));
+      }
+      actual_length = Field_vector::dimension_bytes(column_dim);
+    } else {
+      actual_length = vector_field->field_length;
+    }
+
+    if (expected_length != actual_length) {
+      std::ostringstream msg;
+      msg << "Vector column '" << vector_field->field_name << "' length "
+          << actual_length << " bytes does not match expected "
+          << expected_length << " bytes (dim=" << vec_param.dim << ")";
+      return signal_vec_error(msg.str(), "column-bytes",
+                              static_cast<size_t>(actual_length));
+    }
+
+    ib::warn() << "Vector index parameters are valid.";
+  }
+
 
   if (ind_type != 0) {
     index = dict_mem_index_create(table_name, key->name, 0, ind_type,
@@ -12256,6 +12351,13 @@ inline int create_index(
       index->srid_is_valid = has_srid;
       index->srid = srid;
       index->rtr_srs.reset(fetch_srs(index->srid));
+    }
+
+    if (ind_type == DICT_VECINDEX){
+      auto* p = static_cast<vec_params_t*>(
+          mem_heap_zalloc(index->heap, sizeof(vec_params_t)));
+      *p = vec_param;                 
+      index->vec_params = p;
     }
 
     return convert_error_code_to_mysql(
@@ -13418,7 +13520,6 @@ bool create_table_info_t::innobase_table_flags() {
   /* Check if there are any FTS indexes defined on this table. */
   for (uint i = 0; i < m_form->s->keys; i++) {
     const KEY *key = &m_form->key_info[i];
-
     if (key->flags & HA_FULLTEXT) {
       m_flags2 |= DICT_TF2_FTS;
 
@@ -13435,6 +13536,12 @@ bool create_table_info_t::innobase_table_flags() {
     } else if (key->flags & HA_SPATIAL) {
       assert(~m_create_info->options &
              (HA_LEX_CREATE_TMP_TABLE | HA_LEX_CREATE_INTERNAL_TMP_TABLE));
+    } else if (key->flags & HA_VECINDEX) {
+      m_flags2 |= DICT_TF2_VECINDEX;
+      if (is_temp) {
+        my_error(ER_INNODB_NO_FT_TEMP_TABLE, MYF(0));
+        return false;
+      }
     }
 
     if (innobase_strcasecmp(key->name, FTS_DOC_ID_INDEX_NAME)) {
@@ -14083,6 +14190,9 @@ int create_table_info_t::create_table(const dd::Table *dd_table,
     }
   }
 
+  // Create the ancillary tables for vector index if needed
+  // TODO:  Need a DICT_TF2_VEC and DICT_TF2_VEC_ADD_TABLE
+
   /* Create the ancillary tables that are common to all FTS indexes on
   this table. */
   if (m_flags2 & (DICT_TF2_FTS | DICT_TF2_FTS_ADD_DOC_ID)) {
@@ -14347,6 +14457,25 @@ int create_table_info_t::create_table_update_global_dd(Table *dd_table) {
     ut_d(bool ret =) fts_create_common_dd_tables(m_table);
     ut_ad(ret);
     fts_create_index_dd_tables(m_table);
+  }
+
+  ib::warn() << "vec_create_index_dd_tables " << m_table_name
+               << " in data dictionary.";
+               
+  if(m_flags2 & DICT_TF2_VECINDEX) {
+    ib::warn() << "m_flags2 & DICT_TF2_VECINDEX True ";
+  }else
+    ib::warn() << "m_flags2 & DICT_TF2_VECINDEX False ";
+
+
+  if (m_flags2 & DICT_TF2_VECINDEX) {
+    ib::warn() << "Create vector index data dictionary tables for "
+                 << m_table_name;  
+
+    dberr_t err = vec_create_index_dd_tables(m_table);
+    if (err != DB_SUCCESS) {
+      return convert_error_code_to_mysql(err, 0, nullptr);
+    }
   }
 
   ut_ad(dd_table_match(m_table, dd_table));
@@ -15091,6 +15220,7 @@ int ha_innobase::get_extra_columns_and_keys(const HA_CREATE_INFO *,
           case dd::Index::IT_MULTIPLE:
             continue;
           case dd::Index::IT_FULLTEXT:
+          case dd::Index::IT_VECINDEX:
           case dd::Index::IT_SPATIAL:
             ut_d(ut_error);
         }
@@ -15098,6 +15228,12 @@ int ha_innobase::get_extra_columns_and_keys(const HA_CREATE_INFO *,
       case dd::Index::IA_FULLTEXT:
         if (i->type() == dd::Index::IT_FULLTEXT) {
           has_fulltext = true;
+          continue;
+        }
+        ut_d(ut_error);
+        ut_o(break);
+      case dd::Index::IA_VECINDEX:
+        if (i->type() == dd::Index::IT_VECINDEX) {
           continue;
         }
         ut_d(ut_error);
@@ -15127,6 +15263,7 @@ int ha_innobase::get_extra_columns_and_keys(const HA_CREATE_INFO *,
           }
           [[fallthrough]];
         case dd::Index::IT_MULTIPLE:
+        case dd::Index::IT_VECINDEX:
         case dd::Index::IT_FULLTEXT:
         case dd::Index::IT_SPATIAL:
           my_error(ER_INNODB_FT_WRONG_DOCID_INDEX, MYF(0),

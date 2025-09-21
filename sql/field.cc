@@ -9054,6 +9054,8 @@ uint32 calc_key_length(enum_field_types sql_type, uint32 length,
     case MYSQL_TYPE_BIT:
       return length / 8 + (length & 7 ? 1 : 0);
       break;
+    case MYSQL_TYPE_VECTOR:
+      return length;
     case MYSQL_TYPE_NEWDECIMAL:
       precision = std::min<uint>(
           my_decimal_length_to_precision(length, decimals, is_unsigned),

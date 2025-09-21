@@ -1841,7 +1841,7 @@ static bool setup_index(keytype key_type, const LEX_STRING name,
     PT_key_part_specification *kp;
     while ((kp = li++)) {
       if (kp->is_explicit()) {
-        my_error(ER_WRONG_USAGE, MYF(0), "spatial/fulltext/hash index",
+        my_error(ER_WRONG_USAGE, MYF(0), "spatial/fulltext/hash/vector index",
                  "explicit index order");
         return true;
       }

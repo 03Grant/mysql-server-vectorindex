@@ -536,6 +536,20 @@ IF(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY)
   SET(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY OFF CACHE INTERNAL "" FORCE)
 ENDIF()
 
+option(WITH_FAISS "Build FAISS for InnoDB VECINDEX" ON)
+
+if (WITH_FAISS)
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)       # 先走 CPU 流程
+  set(FAISS_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+  # set(BLA_VENDOR "OpenBLAS" CACHE STRING "" FORCE)
+  # set(BLAS_LIBRARIES "/usr/lib/x86_64-linux-gnu/libopenblas.so" CACHE STRING "" FORCE)
+
+  # submodule add external/faiss
+  add_subdirectory(external/faiss)
+endif()
+
 # Ninja only: List of available pools.
 SET_PROPERTY(GLOBAL PROPERTY JOB_POOLS one_job=1)
 

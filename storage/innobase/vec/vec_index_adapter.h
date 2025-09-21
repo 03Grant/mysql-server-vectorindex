@@ -1,0 +1,33 @@
+// vec_index_adapter.h
+#pragma once
+#include <cstddef>
+#include <memory>
+#include "vec_faiss_includes.h"
+#include "vec_params.h"
+#include "univ.i" 
+#include "db0err.h"
+
+struct vec_index_ctx_t;
+struct dict_index_t;
+
+dberr_t vec_create_index_low(dict_index_t* idx);
+
+// 创建/销毁（只 new，不加向量）
+std::unique_ptr<vec_index_ctx_t> vec_create(const vec_params_t& p);
+
+// Drop some index in the context(maybe because of index merge), drop in_mem_index is not allowed unless allow_drop_mutable is true.
+// I don't think we need to drop in_mem_index at any time.
+bool vec_drop_index(vec_index_ctx_t& ctx, size_t seg_idx, bool allow_drop_mutable=false);
+
+
+void vec_destroy(vec_index_ctx_t* ctx);
+
+// 最小检索/插入（后面你再接入 InnoDB 行数据）
+int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   // 添加 n 向量
+
+int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const faiss::idx_t* ids, size_t n);
+
+int vec_search(vec_index_ctx_t& ctx, const float* q, size_t nq,
+           size_t k, float* distances, faiss::idx_t* labels);                   // 召回
+
+
