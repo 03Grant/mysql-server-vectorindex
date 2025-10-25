@@ -6970,7 +6970,7 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
     vec_dd_add_pk_element(dd_pk, dd_cols[0], /*prefix*/0, /*asc*/true);
   } else {
     // 显式 PK：逐列
-    for (ulint i = 0; i < clust->n_fields; ++i) {
+    for (ulint i = 0; i < clust->n_uniq; ++i) {
       const dict_field_t* f = clust->get_field(i);
       const char*   name = f->name;
       // 在 dd_cols 里找到同名列指针（我们建表时列名一致）

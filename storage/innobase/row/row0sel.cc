@@ -4482,6 +4482,10 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
     return DB_END_OF_INDEX;
   }
 
+  if (dict_index_is_vector(prebuilt->index)) {
+    return DB_END_OF_INDEX;
+  }
+
 #ifdef UNIV_DEBUG
   {
     btrsea_sync_check check(trx->has_search_latch);

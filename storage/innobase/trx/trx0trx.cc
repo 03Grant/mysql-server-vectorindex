@@ -71,6 +71,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "mysql/plugin.h"
 #include "sql/clone_handler.h"
 
+#include "storage/innobase/vec/vec_txn_buf.h"
+#include "storage/innobase/vec/vec_aux_tables.h"
+#include "storage/innobase/vec/vec_ingest.h"
+
+
 static const ulint MAX_DETAILED_ERROR_LEN = 256;
 
 /** Set of table_id */
@@ -2139,6 +2144,18 @@ void trx_commit_low(trx_t *trx, mtr_t *mtr) {
       ut_error;
     }
   }
+
+  if (vec_trx_has_work(trx) && trx->undo_no != 0 &&
+    trx->lock.que_state != TRX_QUE_ROLLING_BACK) {
+    dberr_t err = vec_on_trx_commit(trx);
+    if (err != DB_SUCCESS) {
+        trx->error_state = err;
+        // fall through so the normal error handling aborts the commit
+        ib::warn() << "VECINDEX: Failed to commit vector index changes";
+        ut_error;
+    }
+  }
+
 
   bool serialised;
 

@@ -3602,7 +3602,7 @@ static inline void row_ins_get_row_from_query_block(
   ut_ad(node->state == INS_NODE_INSERT_ENTRIES);
 
   while (node->index != nullptr) {
-    if (node->index->type != DICT_FTS) {
+    if (node->index->type != DICT_FTS && node->index->type != DICT_VECINDEX) {
       err = row_ins_index_entry_step(node, thr);
 
       switch (err) {

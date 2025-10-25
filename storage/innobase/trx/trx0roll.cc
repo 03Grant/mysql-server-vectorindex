@@ -55,6 +55,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0trx.h"
 #include "trx0undo.h"
 #include "usr0sess.h"
+#include "vec_ingest.h"
 
 #include "current_thd.h"
 
@@ -314,6 +315,9 @@ dberr_t trx_rollback_last_sql_stat_for_mysql(
 
       if (trx->fts_trx != nullptr) {
         fts_savepoint_rollback_last_stmt(trx);
+      }
+      if (vec_trx_has_work(trx)) {
+        vec_on_trx_rollback(trx);
       }
 
       /* The following call should not be needed,

@@ -6,6 +6,9 @@ add_library(innobase_vec STATIC
   vec_builder.cc
   vec_aux_tables.cc
   vec_id_alloc.cc
+  vec_txn_buf.cc
+  vec_ingest.cc
+  vec_sql.cc
 )
 
 # only contain innobase and faiss headers

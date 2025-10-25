@@ -10436,6 +10436,8 @@ OBSOLETE_ER_EXTERNAL_UNSUPPORTED_INDEX_ALGORITHM
 ER_TP_CANNOT_DISABLE_MTL_WITH_DL
   eng "The variable thread_pool_max_transactions_limit cannot be set to 0 when thread_pool_dedicated_listernes is ON."
 
+ER_TABLE_CANT_HANDLE_VECINDEX
+  eng "This table can't build vector index."
 #
 # End of 8.1+ (server-to-client) error messages.
 #

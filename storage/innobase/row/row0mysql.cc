@@ -49,6 +49,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "dict0crea.h"
 #include "dict0dd.h"
 #include "dict0dict.h"
+#include "dict0mem.h"
 #include "dict0load.h"
 #include "dict0priv.h"
 #include "dict0stats.h"
@@ -83,6 +84,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "storage/innobase/vec/vec_index_adapter.h"
 #include "storage/innobase/vec/vec_aux_tables.h"
+#include "storage/innobase/vec/vec_txn_buf.h"
 
 #include "current_thd.h"
 #include "my_dbug.h"
@@ -1675,6 +1677,58 @@ run_again:
       fts_trx_add_op(trx, table, doc_id, FTS_INSERT, nullptr);
     }
   }
+
+  for (dict_index_t *vec_index = UT_LIST_GET_FIRST(table->indexes);
+       vec_index != nullptr;
+       vec_index = UT_LIST_GET_NEXT(indexes, vec_index)) {
+    if (vec_index->vec_params == nullptr) {
+      continue;
+    }
+    ib::warn() << "Insert  vec_index begin.";
+    const vec_params_t *params = vec_index->vec_params;
+    const unsigned dim = params->dim;
+    if (dim == 0) {
+      ib::warn() << "VECINDEX: index '"
+                 << (vec_index->name ? vec_index->name : "(null)")
+                 << "' reports zero dimension during insert";
+      err = DB_ERROR;
+      trx->error_state = err;
+      goto error_exit;
+    }
+
+    const dict_field_t *vec_field = vec_index->get_field(0);
+    if (vec_field == nullptr || vec_field->col == nullptr) {
+      ib::warn() << "VECINDEX: index '"
+                 << (vec_index->name ? vec_index->name : "(null)")
+                 << "' has invalid metadata for vector column";
+      err = DB_ERROR;
+      trx->error_state = err;
+      goto error_exit;
+    }
+
+    const ulint col_no = dict_col_get_no(vec_field->col);
+    if (col_no >= dtuple_get_n_fields(node->row)) {
+      ib::warn() << "VECINDEX: index '"
+                 << (vec_index->name ? vec_index->name : "(null)")
+                 << "' column position " << col_no
+                 << " is out of range for the inserted row";
+      err = DB_ERROR;
+      trx->error_state = err;
+      goto error_exit;
+    }
+
+    const dfield_t *vec_value = dtuple_get_nth_field(node->row, col_no);
+    int rc = vec_collect_one_row(trx, table, vec_index, vec_value, dim, node->row);
+    if (rc != 0) {
+      ib::warn() << "VECINDEX: buffering vector for index '"
+                 << (vec_index->name ? vec_index->name : "(null)")
+                 << "' failed with rc=" << rc;
+      err = DB_ERROR;
+      trx->error_state = err;
+      goto error_exit;
+    }
+  }
+  ib::warn() << "Insert  vec_index end.";
 
   que_thr_stop_for_mysql_no_error(thr, trx);
 

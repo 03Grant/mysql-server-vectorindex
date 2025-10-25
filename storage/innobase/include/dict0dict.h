@@ -448,6 +448,10 @@ static inline bool dict_index_is_auto_gen_clust(const dict_index_t *index);
  @return        nonzero for Spatial Index, zero for other indexes */
 [[nodiscard]] static inline ulint dict_index_is_spatial(
     const dict_index_t *index); /*!< in: index */
+/** Check whether the index is a Vector index.
+@return nonzero for Vector index, zero for other indexes */
+[[nodiscard]] static inline ulint dict_index_is_vector(
+    const dict_index_t *index); /*!< in: index */
 /** Check whether the index contains a virtual column.
 @param[in]      index   index
 @return nonzero for index on virtual column, zero for other indexes */

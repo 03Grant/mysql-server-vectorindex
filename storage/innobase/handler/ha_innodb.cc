@@ -6634,6 +6634,10 @@ ulong ha_innobase::index_flags(uint key, uint, bool) const {
     return (0);
   }
 
+  if (table_share->key_info[key].flags & HA_VECINDEX) {
+    return 0;
+  }
+
   ulong flags = HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE |
                 HA_KEYREAD_ONLY | HA_DO_INDEX_COND_PUSHDOWN;
 

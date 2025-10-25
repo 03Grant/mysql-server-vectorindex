@@ -7,7 +7,6 @@
 
 #include "data0data.h"
 #include "my_byteorder.h"
-#include "sql/field.h"
 
 #include <cmath>
 #include <cstring>
@@ -23,30 +22,14 @@ namespace {
 std::mutex g_trx_ctx_mu;
 std::unordered_map<trx_t *, std::unique_ptr<vec_trx_ctx_t>> g_trx_ctx_map;
 
-inline void append_u16_be(std::string &buf, uint16_t v) {
-  char tmp[2];
-  tmp[0] = static_cast<char>((v >> 8) & 0xFF);
-  tmp[1] = static_cast<char>(v & 0xFF);
-  buf.append(tmp, sizeof(tmp));
-}
-
-inline void append_u32_be(std::string &buf, uint32_t v) {
-  char tmp[4];
-  tmp[0] = static_cast<char>((v >> 24) & 0xFF);
-  tmp[1] = static_cast<char>((v >> 16) & 0xFF);
-  tmp[2] = static_cast<char>((v >> 8) & 0xFF);
-  tmp[3] = static_cast<char>(v & 0xFF);
-  buf.append(tmp, sizeof(tmp));
-}
-
-// —— 主键编码：仿照 row_build_index_entry_low 得到聚簇索引 key ——
-static bool vec_encode_pk_bin(dict_table_t *table, const dtuple_t *row,
-                              std::string &out) {
+// —— 聚簇主键逐列拷贝 ——
+static bool vec_capture_pk_columns(dict_table_t *table, const dtuple_t *row,
+                                   std::vector<vec_pk_column_t> &out) {
   if (table == nullptr || row == nullptr) {
     return false;
   }
 
-  dict_index_t *clust = table->first_index();
+  dict_index_t *clust = table->first_index();   // get clustered index
   if (clust == nullptr) {
     return false;
   }
@@ -57,98 +40,69 @@ static bool vec_encode_pk_bin(dict_table_t *table, const dtuple_t *row,
   }
 
   dtuple_t *entry = row_build_index_entry_low(row, nullptr, clust, heap,
-                                              ROW_BUILD_NORMAL);
+                                              ROW_BUILD_FOR_INSERT);
   if (entry == nullptr) {
     mem_heap_free(heap);
     return false;
   }
 
-  const ulint n_cmp = dtuple_get_n_fields_cmp(entry);
-  if (n_cmp == ULINT_UNDEFINED || n_cmp > std::numeric_limits<uint16_t>::max()) {
-    mem_heap_free(heap);
-    return false;
-  }
+  const ulint n_fields = clust->n_fields;
+  out.clear();
+  out.resize(n_fields);
 
-  size_t reserve = sizeof(uint16_t);
-  for (ulint i = 0; i < n_cmp; ++i) {
+  for (ulint i = 0; i < n_fields; ++i) {
     const dfield_t *df = dtuple_get_nth_field(entry, i);
     if (df == nullptr) {
+      out.clear();
       mem_heap_free(heap);
       return false;
     }
-    reserve += 1;  // flag byte
-    if (!dfield_is_null(df)) {
-      const ulint len_ul = dfield_get_len(df);
-      if (len_ul > std::numeric_limits<uint32_t>::max()) {
-        mem_heap_free(heap);
-        return false;
-      }
-      reserve += sizeof(uint32_t);
-      reserve += static_cast<size_t>(len_ul);
+
+    vec_pk_column_t &col = out[i];
+    col.is_null = dfield_is_null(df);
+
+    const dict_field_t *ind_field = clust->get_field(i);
+    if (ind_field != nullptr && ind_field->col != nullptr) {
+      col.mtype = ind_field->col->mtype;
+      col.prtype = ind_field->col->prtype;
+    } else {
+      col.mtype = DATA_FIXBINARY;
+      col.prtype = 0;
     }
-  }
 
-  out.clear();
-  out.reserve(reserve);
-  append_u16_be(out, static_cast<uint16_t>(n_cmp));
-
-  for (ulint i = 0; i < n_cmp; ++i) {
-    const dfield_t *df = dtuple_get_nth_field(entry, i);
-    const bool is_null = dfield_is_null(df);
-    out.push_back(static_cast<char>(is_null ? 0x1 : 0x0));
-
-    if (is_null) {
+    if (col.is_null) {
+      col.data.clear();
       continue;
     }
 
-    const ulint len_ul = dfield_get_len(df);
-    const uint32_t len = static_cast<uint32_t>(len_ul);
-    append_u32_be(out, len);
-
-    const void *data = dfield_get_data(df);
+    const unsigned char *data =
+        static_cast<const unsigned char *>(dfield_get_data(df));
+    const ulint len = dfield_get_len(df);
     if (len > 0 && data == nullptr) {
-      mem_heap_free(heap);
       out.clear();
+      mem_heap_free(heap);
       return false;
     }
-    out.append(reinterpret_cast<const char *>(data), len);
+
+    col.data.assign(data, data + len);
   }
 
   mem_heap_free(heap);
   return true;
 }
 
+
 // —— 抽取向量字节并校验 ——
-static bool vec_extract_and_validate(Field *field, unsigned dim,
+static bool vec_extract_and_validate(const dfield_t *field, unsigned dim,
                                      std::vector<float> &out) {
-  if (field == nullptr || dim == 0 || field->is_null()) {
+  if (field == nullptr || dim == 0 || dfield_is_null(field)) {
     return false;
   }
 
   const size_t expect_bytes = static_cast<size_t>(dim) * sizeof(float);
-  const unsigned char *raw = nullptr;
-  size_t raw_len = 0;
-
-  switch (field->real_type()) {
-    case MYSQL_TYPE_VECTOR: {
-      auto *vf = static_cast<Field_vector *>(field);
-      raw = reinterpret_cast<const unsigned char *>(vf->get_blob_data());
-      raw_len = vf->get_length();
-      break;
-    }
-    case MYSQL_TYPE_VARCHAR:
-    case MYSQL_TYPE_VAR_STRING: {
-      if (!field->binary()) {
-        return false;  // 只支持 VARBINARY
-      }
-      auto *vs = static_cast<Field_varstring *>(field);
-      raw = reinterpret_cast<const unsigned char *>(vs->data_ptr());
-      raw_len = vs->data_length();
-      break;
-    }
-    default:
-      return false;
-  }
+  const ulint raw_len = dfield_get_len(field);
+  const unsigned char *raw =
+      static_cast<const unsigned char *>(dfield_get_data(field));
 
   if (raw == nullptr || raw_len != expect_bytes) {
     return false;
@@ -215,7 +169,7 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
 
 // —— 收集一行 ——
 int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
-                        Field *vector_field, const unsigned dim,
+                        const dfield_t *vector_field, const unsigned dim,
                         const dtuple_t *row_tuple) {
   if (!trx || !table || !vindex || !vector_field || !row_tuple || dim == 0) {
     return -1;
@@ -239,10 +193,27 @@ int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
     return -2;  // 长度/数据非法
   }
 
-  if (!vec_encode_pk_bin(table, row_tuple, item.pk_bin)) {
+  if (!vec_capture_pk_columns(table, row_tuple, item.pk_columns)) {
     return -3;
   }
 
   bucket.items.emplace_back(std::move(item));
   return 0;
+}
+
+
+
+vec_trx_ctx_t* vec_lookup_trx_ctx(trx_t* trx) {
+    std::lock_guard<std::mutex> g(g_trx_ctx_mu);
+    auto it = g_trx_ctx_map.find(trx);
+    return it == g_trx_ctx_map.end() ? nullptr : it->second.get();
+}
+
+bool vec_trx_has_work(trx_t* trx) {
+    if (auto* ctx = vec_lookup_trx_ctx(trx)) {
+        for (const auto& kv : ctx->by_index) {
+            if (!kv.second.items.empty()) return true;
+        }
+    }
+    return false;
 }
