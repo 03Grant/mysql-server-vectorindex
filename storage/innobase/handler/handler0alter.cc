@@ -80,6 +80,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "lex_string.h"
 #include "log0buf.h"
 #include "log0chkp.h"
+#include "storage/innobase/vec/vec_aux_tables.h"
 
 #include "log0ddl.h"
 #include "my_dbug.h"
@@ -448,6 +449,19 @@ static bool innobase_fulltext_exist(const TABLE *table) {
 static bool innobase_spatial_exist(const TABLE *table) {
   for (uint i = 0; i < table->s->keys; i++) {
     if (table->key_info[i].flags & HA_SPATIAL) {
+      return (true);
+    }
+  }
+
+  return (false);
+}
+
+/** Determine if vector indexes exist in a given table.
+@param table MySQL table
+@return whether vector indexes exist on the table */
+static bool innobase_vecindex_exist(const TABLE *table) {
+  for (uint i = 0; i < table->s->keys; i++) {
+    if (table->key_info[i].flags & HA_VECINDEX) {
       return (true);
     }
   }
@@ -2676,11 +2690,11 @@ static void innobase_create_index_def(const TABLE *altered_table,
   }
 
   if (key_clustered) {
-    assert(!(key->flags & (HA_FULLTEXT | HA_SPATIAL)));
+    assert(!(key->flags & (HA_FULLTEXT | HA_SPATIAL | HA_VECINDEX)));
     assert(key->flags & HA_NOSAME);
     index_def->m_ind_type = DICT_CLUSTERED | DICT_UNIQUE;
   } else if (key->flags & HA_FULLTEXT) {
-    assert(!(key->flags & (HA_SPATIAL | HA_NOSAME)));
+    assert(!(key->flags & (HA_SPATIAL | HA_VECINDEX | HA_NOSAME)));
     assert(!(key->flags & HA_KEYFLAG_MASK &
              ~(HA_FULLTEXT | HA_PACK_KEY | HA_BINARY_PACK_KEY)));
     index_def->m_ind_type = DICT_FTS;
@@ -2740,6 +2754,19 @@ static void innobase_create_index_def(const TABLE *altered_table,
       ut_d(ut_error);
     } else {
       index_def->m_fields[0].m_is_v_col = false;
+    }
+  } else if (key->flags & HA_VECINDEX) {
+    assert(!(key->flags & (HA_FULLTEXT | HA_SPATIAL | HA_NOSAME)));
+    index_def->m_ind_type = DICT_VECINDEX;
+    ut_ad(n_fields == 1);
+    ut_ad(index_def->m_fields[0].m_prefix_len == 0);
+
+    // Keep the vector index parameters.
+    if (key->comment.str != nullptr && key->comment.length > 0) {
+        index_def->m_vec_comment =
+            mem_heap_strdupl(heap, key->comment.str, key->comment.length);
+    } else {
+        index_def->m_vec_comment = nullptr;
     }
   } else {
     index_def->m_ind_type = (key->flags & HA_NOSAME) ? DICT_UNIQUE : 0;
@@ -4398,6 +4425,7 @@ template <typename Table>
   ddl::Index_defn *index_defs; /* index definitions */
   dict_table_t *user_table;
   dict_index_t *fts_index = nullptr;
+  dict_index_t *vec_index = nullptr;
   dberr_t error;
   ulint num_fts_index;
   dict_add_v_col_t *add_v = nullptr;
@@ -4884,6 +4912,9 @@ template <typename Table>
       ctx->new_table->fts->doc_col = fts_doc_id_col;
     }
 
+    //TODO: whether need to check if vector index exists here
+
+
     /* Check if we need to update mtypes of legacy GIS columns.
     This check is only needed when we don't have to rebuild
     the table, since rebuild would update all mtypes for GIS
@@ -4932,6 +4963,12 @@ template <typename Table>
       fts_index = ctx->add_index[a];
     }
 
+    if(ctx->add_index[a]->type & DICT_VECINDEX){
+      assert(!vec_index);
+      assert(ctx->add_index[a]->type == DICT_VECINDEX);
+      vec_index = ctx->add_index[a];
+    }
+
     /* If only online ALTER TABLE operations have been
     requested, allocate a modification log. If the table
     will be locked anyway, the modification
@@ -4944,6 +4981,9 @@ template <typename Table>
       ut_ad(!ctx->add_index[a]->online_log);
     } else if (ctx->add_index[a]->type & DICT_FTS) {
       /* Fulltext indexes are not covered
+      by a modification log. */
+    } else if (ctx->add_index[a]->type & DICT_VECINDEX) {
+      /*TODO Vector indexes are not covered
       by a modification log. */
     } else {
       DBUG_EXECUTE_IF("innodb_OOM_prepare_inplace_alter",
@@ -5067,9 +5107,34 @@ template <typename Table>
     ut_ad(trx_get_dict_operation(ctx->trx) == op);
   }
 
+  if (vec_index) {
+  #ifdef UNIV_DEBUG
+    trx_dict_op_t op_vec = trx_get_dict_operation(ctx->trx);
+  #endif
+    ut_ad(ctx->trx->dict_operation_lock_mode == RW_X_LATCH);
+    ut_ad(dict_sys_mutex_own());
+    ut_ad(rw_lock_own(dict_operation_lock, RW_LOCK_X));
+
+    DICT_TF2_FLAG_SET(ctx->new_table, DICT_TF2_VECINDEX);
+
+    dict_sys_mutex_exit();
+    error = vec_create_index_tables_low(ctx->trx, vec_index,
+                                        ctx->new_table->name.m_name,
+                                        ctx->new_table->id);
+    dict_sys_mutex_enter();
+
+    if (error != DB_SUCCESS) {
+      goto error_handling;
+    }
+#ifdef UNIV_DEBUG
+    ut_ad(trx_get_dict_operation(ctx->trx) == op_vec);
+#endif
+    // ib::warn() << "Vector index auxiliary tables created for index ";
+  }
+
   assert(error == DB_SUCCESS);
 
-  if (build_fts_common || fts_index) {
+  if (build_fts_common || fts_index || vec_index) {
     fts_freeze_aux_tables(ctx->new_table);
   }
 
@@ -5096,6 +5161,13 @@ template <typename Table>
         goto error_handling;
       }
     }
+
+    if (vec_index) {
+      error = vec_create_index_dd_tables(ctx->new_table);
+      if (error != DB_SUCCESS) {
+        goto error_handling;
+      }
+    }
   }
 
 error_handling:
@@ -5103,6 +5175,8 @@ error_handling:
   if (build_fts_common || fts_index) {
     fts_detach_aux_tables(ctx->new_table, dict_locked);
   }
+  // TODO error handling for vec_index if needed
+  // vec_detach_aux_tables(ctx->new_table, dict_locked);
 
   /* After an error, remove all those index definitions from the
   dictionary which were defined. */
@@ -5444,6 +5518,7 @@ bool ha_innobase::prepare_inplace_alter_table_impl(
   bool add_fts_doc_id = false;
   bool add_fts_doc_id_idx = false;
   bool add_fts_idx = false;
+  bool add_vec_idx = false;
   dict_s_col_list *s_cols = nullptr;
   mem_heap_t *s_heap = nullptr;
 
@@ -5612,6 +5687,17 @@ bool ha_innobase::prepare_inplace_alter_table_impl(
       continue;
     }
 
+    if (key->flags & HA_VECINDEX) {
+      /* The column length also does not matter for
+      vector search indexes. But, UNIQUE
+      vector indexes are not supported. */
+      assert(!(key->flags & HA_NOSAME));
+      assert(!(key->flags & HA_KEYFLAG_MASK &
+               ~(HA_VECINDEX | HA_PACK_KEY | HA_BINARY_PACK_KEY)));
+      add_vec_idx = true;
+      continue;
+    }
+
     if (innobase_check_column_length(max_col_len, key)) {
       my_error(ER_INDEX_COLUMN_TOO_LONG, MYF(0), max_col_len);
       goto err_exit_no_heap;
@@ -5633,6 +5719,28 @@ bool ha_innobase::prepare_inplace_alter_table_impl(
       if (index->is_corrupted()) {
         ib_errf(m_user_thd, IB_LOG_LEVEL_ERROR, ER_INNODB_INDEX_CORRUPT,
                 "Fulltext index '%s' is corrupt. "
+                "you should drop this index first.",
+                index->name());
+
+        goto err_exit_no_heap;
+      }
+    }
+  }
+
+  if (add_vec_idx) {
+    for (const dict_index_t *index = indexed_table->first_index(); index;
+         index = index->next()) {
+      if (!(index->type & DICT_VECINDEX)) {
+        continue;
+      }
+
+      assert(index->type == DICT_VECINDEX || index->is_corrupted());
+
+      /* We need to drop any corrupted vec indexes
+      before we add a new vec index. */
+      if (index->is_corrupted()) {
+        ib_errf(m_user_thd, IB_LOG_LEVEL_ERROR, ER_INNODB_INDEX_CORRUPT,
+                "Vector index '%s' is corrupt. "
                 "you should drop this index first.",
                 index->name());
 
@@ -5982,6 +6090,12 @@ bool ha_innobase::prepare_inplace_alter_table_impl(
                  Alter_inplace_info::DROP_STORED_COLUMN |
                  Alter_inplace_info::ADD_STORED_BASE_COLUMN)));
     }
+  }
+  /* TODO: We don't want to build multiple vector indexes on the same vector column */
+  /* But here we say only one vector index can exist in one table */
+  if(innobase_vecindex_exist(table)){
+    ib::warn() << "InnoDB table to add vector index as only one vector index is allowed per table";
+    goto err_exit;
   }
 
   /* See if an AUTO_INCREMENT column was added. */

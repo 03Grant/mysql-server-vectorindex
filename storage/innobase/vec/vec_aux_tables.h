@@ -12,7 +12,7 @@
 struct trx_t;
 struct dict_index_t;
 
-/** Create auxiliary index tables for an FTS index.
+/** Create auxiliary index tables for a vecindex.
 @param[in,out]  trx             transaction
 @param[in]      index           the index instance
 @param[in]      table_name      table name

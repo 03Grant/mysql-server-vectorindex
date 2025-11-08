@@ -28,8 +28,8 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <vector>
 #include <utility>
-
 #include "ft_global.h"
 #include "mem_root_deque.h"
 #include "my_alloc.h"
@@ -42,6 +42,8 @@
 #include "sql/item.h"
 #include "sql/item_func.h"
 #include "sql/item_sum.h"  // Item_sum
+#include "sql/sql_error.h"
+#include "mysqld_error.h"
 #include "sql/iterators/basic_row_iterators.h"
 #include "sql/iterators/ref_row_iterators.h"
 #include "sql/iterators/row_iterator.h"
@@ -62,6 +64,7 @@
 #include "sql/sql_lex.h"
 #include "sql/sql_opt_exec_shared.h"
 #include "sql/sql_optimizer.h"  // JOIN
+#include "sql/log.h"
 #include "sql/sql_select.h"
 #include "sql/system_variables.h"
 #include "sql/table.h"
@@ -678,6 +681,161 @@ int FullTextSearchIterator::Read() {
   if (m_examined_rows != nullptr) {
     ++*m_examined_rows;
   }
+  return 0;
+}
+
+VectorSearchIterator::VectorSearchIterator(
+    THD *thd, TABLE *table, Index_lookup *ref,
+    Item_func_myvector_is_ann *vec_func, ha_rows *examined_rows)
+    : TableRowIterator(thd, table),
+      m_ref(ref),
+      m_vec_func(vec_func),
+      m_examined_rows(examined_rows) {}
+
+VectorSearchIterator::~VectorSearchIterator() {
+  Close();
+  if (table()->key_read) {
+    table()->set_keyread(false);
+  }
+}
+
+bool VectorSearchIterator::Init() {
+  Close();
+
+  if (m_vec_func != nullptr) {
+    m_vec_func->set_last_result(false);
+  }
+
+  if (int error = table()->file->ha_index_init(m_ref->key, false)) {
+    PrintError(error);
+    return true;
+  }
+
+  table()->file->ha_vec_search_begin();
+
+  m_pos = 0;
+  m_results.clear();
+
+  int search_error = ExecuteVectorSearch();
+  int end_error = table()->file->ha_index_end();
+  if (search_error != 0) {
+    table()->file->ha_vec_search_end();
+    if (!thd()->is_error()) {
+      PrintError(search_error);
+    }
+    return true;
+  }
+  if (end_error != 0) {
+    table()->file->ha_vec_search_end();
+    if (!thd()->is_error()) {
+      PrintError(end_error);
+    }
+    return true;
+  }
+
+  m_initialized = true;
+  return false;
+}
+
+int VectorSearchIterator::Read() {
+  if (!m_initialized) {
+    my_error(ER_INTERNAL_ERROR, MYF(0),
+             "VectorSearchIterator::Init() must be called before Read()");
+    return 1;
+  }
+
+  if (m_vec_func != nullptr) {
+    m_vec_func->set_last_result(false);
+  }
+
+  while (m_pos < m_results.size()) {
+    const Candidate &candidate = m_results[m_pos++];
+    const size_t candidate_index = m_pos - 1;
+    int error =
+        table()->file->ha_vec_fetch_rows(m_results, candidate_index);
+    if (error == 0) {
+      if (m_vec_func != nullptr) {
+        m_vec_func->set_last_result(true);
+      }
+      if (m_examined_rows != nullptr) {
+        ++*m_examined_rows;
+      }
+      return 0;
+    }
+
+    if (error == HA_ERR_KEY_NOT_FOUND || error == HA_ERR_END_OF_FILE) {
+      sql_print_warning(
+          "VectorSearchIterator: missing base row for table=%s faiss_id=%lld "
+          "(error=%d)",
+          table()->alias, candidate.faiss_id, error);
+      continue;
+    }
+
+    int status = HandleError(error);
+    Close();
+    return status;
+  }
+
+  Close();
+  return -1;
+}
+
+void VectorSearchIterator::Close() {
+  table()->file->ha_vec_search_end();
+  if (table()->file->inited) {
+    table()->file->ha_index_or_rnd_end();
+  }
+  m_results.clear();
+  m_pos = 0;
+  m_initialized = false;
+}
+
+int VectorSearchIterator::ExecuteVectorSearch() {
+  if (m_vec_func == nullptr) {
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  std::vector<uint8_t> query_bytes;
+  uint32 dim = 0;
+
+  if (!m_vec_func->build_query_vector(&query_bytes, &dim)) {
+    sql_print_warning("VectorSearchIterator: failed to build query vector");
+    return HA_ERR_WRONG_COMMAND;
+  }
+
+  m_results.clear();
+
+  if (query_bytes.empty() || dim == 0) {
+    sql_print_warning("VectorSearchIterator: empty query vector");
+    return 0;
+  }
+
+  std::vector<Vec_hit> hits;
+  hits.reserve(16);
+
+  const std::string &options = m_vec_func->options_raw();
+  const uchar *options_ptr =
+      options.empty()
+          ? nullptr
+          : reinterpret_cast<const uchar *>(options.data());
+  const size_t options_len = options.size();
+
+  int handler_error = table()->file->ha_vec_search(
+      reinterpret_cast<const uchar *>(query_bytes.data()), dim,
+      /*k=*/0, options_ptr, options_len, &hits);
+
+  if (handler_error != 0) {
+    return handler_error;
+  }
+
+  m_results.reserve(hits.size());
+  m_results.insert(m_results.end(), hits.begin(), hits.end());
+
+  // for (const auto &hit : hits) {
+  //   sql_print_warning("VectorSearchIterator: faiss_id=%lld distance=%f", hit.faiss_id,
+  //                     hit.distance);
+  // }
+
   return 0;
 }
 

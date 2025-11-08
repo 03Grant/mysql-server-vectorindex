@@ -32,7 +32,7 @@ struct vec_params_t {
   // IVF / PQ / HNSW
   int32_t   nlist{0};        // IVF
   int32_t   m{0}, nbits{0};  // PQ
-  int32_t   hnsw_m{0}, efConstruction{0}; // HNSW
+  int32_t   hnsw_m{32}, efConstruction{128}; // HNSW
 };
 // 简单占位（你后面可改成从 DD / JSON 解析）
 dberr_t vec_params_from_string(const std::string& s,

@@ -37,6 +37,9 @@ Created 2020-11-01 by Sunny Bains. */
 #include "handler0alter.h"
 #include "lock0lock.h"
 #include "row0log.h"
+#include "storage/innobase/vec/vec_params.h"
+#include "storage/innobase/vec/vec_txn_buf.h"
+#include "storage/innobase/vec/vec_ingest.h"
 
 /* Ignore posix_fadvise() on those platforms where it does not exist */
 #if defined _WIN32
@@ -256,6 +259,84 @@ dict_index_t *create_index(trx_t *trx, dict_table_t *table,
   if (dict_index_is_spatial(index)) {
     index->fill_srid_value(index_def->m_srid, index_def->m_srid_is_valid);
   }
+
+  if (dict_index_is_vector(index)) {
+    const char *comment = index_def->m_vec_comment;
+
+    auto fail = [&](const std::string &msg,
+                    const char *what = nullptr,
+                    size_t size = 0U) -> dict_index_t * {
+      ib::warn() << msg;
+      if (what != nullptr) {
+        my_error(ER_DATA_INCOMPATIBLE_WITH_VECTOR, MYF(0), what, size);
+      }
+      trx->error_state = DB_ERROR;
+      return nullptr;
+    };
+
+    if (comment == nullptr || comment[0] == '\0') {
+      return fail("Vector index '" + std::string(index_def->m_name) +
+                  "' has empty comment payload.");
+    }
+
+    vec_params_t parsed{};
+    std::string why;
+    if (vec_params_from_string(comment, &parsed, &why) != DB_SUCCESS) {
+      return fail("Failed to parse vector index parameters for '" +
+                  std::string(index_def->m_name) + "': " + why);
+    }
+
+    if (index_def->m_n_fields != 1) {
+      return fail("Vector index '" + std::string(index_def->m_name) +
+                  "' must reference exactly one column.", "column-meta", 0U);
+    }
+
+    const Index_field &field_def = index_def->m_fields[0];
+    dict_col_t *col = table->get_col(field_def.m_col_no);
+
+    if (col == nullptr) {
+      return fail("Vector index '" + std::string(index_def->m_name) +
+                  "' refers to an invalid column.", "column-meta", 0U);
+    }
+
+    const ulint mysql_type = col->prtype & DATA_MYSQL_TYPE_MASK;
+    const bool is_vector_type = (mysql_type == MYSQL_TYPE_VECTOR);
+    const bool is_binary_string =
+        dtype_is_binary_string_type(col->mtype, col->prtype);
+
+    if (!is_vector_type && !is_binary_string) {
+      return fail("Column '" + std::string(table->get_col_name(field_def.m_col_no)) +
+                  "' is not a supported vector/binary type for vector index.",
+                  "column-type", mysql_type);
+    }
+
+    const uint64_t actual_length = static_cast<uint64_t>(col->len);
+    const uint64_t expected_length =
+        static_cast<uint64_t>(parsed.dim) * sizeof(float);
+
+    if (actual_length != expected_length) {
+      return fail("Column '" + std::string(table->get_col_name(field_def.m_col_no)) +
+                  "' length " + std::to_string(actual_length) +
+                  " bytes does not match expected " + std::to_string(expected_length) +
+                  " bytes (dim=" + std::to_string(parsed.dim) + ").",
+                  "column-bytes", actual_length);
+    }
+    auto *params =
+        static_cast<vec_params_t *>(mem_heap_alloc(index->heap, sizeof(vec_params_t)));
+    *params = parsed;
+    index->vec_params = params;
+    // ib::warn() << "VEC_PARAMS success parsed: type_tag=" << (int)parsed.type_tag
+    //        << ", metric_tag=" << (int)parsed.metric_tag
+    //        << ", dim=" << parsed.dim
+    //        << ", size=" << parsed.size
+    //        << ", build_threads=" << parsed.build_threads
+    //        << ", nlist=" << parsed.nlist
+    //        << ", PQ_m=" << parsed.m
+    //        << ", PQ_nbits=" << parsed.nbits
+    //        << ", HNSW_m=" << parsed.hnsw_m
+    //        << ", HNSW_efConstruction=" << parsed.efConstruction;
+  }
+
 
   /* Adjust field name for newly added virtual columns. */
   for (size_t i = 0; i < n_fields; i++) {
@@ -526,6 +607,12 @@ dberr_t Row::build(ddl::Context &ctx, dict_index_t *index, mem_heap_t *heap,
 }
 
 dberr_t Cursor::finish(dberr_t err) noexcept {
+
+  if (vec_trx_has_work(m_ctx.m_trx)) {
+    err = vec_on_trx_commit(m_ctx.m_trx);
+    if (err != DB_SUCCESS) return err;  
+  }
+  
   if (m_ctx.m_fts.m_ptr != nullptr) {
     /* Wait for the FTS parser threads to complete and prepare to insert. */
     return m_ctx.m_fts.m_ptr->scan_finished(err);

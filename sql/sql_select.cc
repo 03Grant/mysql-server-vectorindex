@@ -78,6 +78,7 @@
 #include "sql/intrusive_list_iterator.h"
 #include "sql/item.h"
 #include "sql/item_func.h"
+#include "sql/item_cmpfunc.h"
 #include "sql/item_json_func.h"
 #include "sql/item_subselect.h"
 #include "sql/item_sum.h"  // Item_sum
@@ -2549,6 +2550,7 @@ bool create_ref_for_key(JOIN *join, JOIN_TAB *j, Key_use *org_keyuse,
 
   const uint key = org_keyuse->key;
   const bool ftkey = (org_keyuse->keypart == FT_KEYPART);
+  const bool veckey = (org_keyuse->keypart == VECINDEX_KEYPART);
   THD *const thd = join->thd;
   uint keyparts, length;
   TABLE *const table = j->table();
@@ -2558,15 +2560,17 @@ bool create_ref_for_key(JOIN *join, JOIN_TAB *j, Key_use *org_keyuse,
   assert(j->keys().is_set(org_keyuse->key));
 
   /* Calculate the length of the used key. */
-  if (ftkey) {
-    Item_func_match *ifm = down_cast<Item_func_match *>(org_keyuse->val);
-
+  if (ftkey || veckey) {
     length = 0;
     keyparts = 1;
-    ifm->get_master()->score_from_index_scan = true;
-  } else /* not ftkey */
+    if (ftkey) {
+      Item_func_match *ifm = down_cast<Item_func_match *>(org_keyuse->val);
+      ifm->get_master()->score_from_index_scan = true;
+    }
+  } else /* not special key */ {
     calc_length_and_keyparts(org_keyuse, j, key, used_tables, chosen_keyuses,
                              &length, &keyparts, nullptr, nullptr);
+  }
   if (thd->is_error()) {
     return true;
   }
@@ -2575,11 +2579,10 @@ bool create_ref_for_key(JOIN *join, JOIN_TAB *j, Key_use *org_keyuse,
     return true;
   }
 
-  uchar *key_buff = j->ref().key_buff;
-  uchar *null_ref_key = nullptr;
-  bool keyuse_uses_no_tables = true;
-  bool null_rejecting_key = true;
   if (ftkey) {
+    Item_func_match *ifm = down_cast<Item_func_match *>(org_keyuse->val);
+
+    ifm->get_master()->score_from_index_scan = true;
     Key_use *keyuse = org_keyuse;
     j->ref().items[0] = ((Item_func *)(keyuse->val))->key_item();
     /* Predicates pushed down into subquery can't be used FT access */
@@ -2593,6 +2596,22 @@ bool create_ref_for_key(JOIN *join, JOIN_TAB *j, Key_use *org_keyuse,
 
     return false;
   }
+  if (veckey) {
+    Key_use *keyuse = org_keyuse;
+    auto *ann_func =
+        down_cast<Item_func_myvector_is_ann *>(keyuse->val);
+    j->ref().items[0] = ann_func->key_item();
+    j->ref().cond_guards[0] = nullptr;
+    j->set_type(JT_VECINDEX);
+    j->set_vec_func(ann_func);
+    memset(j->ref().key_copy, 0, sizeof(j->ref().key_copy[0]) * keyparts);
+    return false;
+  }
+
+  uchar *key_buff = j->ref().key_buff;
+  uchar *null_ref_key = nullptr;
+  bool keyuse_uses_no_tables = true;
+  bool null_rejecting_key = true;
   // Set up Index_lookup based on chosen Key_use-s.
   for (uint part_no = 0; part_no < keyparts; part_no++) {
     Key_use *keyuse = chosen_keyuses[part_no];
@@ -3515,6 +3534,9 @@ bool make_join_readinfo(JOIN *join, uint no_jbuf_after) {
           table->set_keyread(true);
           table->covering_keys.set_bit(tab->ft_func()->key);
         }
+        break;
+      case JT_VECINDEX:
+        table->set_keyread(true);
         break;
       default:
         DBUG_PRINT("error", ("Table type %d found",

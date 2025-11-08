@@ -30,7 +30,6 @@ std::unique_ptr<faiss::Index> vec_make_faiss_index(const vec_params_t& p) {
 
     case VEC_T_IVFPQ: {
       auto* quant = new faiss::IndexFlat(p.dim, metric);
-      // 你在解析里已保证 nbits*m | dim（或至少合法性）
       auto ivfpq = std::make_unique<faiss::IndexIVFPQ>(
           quant, p.dim, p.nlist, p.m, p.nbits, metric);
       ivfpq->own_fields = true;

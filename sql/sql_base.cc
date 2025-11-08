@@ -10463,6 +10463,48 @@ void tdc_remove_table(THD *thd, enum_tdc_remove_table_type remove_type,
   if (!has_lock) table_cache_manager.unlock_all_and_tdc();
 }
 
+int setup_is_ann_funcs(const THD *thd, Query_block *select){
+  DBUG_TRACE;
+  assert(select != nullptr);
+  assert(select->has_vec_funcs());
+
+  List_iterator<Item_func_myvector_is_ann> li(*(select->vecfunc_list));
+  Item_func_myvector_is_ann *ann_func;
+
+  while ((ann_func = li++)) {
+    Table_ref *table_ref = ann_func->table_ref();
+    TABLE *table = ann_func->table();
+    const uint keyno = ann_func->keyno();
+
+    // 解析阶段应该已经绑定好了表/索引。如果此处为空，说明语义校验出了问题，
+    // 直接报错并终止准备流程。
+    if (table_ref == nullptr || table == nullptr || table->s == nullptr) {
+      sql_print_warning("setup_is_ann_funcs: table is nullptr");
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), ann_func->func_name());
+      return 1;
+    }
+
+    if (keyno >= table->s->keys) {
+      sql_print_warning("setup_is_ann_funcs: keyno is out of bounds");
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), ann_func->func_name());
+      return 1;
+    }
+
+    KEY *key_info = &table->key_info[keyno];
+    if (!(key_info->flags & HA_VECINDEX) &&
+        key_info->algorithm != HA_KEY_ALG_VECINDEX) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), ann_func->func_name());
+      return 1;
+    }
+
+    // 如果你后来实现了更精细的准备逻辑（例如 ann_func->fix_index(thd)），
+    // 可以在这里调用：
+    // if (ann_func->fix_index(thd)) return 1;
+  }
+
+  return 0;
+}
+
 int setup_ftfuncs(const THD *thd, Query_block *query_block) {
   assert(query_block->has_ft_funcs());
 

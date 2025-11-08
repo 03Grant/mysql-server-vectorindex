@@ -107,7 +107,7 @@ dberr_t vec_params_from_string(const std::string& s,
 
     } else if (key_l == "size") {
       uint64_t v{};
-      if (!parse_int(val_l, v) || v == 0) {
+      if (!parse_int(val_l, v) || v < 0) {
         if (err) *err = "invalid size: " + val;
         return DB_FAIL;
       }

@@ -3933,6 +3933,11 @@ AccessPath *QEP_TAB::access_path() {
           /*count_examined_rows=*/true);
       used_ref = &ref();
       break;
+    case JT_VECINDEX:
+      path = NewVectorSearchAccessPath(join()->thd, table(), &ref(), vec_func(),
+                                       /*count_examined_rows=*/true);
+      used_ref = &ref();
+      break;
 
     case JT_INDEX_SCAN:
       path = NewIndexScanAccessPath(join()->thd, table(), index(), use_order(),

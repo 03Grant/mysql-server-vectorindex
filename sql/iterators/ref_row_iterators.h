@@ -26,6 +26,7 @@
 
 #include <sys/types.h>
 #include <memory>
+#include <vector>
 
 #include "my_alloc.h"
 #include "my_bitmap.h"
@@ -35,10 +36,12 @@
 #include "sql/sql_sort.h"
 
 class Item_func_match;
+class Item_func_myvector_is_ann;
 class QEP_TAB;
 class THD;
 struct Index_lookup;
 struct TABLE;
+struct Vec_hit;
 
 /**
   For each record on the left side of a join (given in Init()), returns one or
@@ -166,6 +169,31 @@ class FullTextSearchIterator final : public TableRowIterator {
   const bool m_use_order;
   const bool m_use_limit;
   ha_rows *const m_examined_rows;
+};
+
+/** Iterator placeholder for vector ANN index scans. */
+class VectorSearchIterator final : public TableRowIterator {
+ public:
+  VectorSearchIterator(THD *thd, TABLE *table, Index_lookup *ref,
+                       Item_func_myvector_is_ann *vec_func,
+                       ha_rows *examined_rows);
+  ~VectorSearchIterator() override;
+
+  bool Init() override;
+  int Read() override;
+  void Close();
+
+ private:
+  using Candidate = Vec_hit;
+
+  int ExecuteVectorSearch();
+
+  Index_lookup *const m_ref;
+  Item_func_myvector_is_ann *const m_vec_func;
+  ha_rows *const m_examined_rows;
+  std::vector<Candidate> m_results;
+  size_t m_pos{0};
+  bool m_initialized{false};
 };
 
 /*

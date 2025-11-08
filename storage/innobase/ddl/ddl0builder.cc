@@ -43,6 +43,7 @@ Created 2020-11-01 by Sunny Bains. */
 #include "row0ext.h"
 #include "row0vers.h"
 #include "ut0stage.h"
+#include "storage/innobase/vec/vec_txn_buf.h"
 
 namespace ddl {
 
@@ -1345,6 +1346,60 @@ dberr_t Builder::batch_add_row(Row &row, size_t thread_id) noexcept {
   return DB_SUCCESS;
 }
 
+dberr_t Builder::vector_add_row(Row &row, size_t thread_id) noexcept {
+  ut_a(is_vector_index());
+  ut_ad(thread_id < m_thread_ctxs.size() || m_thread_ctxs.empty());
+
+  dict_index_t *vec_index = m_index;
+  ut_a(vec_index != nullptr);
+
+  if (vec_index->vec_params == nullptr || vec_index->vec_params->dim == 0) {
+    ib::warn() << "VECINDEX: index '"
+               << (vec_index->name ? vec_index->name : "(null)")
+               << "' has invalid vector parameters";
+    return DB_ERROR;
+  }
+
+  const dict_field_t *vec_field = vec_index->get_field(0);
+  if (vec_field == nullptr || vec_field->col == nullptr) {
+    ib::warn() << "VECINDEX: index '"
+               << (vec_index->name ? vec_index->name : "(null)")
+               << "' is missing vector column metadata";
+    return DB_ERROR;
+  }
+
+  const dtuple_t *tuple = row.m_ptr;
+  if (tuple == nullptr) {
+    ib::warn() << "VECINDEX: row tuple is null when building index '"
+               << (vec_index->name ? vec_index->name : "(null)") << "'";
+    return DB_END_OF_INDEX;
+  }
+
+  const ulint col_no = dict_col_get_no(vec_field->col);
+  if (col_no >= dtuple_get_n_fields(tuple)) {
+    ib::warn() << "VECINDEX: column position " << col_no
+               << " out of range for row when building index '"
+               << (vec_index->name ? vec_index->name : "(null)") << "'";
+    return DB_ERROR;
+  }
+
+  const dfield_t *vector_field = dtuple_get_nth_field(tuple, col_no);
+  const unsigned dim = static_cast<unsigned>(vec_index->vec_params->dim);
+  //trx_t *trx = m_ctx.m_trx;
+  dict_table_t *table = m_ctx.m_new_table;
+
+  int rc = vec_collect_one_row(this->m_thread_ctxs[thread_id]->m_vec_items, table, vec_index, vector_field, dim, tuple);
+  if (rc != 0) {
+    ib::warn() << "VECINDEX: buffering row for index '"
+               << (vec_index->name ? vec_index->name : "(null)")
+               << "' failed with rc=" << rc;
+    return DB_ERROR;
+  }
+
+  return DB_SUCCESS;
+}
+
+
 dberr_t Builder::add_to_key_buffer(Copy_ctx &ctx,
                                    size_t &mv_rows_added) noexcept {
   const size_t old_mv_rows_added = mv_rows_added;
@@ -1599,6 +1654,8 @@ dberr_t Builder::add_row(Cursor &cursor, Row &row, size_t thread_id,
     if (!cursor.eof()) {
       err = batch_add_row(row, thread_id);
     }
+  } else if (is_vector_index()) {
+    err = vector_add_row(row, thread_id);
   } else {
     err = bulk_add_row(cursor, row, thread_id, std::move(latch_release));
     if (unlikely(err != DB_OVERFLOW && err != DB_SUCCESS &&
@@ -1961,6 +2018,37 @@ dberr_t Builder::fts_sort_and_build() noexcept {
     return DB_SUCCESS;
   }
 }
+
+dberr_t Builder::flush_vector_rows() noexcept {
+  vec_trx_ctx_t *tctx = vec_get_or_create_trx_ctx(m_ctx.m_trx);
+  if (tctx == nullptr) {
+    return DB_ERROR;
+  }
+  dict_index_t *index = m_index;
+  auto &global_bucket = tctx->by_index[index];
+
+  if (global_bucket.index == nullptr) {
+    global_bucket.index = index;
+    global_bucket.dim = index->vec_params->dim;
+  }
+
+  for (auto *thread_ctx : m_thread_ctxs) {
+    auto &items = thread_ctx->m_vec_items;
+    // ib::warn() << "VECINDEX: flushing " << items.size()
+    //            << " buffered rows for index '"
+    //            << (index->name ? index->name : "(null)") << "'";
+    if (!items.empty()) {
+      const auto old_size = global_bucket.items.size();
+      global_bucket.items.resize(old_size + items.size());
+      std::move(items.begin(), items.end(), global_bucket.items.begin() + old_size);
+      items.clear();
+      items.shrink_to_fit();
+    }
+  }
+
+  return DB_SUCCESS;
+}
+
 
 dberr_t Builder::finalize() noexcept {
   ut_a(m_ctx.m_need_observer);

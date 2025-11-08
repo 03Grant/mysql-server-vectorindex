@@ -38,6 +38,7 @@
 #include <bitset>
 #include <functional>
 #include <map>
+#include <vector>
 #include <memory>
 #include <optional>
 #include <random>  // std::mt19937
@@ -140,6 +141,11 @@ struct sdi_key_t {
 using sdi_container = std::vector<sdi_key_t>;
 struct sdi_vector_t {
   sdi_container m_vec;
+};
+
+struct Vec_hit {
+  longlong faiss_id;
+  float distance;
 };
 
 typedef bool (*qc_engine_callback)(THD *thd, const char *table_key,
@@ -5837,6 +5843,29 @@ class handler {
                                           Ft_hints *hints) {
     return ft_init_ext(hints->get_flags(), inx, key);
   }
+  virtual int ha_vec_search(const uchar *query, uint32 dim, size_t k,
+                         const uchar *options, size_t options_len,
+                         std::vector<Vec_hit> *result){
+    static_cast<void>(query);
+    static_cast<void>(dim);
+    static_cast<void>(k);
+    static_cast<void>(options);
+    static_cast<void>(options_len);
+    static_cast<void>(result);
+    return HA_ERR_WRONG_COMMAND;
+  }
+  virtual int ha_vec_fetch_row(const Vec_hit &hit) {
+    static_cast<void>(hit);
+    return HA_ERR_WRONG_COMMAND;
+  }
+  virtual int ha_vec_fetch_rows(const std::vector<Vec_hit> &batch,
+                                size_t read_no) {
+    static_cast<void>(batch);
+    static_cast<void>(read_no);
+    return HA_ERR_WRONG_COMMAND;
+  }
+  virtual void ha_vec_search_begin() {}
+  virtual void ha_vec_search_end() {}
   int ha_ft_read(uchar *buf);
   int ha_read_first_row(uchar *buf, uint primary_key);
 

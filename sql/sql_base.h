@@ -270,6 +270,8 @@ bool wait_while_table_is_used(THD *thd, TABLE *table,
 
 void update_non_unique_table_error(Table_ref *update, const char *operation,
                                    Table_ref *duplicate);
+
+int setup_is_ann_funcs(const THD *thd, Query_block *select);
 int setup_ftfuncs(const THD *thd, Query_block *select);
 bool init_ftfuncs(THD *thd, Query_block *select);
 int run_before_dml_hook(THD *thd);

@@ -55,7 +55,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0trx.h"
 #include "trx0undo.h"
 #include "usr0sess.h"
-#include "vec_ingest.h"
+#include "storage/innobase/vec/vec_ingest.h"
 
 #include "current_thd.h"
 

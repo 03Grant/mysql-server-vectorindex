@@ -167,7 +167,7 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
   }
 }
 
-// —— 收集一行 ——
+// —— 收集一行放入全局tctx bucket中 ——
 int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
                         const dfield_t *vector_field, const unsigned dim,
                         const dtuple_t *row_tuple) {
@@ -198,6 +198,27 @@ int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
   }
 
   bucket.items.emplace_back(std::move(item));
+  return 0;
+}
+
+// 放入已有的bucket中
+int vec_collect_one_row(std::vector<vec_item_t> &bucket, dict_table_t *table, dict_index_t *vindex,
+                        const dfield_t *vector_field, const unsigned dim,
+                        const dtuple_t *row_tuple){
+
+  if (!table || !vindex || !vector_field || !row_tuple || dim == 0) {
+    return -1;
+  }
+  vec_item_t item;
+  if (!vec_extract_and_validate(vector_field, dim, item.vec)) {
+    return -2;  // 长度/数据非法
+  }
+
+  if (!vec_capture_pk_columns(table, row_tuple, item.pk_columns)) {
+    return -3;
+  }
+
+  bucket.emplace_back(std::move(item));
   return 0;
 }
 

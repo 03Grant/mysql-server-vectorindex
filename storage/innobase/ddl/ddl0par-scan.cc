@@ -105,11 +105,12 @@ dberr_t Parallel_cursor::scan(Builders &builders) noexcept {
 
     if (use_n_threads > 1) {
       for (auto &builder : builders) {
-        if (builder->is_skip_file_sort() || builder->is_spatial_index()) {
+        if (builder->is_skip_file_sort() || builder->is_spatial_index() || builder->is_vector_index()) {
           /* Note: Parallel scan will break the order. If in the future we
           decide to force a parallel scan then we will need to force a file
           sort later. Or, figure out how to "stitch" the lists together after
           the dumping the rows from the scan. */
+          /* I find it is even faster when using a single thread for this type of scan in vector indexes. */
           m_single_threaded_mode = true;
           break;
         }

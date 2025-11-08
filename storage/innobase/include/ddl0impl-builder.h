@@ -36,6 +36,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ddl0impl-buffer.h"
 #include "ddl0impl-file-reader.h"
 #include "row0pread.h"
+#include "storage/innobase/vec/vec_txn_buf.h"
 
 namespace ddl {
 
@@ -116,6 +117,11 @@ struct Builder {
     return m_index->type & DICT_FTS;
   }
 
+  /** @return true if the index is a vector index. */
+  [[nodiscard]] bool is_vector_index() const noexcept {
+    return m_index->type & DICT_VECINDEX;
+  }
+
   /** @return true if the index is a unique index. */
   [[nodiscard]] bool is_unique_index() const noexcept {
     ut_a(!is_fts_index());
@@ -162,6 +168,10 @@ struct Builder {
   /** FTS: Sort and insert the rows read.
   @return DB_SUCCESS or error code. */
   [[nodiscard]] dberr_t fts_sort_and_build() noexcept;
+
+  
+  /** Flush the vector rows to global buffer. */
+  [[nodiscard]] dberr_t flush_vector_rows() noexcept;
 
   /** Non-FTS: Sort the rows read.
   @return DB_SUCCESS or error code. */
@@ -259,6 +269,9 @@ struct Builder {
 
     /** For spatial/Rtree rows handling. */
     RTree_inserter *m_rtree_inserter{};
+
+    /** For vector index rows handling. */
+    std::vector<vec_item_t> m_vec_items;
   };
 
   using Allocator = ut::allocator<Thread_ctx *>;
@@ -307,6 +320,12 @@ struct Builder {
   @param[in] thread_id          ID of current thread.
   @return DB_SUCCESS or error code. */
   [[nodiscard]] dberr_t batch_add_row(Row &row, size_t thread_id) noexcept;
+
+  /** Cache a row for batch inserts. Currently used by vector indexes.
+  @param[in,out] row            Row to add.
+  @param[in] thread_id          ID of current thread.
+  @return DB_SUCCESS or error code. */
+  [[nodiscard]] dberr_t vector_add_row(Row &row, size_t thread_id) noexcept;
 
   /** Add a row to the merge buffer.
   @param[in,out]        cursor        Current scan cursor.

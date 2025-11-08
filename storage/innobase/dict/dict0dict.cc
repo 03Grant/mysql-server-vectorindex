@@ -492,6 +492,12 @@ static void dict_table_try_drop_aborted_and_mutex_exit(
 @param[in] try_drop True=try to drop any orphan indexes after an aborted online
 index creation */
 void dict_table_close(dict_table_t *table, bool dict_locked, bool try_drop) {
+  if (UNIV_UNLIKELY(table != nullptr && table->get_ref_count() == 0)) {
+    ib::error() << "DICT_TABLE_CLOSE: ref_count=0 before close for table '"
+                << (table->name.m_name ? table->name.m_name : "(null)")
+                << "' dict_locked=" << dict_locked
+                << " try_drop=" << try_drop << " table_ptr=" << table;
+  }
   ut_a(table->get_ref_count() > 0);
 
 #ifndef UNIV_HOTBACKUP

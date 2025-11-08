@@ -36,6 +36,7 @@
 
 class JOIN;
 class Item_func_match;
+class Item_func_myvector_is_ann;
 class store_key;
 struct POSITION;
 
@@ -229,7 +230,11 @@ enum join_type {
     the results into one. The merge can be used to
     produce unions and intersections
   */
-  JT_INDEX_MERGE
+  JT_INDEX_MERGE,
+  /*
+    Use vector index
+  */
+  JT_VECINDEX
 };
 
 /// Holds members common to JOIN_TAB and QEP_TAB.
@@ -255,6 +260,7 @@ class QEP_shared {
         prefix_tables_map(0),
         added_tables_map(0),
         m_ft_func(nullptr),
+        m_vec_func(nullptr),
         m_skip_records_in_range(false) {}
 
   /*
@@ -311,6 +317,8 @@ class QEP_shared {
   table_map added_tables() const { return added_tables_map; }
   Item_func_match *ft_func() const { return m_ft_func; }
   void set_ft_func(Item_func_match *f) { m_ft_func = f; }
+  Item_func_myvector_is_ann *vec_func() const { return m_vec_func; }
+  void set_vec_func(Item_func_myvector_is_ann *f) { m_vec_func = f; }
 
   // More elaborate functions:
 
@@ -466,6 +474,8 @@ class QEP_shared {
 
   /** FT function */
   Item_func_match *m_ft_func;
+  /** Vector ANN function */
+  Item_func_myvector_is_ann *m_vec_func;
 
   /**
     Set if index dive can be skipped for this query.
@@ -540,6 +550,10 @@ class QEP_shared_owner {
   table_map added_tables() const { return m_qs->added_tables(); }
   Item_func_match *ft_func() const { return m_qs->ft_func(); }
   void set_ft_func(Item_func_match *f) { return m_qs->set_ft_func(f); }
+  Item_func_myvector_is_ann *vec_func() const { return m_qs->vec_func(); }
+  void set_vec_func(Item_func_myvector_is_ann *f) {
+    return m_qs->set_vec_func(f);
+  }
   void set_prefix_tables(table_map prefix_tables, table_map prev_tables) {
     return m_qs->set_prefix_tables(prefix_tables, prev_tables);
   }

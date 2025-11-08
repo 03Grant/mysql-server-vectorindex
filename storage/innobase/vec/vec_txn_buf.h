@@ -55,7 +55,12 @@ int vec_collect_one_row(trx_t*           trx,
                         const unsigned   dim,
                         const dtuple_t*  row_tuple);     // 当前行的 InnoDB tuple
 
-
+int vec_collect_one_row(std::vector<vec_item_t> &bucket, 
+                        dict_table_t*   table, 
+                        dict_index_t*   vindex,
+                        const dfield_t* vector_field,
+                        const unsigned  dim,
+                        const dtuple_t* row_tuple);
 
 // 提交成功或回滚时清空
 void vec_trx_ctx_clear(vec_trx_ctx_t* ctx);

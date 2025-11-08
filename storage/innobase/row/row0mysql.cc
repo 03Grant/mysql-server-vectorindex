@@ -1728,7 +1728,7 @@ run_again:
       goto error_exit;
     }
   }
-  ib::warn() << "Insert  vec_index end.";
+  //ib::warn() << "Insert  vec_index end.";
 
   que_thr_stop_for_mysql_no_error(thr, trx);
 

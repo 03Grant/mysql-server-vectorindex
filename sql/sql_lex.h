@@ -1365,6 +1365,9 @@ class Query_block : public Query_term {
   /// @return true if query block references full-text functions
   bool has_ft_funcs() const { return ftfunc_list->elements > 0; }
 
+  /// @return true if query block references vector functions
+  bool has_vec_funcs() const { return vecfunc_list->elements > 0; }
+
   /// @returns true if query block is a recursive member of a recursive unit
   bool is_recursive() const { return recursive_reference != nullptr; }
 
@@ -1394,6 +1397,7 @@ class Query_block : public Query_term {
   bool add_item_to_list(Item *item);
   bool add_grouping_expr(THD *thd, Item *item);
   bool add_ftfunc_to_list(Item_func_match *func);
+  bool add_vecfunc_to_list(Item_func_myvector_is_ann *func);
   Table_ref *add_table_to_list(THD *thd, Table_ident *table, const char *alias,
                                ulong table_options,
                                thr_lock_type flags = TL_UNLOCK,
@@ -1512,6 +1516,8 @@ class Query_block : public Query_term {
 
   /// Add full-text function elements from a list into this query block
   bool add_ftfunc_list(List<Item_func_match> *ftfuncs);
+
+  bool add_vecfunc_list(List<Item_func_myvector_is_ann> *vecfuncs);
 
   void set_lock_for_table(const Lock_descriptor &descriptor, Table_ref *table);
 
@@ -1960,6 +1966,12 @@ class Query_block : public Query_term {
   */
   List<Item_func_match> *ftfunc_list;
   List<Item_func_match> ftfunc_list_alloc{};
+
+  /**
+    A pointer to vecfunc_list, list of vector functions.
+   */
+  List<Item_func_myvector_is_ann> *vecfunc_list;
+  List<Item_func_myvector_is_ann> vecfunc_list_alloc{};
 
   /// The VALUES items of a table value constructor.
   mem_root_deque<mem_root_deque<Item *> *> *row_value_list{nullptr};

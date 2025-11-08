@@ -6357,6 +6357,54 @@ static bool dd_get_or_assign_fts_tablespace_id(const dict_table_t *parent_table,
   return true;
 }
 
+/** Set table options for vec dd tables according to dict table
+@param[in,out]  dd_table        dd table instance
+@param[in]      table           dict table instance */
+void dd_set_vec_table_options(dd::Table *dd_table, const dict_table_t *table) {
+  dd_table->set_engine(innobase_hton_name);
+  //dd_table->set_hidden(dd::Abstract_table::HT_HIDDEN_SE);
+  dd_table->set_collation_id(my_charset_bin.number);
+
+  dd::Table::enum_row_format row_format = dd::Table::RF_DYNAMIC;
+  switch (dict_tf_get_rec_format(table->flags)) {
+    case REC_FORMAT_REDUNDANT:
+      row_format = dd::Table::RF_REDUNDANT;
+      break;
+    case REC_FORMAT_COMPACT:
+      row_format = dd::Table::RF_COMPACT;
+      break;
+    case REC_FORMAT_COMPRESSED:
+      row_format = dd::Table::RF_COMPRESSED;
+      break;
+    case REC_FORMAT_DYNAMIC:
+      row_format = dd::Table::RF_DYNAMIC;
+      break;
+    default:
+      ut_error;
+  }
+
+  dd_table->set_row_format(row_format);
+
+  /* FTS AUX tables are always not encrypted/compressed
+  as it is designed now. So both "compress" and "encrypt_type"
+  option are not set */
+
+  dd::Properties *table_options = &dd_table->options();
+  table_options->set("pack_record", true);
+  table_options->set("checksum", false);
+  table_options->set("delay_key_write", false);
+  table_options->set("avg_row_length", 0);
+  table_options->set("stats_sample_pages", 0);
+  table_options->set("stats_auto_recalc", HA_STATS_AUTO_RECALC_DEFAULT);
+
+  if (auto zip_ssize = DICT_TF_GET_ZIP_SSIZE(table->flags)) {
+    table_options->set("key_block_size", 1 << (zip_ssize - 1));
+  } else {
+    table_options->set("key_block_size", 0);
+  }
+}
+
+
 /** Set table options for fts dd tables according to dict table
 @param[in,out]  dd_table        dd table instance
 @param[in]      table           dict table instance */
@@ -6826,6 +6874,48 @@ static inline void vec_split_db_tbl(const char* full, std::string& db, std::stri
   dict_name::get_table(full, db, tbl);
 }
 
+static dd::Column *vec_dd_find_column(const std::vector<dd::Column*> &cols,
+                                      const char *name) {
+  for (dd::Column *col : cols) {
+    if (col != nullptr && col->name() == name) {
+      return col;
+    }
+  }
+  return nullptr;
+}
+
+static inline void vec_dd_add_index_elements(
+    dd::Index *dd_index, const dict_index_t *dict_index,
+    const std::vector<dd::Column *> &dd_cols) {
+  ut_ad(dd_index != nullptr);
+  ut_ad(dict_index != nullptr);
+
+  const ulint n_unique = dict_index_get_n_unique(dict_index);
+
+  for (ulint i = 0; i < n_unique; ++i) {
+    const dict_field_t *field = dict_index->get_field(i);
+    ut_ad(field != nullptr);
+    const char *field_name =
+        field->name ? static_cast<const char *>(field->name) : nullptr;
+    dd::Column *dd_col = vec_dd_find_column(dd_cols, field_name);
+    if (dd_col == nullptr) {
+      continue;
+    }
+
+    dd::Index_element *elem = dd_index->add_element(dd_col);
+    if (field->prefix_len > 0) {
+      elem->set_length(static_cast<uint>(field->prefix_len));
+    } else {
+      const dict_col_t *col = field->col;
+      if (col != nullptr) {
+        elem->set_length(static_cast<uint>(col->len));
+      }
+    }
+    elem->set_order(field->is_ascending ? dd::Index_element::ORDER_ASC
+                                        : dd::Index_element::ORDER_DESC);
+  }
+}
+
 /** 把 dict_col_t -> dd::Column，尽量和物理表一致。
     这里只给出骨架：你可以根据 mtype/prtype 映射到 DD 的枚举类型，
     并设置 collation/unsigned/nullable/length/prefix 等。
@@ -6843,15 +6933,17 @@ static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
 
   // 是否 unsigned（整数）
   const bool is_unsigned = (c->prtype & DATA_UNSIGNED) != 0;
+  out->set_unsigned(is_unsigned);
 
+  out->set_default_value_null(true);
   // —— 类型映射 (TODO: 按你的版本补全) ——————————————
   switch (c->mtype) {
     case DATA_INT:
       out->set_type(dd::enum_column_types::LONGLONG); // 简化：统一用 BIGINT
-      out->set_unsigned(is_unsigned);
-      out->set_char_length(20);
+      out->set_numeric_precision(static_cast<uint>(c->len * 8));
       out->set_numeric_scale(0);
       out->set_collation_id(my_charset_bin.number);
+      out->set_char_length(static_cast<uint>(c->len));
       break;
 
     case DATA_VARMYSQL:
@@ -6879,18 +6971,6 @@ static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
       out->set_collation_id(my_charset_bin.number);
       break;
   }
-}
-
-/** 为 PRIMARY 添加元素，保留 prefix_len + 升降序 */
-static inline void vec_dd_add_pk_element(dd::Index* dd_pk,
-                                         dd::Column* dd_col,
-                                         ulint       prefix_len,
-                                         bool        ascending)
-{
-  dd::Index_element* e = dd_pk->add_element(dd_col);
-  if (prefix_len > 0) e->set_length(static_cast<uint>(prefix_len));
-  e->set_order(ascending ? dd::Index_element::ORDER_ASC
-                         : dd::Index_element::ORDER_DESC);
 }
 
 /** Create DD row for the single VEC aux table (already created physically).
@@ -6925,7 +7005,7 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
   dd_table->set_schema_id(schema->id());
 
   // 1) 设隐藏/引擎等（直接复用 FTS 的 helper；里面会 set_hidden(HT_HIDDEN_SE)）
-  dd_set_fts_table_options(dd_table, table);
+  dd_set_vec_table_options(dd_table, table);
   // 如果不想用 FTS 名称，可以包一层 dd_set_vec_table_options() 调 dd_set_fts_table_options()
 
   // 2) 添加列（顺序必须与物理表一致：你建表时先 PK 列，再 faiss_id）
@@ -6961,28 +7041,18 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
   dd_pk->set_generated(false);
   dd_pk->set_engine(dd_table->engine());
 
-  // 从 parent_table 的聚簇索引取字段定义（保留 prefix/order）
-  const dict_index_t* clust = parent_table->first_index();
-  ut_ad(clust && clust->is_clustered());
-
-  if (std::strcmp(clust->name, "GEN_CLUST_INDEX") == 0) {
-    // 无显式 PK：我们的物理 aux 第一列是 row_id
-    vec_dd_add_pk_element(dd_pk, dd_cols[0], /*prefix*/0, /*asc*/true);
-  } else {
-    // 显式 PK：逐列
-    for (ulint i = 0; i < clust->n_uniq; ++i) {
-      const dict_field_t* f = clust->get_field(i);
-      const char*   name = f->name;
-      // 在 dd_cols 里找到同名列指针（我们建表时列名一致）
-      dd::Column* ddcol = nullptr;
-      for (dd::Column* c : dd_cols) {
-        if (c->name() == name) { ddcol = c; break; }
-      }
-      ut_ad(ddcol != nullptr);
-      vec_dd_add_pk_element(dd_pk, ddcol, f->prefix_len,
-                            f->is_ascending != 0);
-    }
+  const dict_index_t *aux_pk =
+      dict_table_get_index_on_name(table, "PRIMARY", true);
+  if (aux_pk == nullptr) {
+    aux_pk = dict_table_get_index_on_name(table, "PRIMARY", false);
   }
+  if (aux_pk == nullptr) {
+    ib::warn() << "VECINDEX: missing PRIMARY index on aux table "
+               << table->name.m_name;
+    return false;
+  }
+
+  vec_dd_add_index_elements(dd_pk, aux_pk, dd_cols);
 
   // 4) 添加唯一索引：u_faiss_id(faiss_id)
   {
@@ -6993,16 +7063,22 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
     uk->set_visible(true);
     uk->set_type(dd::Index::IT_UNIQUE);
     uk->set_ordinal_position(2);
-    uk->set_generated(false);
+   uk->set_generated(false);
     uk->set_engine(dd_table->engine());
 
-    // 找到 faiss_id 列
-    dd::Column* c = nullptr;
-    for (dd::Column* x : dd_cols) {
-      if (x->name() == "faiss_id") { c = x; break; }
+    const dict_index_t *aux_unique =
+        dict_table_get_index_on_name(table, "u_faiss_id", true);
+    if (aux_unique == nullptr) {
+      aux_unique =
+          dict_table_get_index_on_name(table, "u_faiss_id", false);
     }
-    ut_ad(c != nullptr);
-    uk->add_element(c); // 无前缀，默认升序
+    if (aux_unique == nullptr) {
+      ib::warn() << "VECINDEX: missing u_faiss_id index on aux table "
+                 << table->name.m_name;
+      return false;
+    }
+
+    vec_dd_add_index_elements(uk, aux_unique, dd_cols);
   }
 
   // 5) 确定/分配 dd_space_id（强烈建议复用 FTS helper：它涵盖各种空间情况）

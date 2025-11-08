@@ -920,7 +920,7 @@ bool JOIN::optimize(bool finalize_access_paths) {
       if (!tab->position()) continue;
       if (setup_join_buffering(tab, this, no_jbuf_after)) return true;
       if (tab->use_join_cache() != JOIN_CACHE::ALG_NONE) simple_sort = false;
-      assert(tab->type() != JT_FT ||
+      assert((tab->type() != JT_FT && tab->type() != JT_VECINDEX) ||
              tab->use_join_cache() == JOIN_CACHE::ALG_NONE);
       if (has_lateral && get_lateral_deps(*best_ref[i]) != 0) {
         deps_of_remaining_lateral_derived_tables =
@@ -1383,6 +1383,7 @@ uint QEP_TAB::effective_index() const {
 
     case JT_INDEX_SCAN:
     case JT_FT:
+    case JT_VECINDEX:
       return index();
 
     case JT_INDEX_MERGE:
@@ -2316,7 +2317,9 @@ static bool test_if_skip_sort_order(JOIN_TAB *tab, ORDER_with_src &order,
         down_cast<const Item_field *>(item)->field->part_of_sortkey);
     if (usable_keys.is_clear_all()) return false;  // No usable keys
   }
-  if (tab->type() == JT_REF_OR_NULL || tab->type() == JT_FT) return false;
+  if (tab->type() == JT_REF_OR_NULL || tab->type() == JT_FT ||
+      tab->type() == JT_VECINDEX)
+    return false;
 
   ref_key = -1;
   /* Test if constant range in WHERE */
@@ -2633,7 +2636,8 @@ check_reverse_order:
         goto fix_ICP;
       }
 
-      assert(tab->type() != JT_REF_OR_NULL && tab->type() != JT_FT);
+      assert(tab->type() != JT_REF_OR_NULL && tab->type() != JT_FT &&
+             tab->type() != JT_VECINDEX);
 
       // Changing the key makes filter_effect obsolete
       tab->position()->filter_effect = COND_FILTER_STALE;
@@ -7968,6 +7972,58 @@ static bool add_ft_keys(Key_use_array *keyuse_array, Item *cond,
   return keyuse_array->push_back(keyuse);
 }
 
+
+static bool add_vec_keys(Key_use_array *keyuse_array, Item *cond,
+                         table_map usable_tables) {
+  if (cond == nullptr) return false;
+  assert(cond->is_bool_func());
+
+  if (cond->type() == Item::FUNC_ITEM) {
+    Item_func *func = down_cast<Item_func *>(cond);
+    if (func->functype() == Item_func::MYVECTOR_IS_ANN_FUNC) {
+      auto *ann = down_cast<Item_func_myvector_is_ann *>(func);
+      Table_ref *tbl = ann->table_ref();
+      const uint keyno = ann->keyno();
+
+      if (tbl == nullptr || keyno == UINT_MAX) return false;
+      if (!(usable_tables & tbl->map())) return false;
+      if (!tbl->table->keys_in_use_for_query.is_set(keyno)) return false;
+
+      const Key_use keyuse(tbl, ann, ann->key_item()->used_tables(), keyno,
+                           VECINDEX_KEYPART,
+                           0,            // optimize
+                           0,            // keypart_map
+                           ~(ha_rows)0,  // ref_table_rows
+                           false,        // null_rejecting
+                           nullptr,      // cond_guard
+                           UINT_MAX);    // sj_pred_no
+      tbl->table->reginfo.join_tab->keys().set_bit(keyno);
+      return keyuse_array->push_back(keyuse);
+    }
+    
+
+    // How about OR?
+    if (func->functype() == Item_func::COND_AND_FUNC) {
+      List_iterator_fast<Item> it(*down_cast<Item_cond *>(cond)->argument_list());
+      Item *arg;
+      while ((arg = it++))
+        if (add_vec_keys(keyuse_array, arg, usable_tables)) return true;
+    }
+    return false;
+  }
+
+  if (cond->type() == Item::COND_ITEM) {
+    List_iterator_fast<Item> it(*down_cast<Item_cond *>(cond)->argument_list());
+    Item *arg;
+    while ((arg = it++))
+      if (add_vec_keys(keyuse_array, arg, usable_tables)) return true;
+  }
+
+  return false;
+}
+
+
+
 /**
   Compares two keyuse elements.
 
@@ -8454,6 +8510,9 @@ static bool update_ref_and_keys(THD *thd, Key_use_array *keyuse,
   if (query_block->ftfunc_list->elements) {
     if (add_ft_keys(keyuse, cond, normal_tables, true)) return true;
   }
+  if (query_block->vecfunc_list->elements) {
+    if (add_vec_keys(keyuse, cond, normal_tables)) return true;
+  }
 
   /*
     Sort the array of possible keys and remove the following key parts:
@@ -8484,7 +8543,7 @@ static bool update_ref_and_keys(THD *thd, Key_use_array *keyuse,
       if (use->val->const_for_execution() &&
           use->optimize != KEY_OPTIMIZE_REF_OR_NULL)
         table->const_key_parts[use->key] |= use->keypart_map;
-      if (use->keypart != FT_KEYPART) {
+      if (use->keypart != FT_KEYPART && use->keypart != VECINDEX_KEYPART) {
         if (use->key == prev->key && use->table_ref == prev->table_ref) {
           if (prev->keypart + 1 < use->keypart ||
               (prev->keypart == use->keypart && found_eq_constant))

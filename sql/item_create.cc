@@ -1658,6 +1658,7 @@ static const std::pair<const char *, Create_func *> func_array[] = {
     {"FROM_VECTOR", SQL_FN(Item_func_from_vector, 1)},
     {"VECTOR_TO_STRING", SQL_FN(Item_func_from_vector, 1)},
     {"VECTOR_DIM", SQL_FN(Item_func_vector_dim, 1)},
+    {"MYVECTOR_IS_ANN", SQL_FN_V(Item_func_myvector_is_ann, 2, 3)},
     {"UCASE", SQL_FN(Item_func_upper, 1)},
     {"UNCOMPRESS", SQL_FN(Item_func_uncompress, 1)},
     {"UNCOMPRESSED_LENGTH", SQL_FN(Item_func_uncompressed_length, 1)},

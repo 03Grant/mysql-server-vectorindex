@@ -301,7 +301,7 @@ dberr_t Loader::load() noexcept {
   for (auto builder : m_builders) {
     ut_a(builder->get_state() == Builder::State::ADD);
     /* RTrees are built during the scan phase, using row by row insert. */
-    if (!builder->is_spatial_index()) {
+    if (!builder->is_spatial_index() && !builder->is_vector_index()) {
       builder->set_next_state();
       add_task(Task{builder});
     }
@@ -372,6 +372,13 @@ dberr_t Loader::prepare() noexcept {
   /* Allocate memory for merge file data structure and initialize fields */
 
   auto err = m_ctx.setup_fts_build();
+  
+  if (err != DB_SUCCESS) {
+    return err;
+  }
+  
+  //? Create vector index structures here because it is easy.
+  err = m_ctx.setup_vecindex_build();
 
   if (err != DB_SUCCESS) {
     return err;
@@ -426,21 +433,25 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
 
   auto cursor = Cursor::create_cursor(m_ctx);
 
+  // ib::warn() << "Loader: Cursor created for scanning. ";
+
   if (cursor == nullptr) {
     ut_d(cleanup());
     return DB_OUT_OF_MEMORY;
   }
 
+  // ib::warn() << "Loader: Cursor initialized for reading. ";
+
   auto err = m_ctx.read_init(cursor);
 
   if (err == DB_SUCCESS) {
     cursor->open();
-
+    // ib::warn() << "Loader: Cursor opened for reading. ";
     /* Reset the MySQL row buffer that is used when reporting duplicate keys.
     Return needs to be checked since innobase_rec_reset tries to evaluate
     set_default() which can also be a function and might return errors */
     innobase_rec_reset(m_ctx.m_table);
-
+    // ib::warn() << "Loader: Cursor reset for reading. ";
     if (m_ctx.m_table->in_use->is_error()) {
       err = DB_COMPUTE_VALUE_FAILED;
     } else {
@@ -448,19 +459,34 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
       index entries for merge sort and bulk build of the indexes. */
       err = cursor->scan(m_builders);
     }
-
+    // ib::warn() << "Loader: Cursor scan completed. ";
     /* Close the mtr and release any locks, wait for FTS etc. */
-    err = cursor->finish(err);
 
+    if (err == DB_SUCCESS) {
+      for (auto builder : m_builders) {
+        if (builder->is_vector_index()) {
+          // ib::warn() << "VECINDEX: Flushing vector rows for index '"
+          //            << (builder->index()->name ? builder->index()->name
+          //                                       : "(null)")
+          //            << "'";
+          err = builder->flush_vector_rows();
+          if (err != DB_SUCCESS) {
+            break;
+          }
+        }
+      }
+    }
+
+    err = cursor->finish(err);
+    // ib::warn() << "Loader: Cursor finished reading. ";
     DBUG_EXECUTE_IF("force_virtual_col_build_fail",
                     err = DB_COMPUTE_VALUE_FAILED;);
 
     DEBUG_SYNC_C("ddl_after_scan");
-
     if (err == DB_SUCCESS) {
       err = load();
     }
-
+    // ib::warn() << "Loader: Load completed. ";
     DBUG_EXECUTE_IF("ddl_insert_big_row", err = DB_TOO_BIG_RECORD;);
   }
 
@@ -468,7 +494,7 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
     ut::delete_(cursor);
     cursor = nullptr;
   }
-
+  // ib::warn() << "Loader: Cursor destroyed after reading. ";
   ut_d(cleanup());
 
   return err;
@@ -477,10 +503,11 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
 dberr_t Loader::build_all() noexcept {
   auto err = prepare();
 
+  // ib::warn() << "Loader prepare completed. ";
   if (err == DB_SUCCESS) {
     err = scan_and_build_indexes();
   }
-
+  // ib::warn() << "Loader scan and build indexes completed. ";
   DBUG_EXECUTE_IF("ib_build_indexes_too_many_concurrent_trxs",
                   err = DB_TOO_MANY_CONCURRENT_TRXS;
                   m_ctx.m_trx->error_state = err;);
@@ -508,7 +535,8 @@ dberr_t Loader::build_all() noexcept {
 #ifdef UNIV_DEBUG
 bool Loader::validate_indexes() const noexcept {
   for (auto &builder : m_builders) {
-    if (!builder->is_fts_index() &&
+    if (!builder->is_fts_index() && 
+        !builder->is_vector_index() &&
         !btr_validate_index(builder->index(), nullptr, false)) {
       return false;
     }

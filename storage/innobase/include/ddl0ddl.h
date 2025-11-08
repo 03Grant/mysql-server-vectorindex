@@ -35,6 +35,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "lock0types.h"
 #include "os0file.h"
 #include "ut0class_life_cycle.h"
+#include "storage/innobase/vec/vec_index_runtime.h"
 
 // Forward declaration
 class Flush_observer;
@@ -45,6 +46,7 @@ namespace ddl {
 struct Dup;
 struct Row;
 struct FTS;
+struct VEC;
 class Loader;
 struct Cursor;
 struct Context;
@@ -126,6 +128,10 @@ struct Index_defn {
 
   /** SRID obtained from dd column */
   uint32_t m_srid{};
+
+  /** Vector index comment */
+  const char *m_vec_comment{};
+
 };
 
 /** Structure for reporting duplicate records. */
@@ -373,6 +379,21 @@ struct Context {
     ddl::FTS *m_ptr{};
   };
 
+  /** Vector Index information. */
+  struct VEC {
+    /** Constructor. */
+    VEC() noexcept;
+
+    /** Destructor. */
+    ~VEC() noexcept;
+
+    /** Vector Index. */
+    std::vector<dict_index_t*> indexes;
+    /** (Need it here?) Vector Index Runtime Context. */
+    std::vector<vec_index_ctx_t*> m_vec_runtime;
+
+  };
+
   /** Scan sort and IO buffer size. */
   using Scan_buffer_size = std::pair<size_t, size_t>;
 
@@ -504,6 +525,16 @@ struct Context {
   @param[in,out] cursor         Cursor used for the cluster index read. */
   [[nodiscard]] dberr_t read_init(Cursor *cursor) noexcept;
 
+
+  /** Initialize the VECINDEX build infrastructure.
+  @param[in,out] index          Index prototype to build.
+  @return DB_SUCCESS or error code. */
+  dberr_t vecindex_create(dict_index_t *index) noexcept;
+
+  /** Setup the VECINDEX index build data structures.
+  @return DB_SUCCESS or error code. */
+  [[nodiscard]] dberr_t setup_vecindex_build() noexcept;
+
   /** Initialize the FTS build infrastructure.
   @param[in,out] index          Index prototype to build.
   @return DB_SUCCESS or error code. */
@@ -560,6 +591,9 @@ struct Context {
 
   /** @return true if any FTS indexes are involved. */
   [[nodiscard]] bool has_fts_indexes() const noexcept;
+
+  /** @return true if any VEC indexes are involved. */
+  [[nodiscard]] bool has_vec_indexes() const noexcept;
 
   /** @return true if the DDL was interrupted. */
   [[nodiscard]] bool is_interrupted() noexcept;

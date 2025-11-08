@@ -34,11 +34,16 @@
 #include <array>
 #include <cassert>
 #include <climits>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "decimal.h"
 #include "field_types.h"
@@ -58,6 +63,7 @@
 #include "sql/aggregate_check.h"  // Distinct_check
 #include "sql/check_stack.h"
 #include "sql/current_thd.h"  // current_thd
+#include "sql/log.h"
 #include "sql/derror.h"       // ER_THD
 #include "sql/error_handler.h"
 #include "sql/field.h"
@@ -99,6 +105,90 @@ using std::min;
 
 static const enum_walk walk_options =
     enum_walk::PREFIX | enum_walk::POSTFIX | enum_walk::SUBQUERY;
+
+namespace {
+
+using Query_vector_format = Item_func_myvector_is_ann::Query_vector_format;
+
+inline void skip_ws(const char *&ptr, const char *end) {
+  while (ptr < end && std::isspace(static_cast<unsigned char>(*ptr))) ++ptr;
+}
+
+bool parse_vector_options(const String &options, Query_vector_format *format) {
+  if (options.length() == 0) return true;
+  std::string lowered(options.ptr(), options.length());
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  auto pos = lowered.find("query_type");
+  if (pos == std::string::npos) return true;
+  if (lowered.find("binary", pos) != std::string::npos) {
+    *format = Query_vector_format::kBinary;
+    return true;
+  }
+  if (lowered.find("float", pos) != std::string::npos) {
+    *format = Query_vector_format::kFloat;
+    return true;
+  }
+  return false;
+}
+
+bool construct_query_vector(const String &input, Query_vector_format format,
+                            std::vector<uint8_t> *out, uint32 *dimension) {
+  out->clear();
+  *dimension = 0;
+
+  if (format == Query_vector_format::kBinary) {
+    size_t len = input.length();
+    if (len == 0 || (len % sizeof(float)) != 0) return false;
+    out->assign(reinterpret_cast<const uint8_t *>(input.ptr()),
+                reinterpret_cast<const uint8_t *>(input.ptr()) + len);
+    *dimension = static_cast<uint32>(len / sizeof(float));
+    return *dimension != 0;
+  }
+
+  const char *ptr = input.ptr();
+  const char *end = ptr + input.length();
+
+  skip_ws(ptr, end);
+  if (ptr < end && *ptr == '[') {
+    ++ptr;
+  }
+
+  while (ptr < end) {
+    skip_ws(ptr, end);
+    if (ptr >= end) break;
+    if (*ptr == ']') {
+      ++ptr;
+      break;
+    }
+
+    errno = 0;
+    char *next = nullptr;
+    double val = std::strtod(ptr, &next);
+    if (next == ptr || errno == ERANGE) return false;
+    float f = static_cast<float>(val);
+    const uint8_t *raw = reinterpret_cast<const uint8_t *>(&f);
+    out->insert(out->end(), raw, raw + sizeof(float));
+    ++(*dimension);
+
+    ptr = next;
+    skip_ws(ptr, end);
+    if (ptr < end && *ptr == ',') {
+      ++ptr;
+      continue;
+    }
+    if (ptr < end && *ptr == ']') {
+      ++ptr;
+      break;
+    }
+  }
+
+  skip_ws(ptr, end);
+  if (ptr < end) return false;
+  return *dimension != 0;
+}
+
+}  // namespace
 
 static bool convert_constant_item(THD *, Item_field *, Item **, bool *);
 static longlong get_year_value(THD *thd, Item ***item_arg, Item **cache_arg,
@@ -4111,6 +4201,245 @@ bool Item_func_case::get_date(MYSQL_TIME *ltime, my_time_flags_t fuzzydate) {
   if (item->get_date(ltime, fuzzydate)) return error_date();
   null_value = item->null_value;
   return false;
+}
+
+bool Item_func_myvector_is_ann::do_itemize(Parse_context *pc, Item **res) {
+  if (skip_itemize(res)) return false;
+
+  if (super::do_itemize(pc, res)) return true;
+
+  m_table_ref = nullptr;
+  m_table = nullptr;
+  m_keyno = UINT_MAX;
+  m_query_dim = 0;
+  m_vector_column_is_index = false;
+  m_query_is_constant = false;
+  m_vector_data.clear();
+
+  if (pc->select->add_vecfunc_to_list(this)) return true;
+  return false;
+}
+
+bool Item_func_myvector_is_ann::fix_fields(THD *thd, Item **ref) {
+  if (argument_count() < 2 || argument_count() > 3) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return true;
+  }
+  // sql_print_warning("MYVECTOR_IS_ANN: fix_fields");
+  if (Item_bool_func::fix_fields(thd, ref)) return true;
+  set_nullable(false);
+
+  Item *vec_arg = args[0];
+  if (vec_arg->type() != Item::FIELD_ITEM) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return true;
+  }
+
+  auto *field_item = down_cast<Item_field *>(vec_arg);
+  Field *field = field_item->field;
+  if (field == nullptr) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return true;
+  }
+
+  m_table_ref = field_item->m_table_ref;
+  m_table = field->table;
+  if (m_table == nullptr || m_table_ref == nullptr) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return true;
+  }
+
+  const char *log_db = m_table_ref->db ? m_table_ref->db : "";
+  const char *log_table =
+      m_table_ref->table_name ? m_table_ref->table_name : "";
+  // sql_print_warning("MYVECTOR_IS_ANN: resolved table=%s.%s", log_db,
+  //                   log_table);
+
+  enum_field_types real_type = field->real_type();
+  bool ok_vector =
+      (real_type == MYSQL_TYPE_VECTOR) ||
+      (field->binary() && (real_type == MYSQL_TYPE_VAR_STRING ||
+                           real_type == MYSQL_TYPE_VARCHAR ||
+                           real_type == MYSQL_TYPE_STRING ||
+                           real_type == MYSQL_TYPE_BLOB));
+  if (!ok_vector) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return true;
+  }
+
+  m_vector_column_is_index = false;
+  m_keyno = UINT_MAX;
+  m_query_format = Query_vector_format::kFloat;
+  m_options_raw.clear();
+
+  if (m_table->s != nullptr) {
+    for (uint i = 0; i < m_table->s->keys; ++i) {
+      KEY *key = &m_table->key_info[i];
+      bool is_vecindex =
+          (key->algorithm == HA_KEY_ALG_VECINDEX) || (key->flags & HA_VECINDEX);
+      if (!is_vecindex) continue;
+      if (key->user_defined_key_parts == 0 ||
+          key->key_part[0].field != field) {
+        continue;
+      }
+
+      m_vector_column_is_index = true;
+      m_keyno = i;
+      break;
+    }
+  }
+
+  if (!m_vector_column_is_index) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return true;
+  }
+
+  if (argument_count() == 3) {
+    Item *opt_arg = args[2];
+    if (opt_arg->result_type() != STRING_RESULT && opt_arg->check_cols(1)) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+      return true;
+    }
+    if (opt_arg->const_item()) {
+      String buffer;
+      String *opt_string = opt_arg->val_str(&buffer);
+      if (opt_arg->null_value || opt_string == nullptr) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+        return true;
+      }
+      m_options_raw.assign(opt_string->ptr(), opt_string->length());
+      Query_vector_format fmt = m_query_format;
+      if (!parse_vector_options(*opt_string, &fmt)) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+        return true;
+      }
+      m_query_format = fmt;
+      // sql_print_warning("MYVECTOR_IS_ANN: options format=%s",
+      //                   m_query_format == Query_vector_format::kBinary ? "binary"
+      //                                                                  : "float");
+    }
+  }
+
+  Item *query_arg = args[1];
+  if (query_arg->result_type() != STRING_RESULT && query_arg->check_cols(1)) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return true;
+  }
+
+  m_query_is_constant = query_arg->const_item();
+  m_vector_data.clear();
+  m_query_dim = 0;
+
+  if (m_query_is_constant) {
+    String buffer;
+    String *query_string = query_arg->val_str(&buffer);
+    if (query_arg->null_value || query_string == nullptr ||
+        query_string->ptr() == nullptr || query_string->length() == 0) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+      return true;
+    }
+
+    uint32 dim = 0;
+    if (!construct_query_vector(*query_string, m_query_format, &m_vector_data,
+                                &dim)) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+      return true;
+    }
+
+    // sql_print_warning("MYVECTOR_IS_ANN: parsed vector dim=%u format=%s",
+    //                   dim, m_query_format == Query_vector_format::kBinary ? "binary"
+    //                                                                       : "float");
+    // push_warning_printf(thd, Sql_condition::SL_WARNING,
+    //                     ER_UNKNOWN_ERROR, "MYVECTOR_IS_ANN: Successfully parsed");
+    m_query_dim = dim;
+  }
+
+  m_last_result = false;
+
+  return false;
+}
+
+bool Item_func_myvector_is_ann::resolve_type(THD *thd) {
+  if (param_type_is_default(thd, 1, argument_count(), MYSQL_TYPE_VARCHAR))
+    return true;
+
+  set_data_type_bool();
+  collation.set_numeric();
+  set_nullable(false);
+  max_length = 1;
+  decimals = 0;
+  unsigned_flag = false;
+  return false;
+}
+
+longlong Item_func_myvector_is_ann::val_int() {
+  null_value = false;
+  return m_last_result ? 1 : 0;
+}
+
+bool Item_func_myvector_is_ann::build_query_vector(std::vector<uint8_t> *out,
+                                                   uint32 *dim) {
+  if (out == nullptr || dim == nullptr) {
+    return false;
+  }
+
+  out->clear();
+  *dim = 0;
+
+  if (m_query_is_constant) {
+    if (m_vector_data.empty() || m_query_dim == 0) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+      return false;
+    }
+    *out = m_vector_data;
+    *dim = m_query_dim;
+    return true;
+  }
+
+  Item *query_arg = query_item();
+  if (query_arg == nullptr) {
+    return false;
+  }
+
+  String buffer;
+  String *query_string = query_arg->val_str(&buffer);
+  if (query_arg->null_value || query_string == nullptr ||
+      query_string->ptr() == nullptr || query_string->length() == 0) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return false;
+  }
+
+  if (!construct_query_vector(*query_string, m_query_format, out, dim)) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0), func_name());
+    return false;
+  }
+
+  return *dim != 0;
+}
+
+bool Item_func_myvector_is_ann::eq_specific(const Item *item) const {
+  if (item->type() != Item::FUNC_ITEM) return false;
+  const auto *other = dynamic_cast<const Item_func_myvector_is_ann *>(item);
+  if (other == nullptr) return false;
+  return args[0]->eq(other->args[0]) &&
+         args[1]->eq(other->args[1]) &&
+         ((argument_count() == other->argument_count() &&
+           (argument_count() == 2 ||
+            args[2]->eq(other->args[2]))) ||
+          (argument_count() != other->argument_count() && false));
+}
+
+void Item_func_myvector_is_ann::print(const THD *thd, String *str,
+                                      enum_query_type query_type) const {
+  str->append(STRING_WITH_LEN("MYVECTOR_IS_ANN("));
+  args[0]->print(thd, str, query_type);
+  str->append(',');
+  args[1]->print(thd, str, query_type);
+  if (argument_count() == 3) {
+    str->append(',');
+    args[2]->print(thd, str, query_type);
+  }
+  str->append(')');
 }
 
 bool Item_func_case::get_time(MYSQL_TIME *ltime) {

@@ -9,8 +9,22 @@
 
 struct vec_index_ctx_t;
 struct dict_index_t;
+class THD;
+struct TABLE;
+class handler;
+class MDL_ticket;
+
+struct vec_aux_table_handle {
+  TABLE *table{nullptr};
+  handler *se_handler{nullptr};
+  MDL_ticket *mdl_ticket{nullptr};
+};
 
 dberr_t vec_create_index_low(dict_index_t* idx);
+dberr_t vec_open_aux_table(dict_index_t* idx);
+dberr_t vec_open_aux_table_for_thd(dict_index_t* idx, THD *thd,
+                                   vec_aux_table_handle *handle);
+void vec_close_aux_table_for_thd(THD *thd, vec_aux_table_handle *handle);
 
 // 创建/销毁（只 new，不加向量）
 std::unique_ptr<vec_index_ctx_t> vec_create(const vec_params_t& p);
@@ -29,5 +43,3 @@ int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const faiss::idx_t* 
 
 int vec_search(vec_index_ctx_t& ctx, const float* q, size_t nq,
            size_t k, float* distances, faiss::idx_t* labels);                   // 召回
-
-

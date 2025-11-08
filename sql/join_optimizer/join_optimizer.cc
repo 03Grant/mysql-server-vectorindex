@@ -6244,6 +6244,9 @@ string PrintAccessPath(const AccessPath &path, const JoinHypergraph &graph,
     case AccessPath::FULL_TEXT_SEARCH:
       str += "FULL_TEXT_SEARCH";
       break;
+    case AccessPath::VECTOR_SEARCH:
+      str += "VECTOR_SEARCH";
+      break;
     case AccessPath::CONST_TABLE:
       str += "CONST_TABLE";
       break;

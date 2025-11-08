@@ -32,11 +32,13 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <assert.h>
 #include <sys/types.h>
+#include <vector>
 #include "create_field.h"
 #include "field.h"
 #include "handler.h"
 #include "mysql/components/services/clone_protocol_service.h"
 
+#include "storage/innobase/vec/vec_index_adapter.h"
 #include "row0pread-adapter.h"
 #include "row0pread-histogram.h"
 #include "trx0trx.h"
@@ -189,6 +191,14 @@ class ha_innobase : public handler {
                                   Ft_hints *hints) override;
 
   int ft_read(uchar *buf) override;
+  int ha_vec_search(const uchar *query, uint32 dim, size_t k,
+                 const uchar *options, size_t options_len,
+                 std::vector<Vec_hit> *result) override;
+  int ha_vec_fetch_row(const Vec_hit &hit) override;
+  int ha_vec_fetch_rows(const std::vector<Vec_hit> &batch,
+                        size_t read_no) override;
+  void ha_vec_search_begin() override;
+  void ha_vec_search_end() override;
 
   void position(const uchar *record) override;
 
@@ -722,6 +732,35 @@ class ha_innobase : public handler {
 
   /** Save CPU time with prebuilt/cached data structures */
   row_prebuilt_t *m_prebuilt;
+
+  /** Cached auxiliary table state for vector search fetches. */
+  vec_aux_table_handle m_vec_aux_handle;
+
+  /** True if m_vec_aux_handle currently references an open auxiliary table. */
+  bool m_vec_aux_handle_open{false};
+
+  /** Cached rows produced by the latest vector fetch batch. */
+  std::vector<std::vector<uchar>> m_vec_row_cache_rows;
+
+  /** True when m_vec_row_cache_rows contains a complete batch. */
+  bool m_vec_row_cache_ready{false};
+
+  /** Cached reclength for the current table when the batch cache was built. */
+  size_t m_vec_row_cache_reclength{0};
+
+  int vec_fetch_row_into_buffer(const Vec_hit &hit, uchar *row_buf);
+  int vec_populate_row_cache(const std::vector<Vec_hit> &batch);
+  void vec_clear_row_cache();
+  int vec_prepare_aux_metadata(TABLE *aux_table, KEY **aux_faiss_key,
+                               Field **aux_faiss_field, KEY **aux_pk_key,
+                               uint *aux_faiss_index_no);
+  int vec_lookup_base_pk(vec_index_ctx_t *ctx, handler *aux_handler,
+                         TABLE *aux_table, KEY *aux_faiss_key,
+                         Field *aux_faiss_field, KEY *aux_pk_key,
+                         KEY *base_pk_key, uint aux_faiss_index_no,
+                         dict_index_t *faiss_index,
+                         std::vector<uchar> &base_pk_keybuf,
+                         const Vec_hit &hit);
 
   /** Thread handle of the user currently using the handler;
   this is set in external_lock function */

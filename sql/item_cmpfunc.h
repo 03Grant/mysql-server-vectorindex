@@ -31,6 +31,8 @@
 
 #include <cstring>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "field_types.h"
 #include "my_alloc.h"
@@ -1663,6 +1665,69 @@ class Item_func_nullif final : public Item_bool_func2 {
 };
 
 /* Functions to handle the optimized IN */
+
+/* MYVECTOR_IS_ANN */
+
+class Item_func_myvector_is_ann final : public Item_bool_func {
+  typedef Item_bool_func super;
+
+ public:
+  Item_func_myvector_is_ann(const POS &pos, Item *vec_col, Item *query)
+      : Item_bool_func(pos, vec_col, query) {}
+
+  Item_func_myvector_is_ann(const POS &pos, Item *vec_col, Item *query,
+                            Item *options)
+      : Item_bool_func(pos, vec_col, query, options) {}
+
+  Item_func_myvector_is_ann(Item *vec_col, Item *query)
+      : Item_bool_func(vec_col, query) {}
+
+  Item_func_myvector_is_ann(Item *vec_col, Item *query, Item *options)
+      : Item_bool_func(vec_col, query, options) {}
+  const char *func_name() const override { return "myvector_is_ann"; }
+  enum Functype functype() const override { return MYVECTOR_IS_ANN_FUNC; }
+  
+
+  bool do_itemize(Parse_context *pc, Item **res) override;
+  bool fix_fields(THD *thd, Item **ref) override;
+  bool resolve_type(THD *thd) override;
+  Item *key_item() const override { return args[0]; }
+  Item *query_item() const { return args[1]; }
+  Item *options_item() const { return argument_count() == 3 ? args[2] : nullptr; }
+  void set_last_result(bool hit) { m_last_result = hit; }
+  bool last_result() const { return m_last_result; }
+  bool build_query_vector(std::vector<uint8_t> *out, uint32 *dim);
+  
+  //bool reject_vector_args() override { return false; }
+  bool eq_specific(const Item *item) const override;
+  void print(const THD *thd, String *str,
+             enum_query_type query_type) const override;
+  longlong val_int() override;
+
+  enum class Query_vector_format { kFloat, kBinary };
+
+  Table_ref *table_ref() const { return m_table_ref; }
+  TABLE *table() const { return m_table; }
+  uint keyno() const { return m_keyno; }
+  uint32 query_dim() const { return m_query_dim; }
+  Query_vector_format query_format() const { return m_query_format; }
+  const std::vector<uint8_t> &vector_data() const { return m_vector_data; }
+  bool query_is_constant() const { return m_query_is_constant; }
+  const std::string &options_raw() const { return m_options_raw; }
+
+ private:
+  Table_ref *m_table_ref{nullptr};
+  TABLE *m_table{nullptr};
+  uint m_keyno{UINT_MAX};
+  uint32 m_query_dim{0};
+  bool m_vector_column_is_index{false};
+  bool m_query_is_constant{false};
+  // query vector data stored as bytes (used when the vector literal is constant)
+  std::vector<uint8_t> m_vector_data;
+  Query_vector_format m_query_format{Query_vector_format::kFloat};
+  std::string m_options_raw;
+  bool m_last_result{false};
+};
 
 /* A vector of values of some type  */
 

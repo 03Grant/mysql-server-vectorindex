@@ -37,6 +37,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <mysql_com.h>
 
 #include "ha_prototypes.h"
+#include "storage/innobase/vec/vec_index_adapter.h"
 
 #include "data0type.h"
 #endif /* !UNIV_HOTBACKUP */
@@ -792,6 +793,12 @@ void dict_mem_index_free(dict_index_t *index) /*!< in: index */
 #endif /* !UNIV_HOTBACKUP */
 
   index->rtr_srs.reset();
+
+  if (index->vec_runtime != nullptr) {
+    // ib::warn() << "FREE: Memory vector index runtime address:" << index->vec_runtime;
+    vec_destroy(index->vec_runtime);
+    index->vec_runtime = nullptr;
+  }
 
   mem_heap_free(index->heap);
 }

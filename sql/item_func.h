@@ -356,7 +356,8 @@ class Item_func : public Item_result_field {
     JSON_SEARCH_FUNC,
     JSON_SCHEMA_VALIDATION_REPORT_FUNC,
     JSON_SCHEMA_VALID_FUNC,
-    ETAG_FUNC
+    ETAG_FUNC,
+    MYVECTOR_IS_ANN_FUNC
   };
   enum optimize_type {
     OPTIMIZE_NONE,

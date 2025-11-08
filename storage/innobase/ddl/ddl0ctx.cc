@@ -40,6 +40,7 @@ Created 2020-11-01 by Sunny Bains. */
 #include "ha_prototypes.h"
 #include "handler0alter.h"
 #include "row0log.h"
+#include "storage/innobase/vec/vec_index_adapter.h"
 
 namespace ddl {
 
@@ -302,6 +303,24 @@ dberr_t Context::fts_create(dict_index_t *index) noexcept {
   }
 }
 
+dberr_t Context::vecindex_create(dict_index_t *index) noexcept {
+  // ib::warn() << "Create faiss in memory index . ";
+  dberr_t err = vec_create_index_low(index);
+  // ib::warn() << "Memory vector index runtime address:" << index->vec_runtime;
+  if (err == DB_SUCCESS && index->vec_runtime != nullptr) {
+    dberr_t aux_err = vec_open_aux_table(index);
+    if (aux_err != DB_SUCCESS) {
+      ib::warn() << "VECINDEX: unable to open auxiliary table during build for '"
+                 << (index->name ? index->name : "(null)") << "'";
+    }
+  }
+  ut_ad(index);
+  // ib::warn() << "Ready to create aux table .. ";
+  // err = vec_create_index_tables_low(m_trx, index, m_new_table->name.m_name, m_new_table->id);
+  // ib::warn() << "Memory index Created . ";
+  return err;
+}
+
 dberr_t Context::cleanup(dberr_t err) noexcept {
   ut_a(err == m_err);
 
@@ -446,6 +465,19 @@ bool Context::has_fts_indexes() const noexcept {
   return false;
 }
 
+bool Context::has_vec_indexes() const noexcept {
+  if (dict_table_has_vec_index(m_old_table)) {
+    return true;
+  }
+
+  for (auto index : m_indexes) {
+    if (index->type & DICT_VECINDEX) {
+      return true;
+    }
+  }
+  return false;
+}
+
 dberr_t Context::setup_fts_build() noexcept {
   for (auto index : m_indexes) {
     if (!(index->type & DICT_FTS)) {
@@ -454,6 +486,23 @@ dberr_t Context::setup_fts_build() noexcept {
 
     /* There can be only one FTS index on a table. */
     auto err = fts_create(index);
+
+    if (err != DB_SUCCESS) {
+      return err;
+    }
+  }
+
+  return DB_SUCCESS;
+}
+
+dberr_t Context::setup_vecindex_build() noexcept {
+  for (auto index : m_indexes) {
+    if (!(index->type & DICT_VECINDEX)) {
+      continue;
+    }
+
+    /* There can be only one VECINDEX on a table. */
+    auto err = vecindex_create(index);
 
     if (err != DB_SUCCESS) {
       return err;

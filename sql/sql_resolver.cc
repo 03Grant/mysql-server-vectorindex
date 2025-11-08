@@ -580,6 +580,8 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
     if (setup_ftfuncs(thd, this)) return true;
   }
 
+  if (has_vec_funcs() && setup_is_ann_funcs(thd, this)) return true;
+
   if (query_result() && query_result()->prepare(thd, fields, unit)) return true;
 
   if (has_sj_candidates() && flatten_subqueries(thd)) return true;
@@ -3331,6 +3333,10 @@ bool Query_block::convert_subquery_to_semijoin(
       add_ftfunc_list(subq_query_block->ftfunc_list))
     return true; /* purecov: inspected */
 
+  if (subq_query_block->vecfunc_list->elements && 
+      add_vecfunc_list(subq_query_block->vecfunc_list))
+    return true; /* purecov: inspected */
+
   if (do_aj)
     has_aj_nests = true;
   else
@@ -3588,6 +3594,10 @@ bool Query_block::merge_derived(THD *thd, Table_ref *derived_table) {
   // Add any full-text functions from derived table into outer query
   if (derived_query_block->ftfunc_list->elements &&
       add_ftfunc_list(derived_query_block->ftfunc_list))
+    return true; /* purecov: inspected */
+
+  if (derived_query_block->vecfunc_list->elements &&
+      add_vecfunc_list(derived_query_block->vecfunc_list))
     return true; /* purecov: inspected */
 
   /*
@@ -3977,6 +3987,23 @@ bool Query_block::add_ftfunc_list(List<Item_func_match> *ftfuncs) {
   List_iterator_fast<Item_func_match> li(*ftfuncs);
   while ((ifm = li++)) {
     if (ftfunc_list->push_back(ifm)) return true; /* purecov: inspected */
+  }
+  return false;
+}
+
+/**
+  Add a list of vector function elements into a query block.
+
+  @param vecfuncs   List of vector function elements to add.
+
+  @returns false if success, true if error
+*/
+
+bool Query_block::add_vecfunc_list(List<Item_func_myvector_is_ann> *vecfuncs) {
+  Item_func_myvector_is_ann *ivm;
+  List_iterator_fast<Item_func_myvector_is_ann> li(*vecfuncs);
+  while ((ivm = li++)) {
+    if (vecfunc_list->push_back(ivm)) return true; /* purecov: inspected */
   }
   return false;
 }

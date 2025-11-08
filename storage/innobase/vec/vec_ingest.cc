@@ -6,6 +6,7 @@
 #include "trx0roll.h"
 #include "ut0dbg.h"
 #include <faiss/Index.h>
+#include <omp.h>
 
 #include <cstring>
 
@@ -23,7 +24,7 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
   }
 
 
-  ib::warn() << "Step 1 vec_apply_bucket. ";
+  // ib::warn() << "Step 1 vec_apply_bucket. ";
 
 
   auto* ctx = index->vec_runtime;
@@ -45,11 +46,13 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
   faiss::Index* flat = ctx->indices[0].get();
   faiss::idx_t start = 0;
   {
+    omp_set_num_threads(index->vec_params->build_threads); 
     std::lock_guard<std::mutex> g(ctx->mu);
     start = static_cast<faiss::idx_t>(flat->ntotal); // 现有向量数
     flat->add(k, xb.data());                         // 内部分配 id: start..start+k-1
+    omp_set_num_threads(1);
   }
-  ib::warn() << "Step 2 vec_apply_bucket. ";
+  // ib::warn() << "Step 2 vec_apply_bucket. ";
 
   // 3) 锁外写辅助表：把主键快照与 start+i 写入辅助表（与事务同生死）
 

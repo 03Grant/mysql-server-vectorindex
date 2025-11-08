@@ -226,7 +226,7 @@ Key_use *Optimize_table_order::find_best_ref(
   double best_ref_cost = DBL_MAX;
 
   // Index type, note that code below relies on this element definition order
-  enum idx_type { CLUSTERED_PK, UNIQUE, NOT_UNIQUE, FULLTEXT };
+enum idx_type { CLUSTERED_PK, UNIQUE, NOT_UNIQUE, VECINDEX, FULLTEXT };
   enum idx_type best_found_keytype = NOT_UNIQUE;
 
   TABLE *const table = tab->table();
@@ -274,8 +274,11 @@ Key_use *Optimize_table_order::find_best_ref(
     DBUG_PRINT("info", ("Considering ref access on key %s", keyinfo->name));
     Opt_trace_object trace_access_idx(trace);
 
+    const bool is_vecindex = (keyuse->keypart == VECINDEX_KEYPART);
     enum idx_type cur_keytype =
-        (keyuse->keypart == FT_KEYPART) ? FULLTEXT : NOT_UNIQUE;
+        (keyuse->keypart == FT_KEYPART)
+            ? FULLTEXT
+            : (is_vecindex ? VECINDEX : NOT_UNIQUE);
 
     // Calculate how many key segments of the current key we can use
     Key_use *const start_key = keyuse;
@@ -335,7 +338,7 @@ Key_use *Optimize_table_order::find_best_ref(
           const_part |= keyuse->keypart_map;
         }
         found_part |= keyuse->keypart_map;
-        if (keypart != FT_KEYPART) {
+        if (keypart != FT_KEYPART && keypart != VECINDEX_KEYPART) {
           const bool keyinfo_maybe_null =
               keyinfo->key_part[keypart].field->is_nullable() ||
               tab->table()->is_nullable();
@@ -373,8 +376,8 @@ Key_use *Optimize_table_order::find_best_ref(
         distinct_keys_est = tab->records();
     }
 
-    // fulltext indexes require special treatment
-    if (cur_keytype != FULLTEXT) {
+    // fulltext/vector indexes require special treatment
+    if (cur_keytype != FULLTEXT && cur_keytype != VECINDEX) {
       *found_condition |= (0 != found_part);
 
       const bool all_key_parts_covered =
@@ -668,18 +671,19 @@ Key_use *Optimize_table_order::find_best_ref(
         continue;
       }
     } else {
-      // This is a full-text index
+      // This is a full-text or vector index
 
-      trace_access_idx.add_alnum("access_type", "fulltext")
+      const bool is_vec = (cur_keytype == VECINDEX);
+      trace_access_idx.add_alnum("access_type", is_vec ? "vecindex" : "fulltext")
           .add_utf8("index", keyinfo->name);
 
       if (best_found_keytype < NOT_UNIQUE) {
         trace_access_idx.add("chosen", false)
             .add_alnum("cause", "heuristic_eqref_already_found");
-        // Ignore test_all_ref_keys, semijoin loosescan never uses fulltext
+        // Ignore test_all_ref_keys, semijoin loosescan never uses these indexes
         continue;
       }
-      // Actually it should be cur_fanout=0.0 (yes!) but 1.0 is probably safer
+      // For ANN/FT indexes we rely on engine cost; use fanout 1 as conservative
       cur_read_cost = prev_record_reads(join, idx, table_deps) *
                       table->cost_model()->page_read_cost(1.0);
       cur_fanout = 1.0;
@@ -699,7 +703,7 @@ Key_use *Optimize_table_order::find_best_ref(
       so far if:
 
        1) The access type for the best index and the current index is
-          FULLTEXT or REF, and the current index has a lower cost
+          FULLTEXT/VECINDEX or REF, and the current index has a lower cost
        2) The access type is the same for the best index and the
           current index, and the current index has a lower cost
           (ie, both indexes are UNIQUE)
@@ -1343,12 +1347,13 @@ float calculate_condition_filter(const JOIN_TAB *const tab,
   if (keyuse) {
     const KEY *key = table->key_info + keyuse->key;
 
-    if (keyuse[0].keypart == FT_KEYPART) {
+    if (keyuse[0].keypart == FT_KEYPART ||
+        keyuse[0].keypart == VECINDEX_KEYPART) {
       /*
         Fulltext indexes are special because keyuse->keypart does not
         contain the keypart number but a constant (FT_KEYPART)
-        defining that it is a fulltext index. However, since fulltext
-        search demands that all indexed keyparts are used, iterating
+        defining that it is a fulltext/vecindex key. However, since these
+        searches demand that all indexed keyparts are used, iterating
         over the next 'actual_key_parts' works.
       */
       for (uint i = 0; i < key->actual_key_parts; i++)
@@ -1675,13 +1680,13 @@ bool Optimize_table_order::semijoin_loosescan_fill_driving_table_position(
         /*
           If this Key_use is not about a semi-join equality, or references an
           excluded table, or does not reference a not-yet-available table, or
-          is for fulltext, or is over a prefix, then it is not a "handled sj
+          is for fulltext/vecindex, or is over a prefix, then it is not a "handled sj
           equality".
         */
         if ((keyuse->sj_pred_no == UINT_MAX) ||
             (excluded_tables & keyuse->used_tables) ||
             !(remaining_tables & keyuse->used_tables) ||
-            (keypart == FT_KEYPART) ||
+            (keypart == FT_KEYPART || keypart == VECINDEX_KEYPART) ||
             (table->key_info[key].key_part[keypart].key_part_flag &
              HA_PART_KEY_SEG))
           continue;
