@@ -9,11 +9,15 @@
 
 
 #include <cstring>
+#include <cstdint>
 #include <string>
 #include <sstream>
 #include <vector>
+#include <utility>
 #include <cstdio>   // std::snprintf
 #include <cstddef>  // size_t
+#include <limits>
+#include <algorithm>
 
 #include "fts0priv.h"         // fts_parse_sql / fts_eval_sql
 #include "pars0pars.h"        // pars_info_* helpers
@@ -223,138 +227,6 @@ dberr_t vec_aux_insert_one(
 }
 
 
-// dberr_t vec_aux_insert_one(trx_t* trx,
-//                            dict_index_t* index,
-//                            const std::vector<vec_pk_column_t>& pk_columns,
-//                            uint64_t faiss_id)
-// {
-//   ut_ad(trx != nullptr);
-//   ut_ad(index != nullptr && (index->type & DICT_VECINDEX));
-//   if (!trx || !index || !index->table || !(index->type & DICT_VECINDEX)) {
-//     return DB_ERROR;
-//   }
-
-//   const std::string aux_full = vec_aux_full_name(index); // 形如 "db/I_VEC_<tid>_<iid>"
-//   if (aux_full.empty()) {
-//     ib::warn() << "VECINDEX: derive aux name failed for index "
-//                << (index->name ? index->name : "(null)");
-//     return DB_ERROR;
-//   }
-
-//   if (pk_columns.empty()) {
-//     ib::warn() << "VECINDEX: empty pk_columns";
-//     return DB_ERROR;
-//   }
-//   for (size_t i = 0; i < pk_columns.size(); ++i) {
-//     if (pk_columns[i].is_null) {
-//       ib::warn() << "VECINDEX: NULL in PK column #" << i << " not allowed";
-//       return DB_ERROR;
-//     }
-//   }
-
-//   ib::warn() << "Insert Aux step 1";
-//   // --- 准备 fts_table_t（注意 suffix 需要可持久的缓冲） ---
-//   fts_table_t ft{};
-//   ft.parent   = index->table->name.m_name;
-//   ft.type     = FTS_INDEX_TABLE;
-//   ft.table_id = index->table->id;
-//   ft.index_id = index->id;
-//   {
-//     auto pos = aux_full.find('/');
-//     std::string suf = (pos == std::string::npos) ? aux_full : aux_full.substr(pos + 1);
-//     ft.suffix = mem_strdup(suf.c_str()); // <- 复制一份
-//   }
-//   ft.table   = index->table;
-//   ft.charset = nullptr;
-
-//   ib::warn() << "Insert Aux step 2";
-
-//   // --- 构造绑定 ---
-//   pars_info_t* info = pars_info_create();
-//   if (!info) return DB_OUT_OF_MEMORY;
-
-
-//   ib::warn() << "Insert Aux step 3";
-
-//   // 绑定表标识符（带 schema）
-//   pars_info_bind_id(info, /*qualified=*/true, "table_name", aux_full.c_str());
-
-//   ib::warn() << "Insert Aux step 4";
-
-//   // 绑定列标识符：$c0..$cN, $vid
-//   // 列名建议在 DDL 构造 aux 时就固定成 pk_0, pk_1, ...；否则这里从 vec_pk_column_t 带过来
-//   for (size_t i = 0; i < pk_columns.size(); ++i) {
-//     char iname[8];
-//     std::snprintf(iname, sizeof(iname), "c%zu", i);
-//     const char* colname = pk_columns[i].col_name.c_str(); // 请保证这里有真实列名
-//     pars_info_bind_id(info, /*qualified=*/false, iname, colname);
-//   }
-
-//   ib::warn() << "Insert Aux step 5";
-
-//   pars_info_bind_id(info, /*qualified=*/false, "vid", "faiss_id");
-
-//   ib::warn() << "Insert Aux step 6";
-//   // 绑定值字面量：:p0..:pN, :faiss_id
-//   for (size_t i = 0; i < pk_columns.size(); ++i) {
-//     char pname[8];
-//     std::snprintf(pname, sizeof(pname), "p%zu", i);
-//     const auto& col = pk_columns[i];
-
-//     // 确保 mtype/prtype 正确来源于基表 PK 列
-//     if (col.mtype == 0) {
-//       ib::warn() << "VECINDEX: pk_columns[" << i << "].mtype not set";
-//       pars_info_free(info);
-//       return DB_ERROR;
-//     }
-
-//     pars_info_add_literal(
-//         info, pname,
-//         col.data.empty() ? nullptr : col.data.data(),
-//         col.data.size(),
-//         col.mtype, col.prtype);
-//   }
-
-//   ib::warn() << "Insert Aux step 7";
-//   pars_info_add_ull_literal(info, "faiss_id", faiss_id);
-
-//   ib::warn() << "Insert Aux step 8";
-//   // --- 拼 SQL（显式列清单，不要 BEGIN） ---
-//   std::string col_list, val_list;
-//   for (size_t i = 0; i < pk_columns.size(); ++i) {
-//     if (i) { col_list += ", "; val_list += ", "; }
-//     char cbuf[8], pbuf[8];
-//     std::snprintf(cbuf, sizeof(cbuf), "$c%zu", i);
-//     std::snprintf(pbuf, sizeof(pbuf), ":p%zu", i);
-//     col_list += cbuf;
-//     val_list += pbuf;
-//   }
-//   if (!pk_columns.empty()) { col_list += ", "; val_list += ", "; }
-//   col_list += "$vid";
-//   val_list += ":faiss_id";
-
-//   std::string sql = "INSERT INTO $table_name (" + col_list + ") VALUES (" + val_list + ");";
-
-//   ib::warn() << "Insert Aux step 9";
-//   // --- 解析与执行 ---
-//   que_t* graph = fts_parse_sql(&ft, info, sql.c_str());
-//   if (!graph) {
-//     pars_info_free(info);
-//     return DB_ERROR;
-//   }
-
-//   ib::warn() << "Insert Aux step 10";
-//   trx->op_info = "vector index aux insert";
-//   dberr_t err = fts_eval_sql(trx, graph);
-
-//   ib::warn() << "Insert Aux step 11";
-//   que_graph_free(graph);
-//   // pars_info_free(info); // 若 fts/pars 接口会把 info 吸收到图里，可不手动 free；否则在上面失败分支已 free
-//   ib::warn() << "Insert Aux step 12";
-//   return err;
-// }
-
-
 /** Extract only the required flags from table->flags2 for FTS Aux
 tables.
 @param[in]      flags2  Table flags2
@@ -448,6 +320,87 @@ static dberr_t vec_create_one_index_dd_tables(const dict_index_t* index)
   ib::warn() << "VECINDEX: DD register successed! ";
 
 
+  return DB_SUCCESS;
+}
+
+namespace {
+// Convert to key image for mysql engine
+inline void vec_cache_append_u32(std::vector<unsigned char> &buf,
+                                 uint32_t value) {
+  buf.push_back(static_cast<unsigned char>(value & 0xFF));
+  buf.push_back(static_cast<unsigned char>((value >> 8) & 0xFF));
+  buf.push_back(static_cast<unsigned char>((value >> 16) & 0xFF));
+  buf.push_back(static_cast<unsigned char>((value >> 24) & 0xFF));
+}
+
+inline void vec_cache_append_u64(std::vector<unsigned char> &buf,
+                                 uint64_t value) {
+  for (int i = 0; i < 8; ++i) {
+    buf.push_back(static_cast<unsigned char>((value >> (i * 8)) & 0xFF));
+  }
+}
+
+inline void vec_cache_append_u8(std::vector<unsigned char> &buf,
+                                unsigned char value) {
+  buf.push_back(value);
+}
+
+static std::vector<unsigned char> vec_pack_pk_columns(
+    const std::vector<vec_pk_column_t> &pk_columns) {
+  std::vector<unsigned char> packed;
+  const uint32_t num_cols =
+      static_cast<uint32_t>(std::min<size_t>(pk_columns.size(), UINT32_MAX));
+  packed.reserve(8 + pk_columns.size() * 16);
+
+  vec_cache_append_u32(packed, num_cols);
+  for (const auto &col : pk_columns) {
+    vec_cache_append_u8(packed, col.is_null ? 1 : 0);
+    vec_cache_append_u64(packed, static_cast<uint64_t>(col.mtype));
+    vec_cache_append_u64(packed, static_cast<uint64_t>(col.prtype));
+    const uint32_t len =
+        static_cast<uint32_t>(std::min<size_t>(col.data.size(), UINT32_MAX));
+    vec_cache_append_u32(packed, len);
+    packed.insert(packed.end(), col.data.begin(), col.data.end());
+  }
+
+  return packed;
+}
+
+}  // namespace
+
+dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache, uint64_t faiss_id,
+                             const std::vector<vec_pk_column_t> &pk_columns) {
+  if (cache == nullptr) {
+    return DB_ERROR;
+  }
+
+  if (faiss_id >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    ib::error() << "VECINDEX: faiss_id too large for aux cache: " << faiss_id;
+    return DB_ERROR;
+  }
+
+  std::vector<unsigned char> packed = vec_pack_pk_columns(pk_columns);
+  if (packed.empty()) {
+    packed.push_back(0);  // keep non-empty to distinguish stored entry
+  }
+
+  if (cache->key_length == 0) {
+    cache->key_length = packed.size();
+  }
+
+  const size_t target = static_cast<size_t>(faiss_id);
+  if (target < cache->pk_values.size()) {
+    cache->pk_values[target] = std::move(packed);
+  } else if (target == cache->pk_values.size()) {
+    cache->pk_values.emplace_back(std::move(packed));
+  } else {
+    ib::error() << "VECINDEX: faiss_id gap when inserting into cache, expected "
+                << cache->pk_values.size() << " got " << target;
+    return DB_ERROR;
+  }
+
+  cache->ready = true;
   return DB_SUCCESS;
 }
 

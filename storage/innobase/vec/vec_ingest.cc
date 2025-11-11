@@ -33,6 +33,8 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
     return DB_ERROR;
   }
 
+  ctx->aux_cache.clear();
+
   const size_t dim = size_t(bucket.dim);
   const size_t k   = bucket.items.size();
 
@@ -68,6 +70,15 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
                  << " faiss_id=" << faiss_id
                  << " error=" << last_err;
       return last_err;
+    }
+
+    dberr_t cache_err =
+        vec_insert_aux_cache(&ctx->aux_cache, faiss_id, it.pk_columns);
+    if (cache_err != DB_SUCCESS) {
+      ib::warn() << "VECINDEX: failed to insert aux cache entry for index "
+                 << (index->name ? index->name : "(null)")
+                 << " faiss_id=" << faiss_id;
+      return cache_err;
     }
   }
 
