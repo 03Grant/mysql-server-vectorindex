@@ -78,7 +78,6 @@ struct INNOBASE_SHARE {
 
 /** Prebuilt structures in an InnoDB table handle used within MySQL */
 struct row_prebuilt_t;
-struct Vec_aux_lookup_state;
 
 namespace dd {
 namespace cache {
@@ -752,21 +751,6 @@ class ha_innobase : public handler {
   int vec_fetch_row_into_buffer(const Vec_hit &hit, uchar *row_buf);
   int vec_populate_row_cache(const std::vector<Vec_hit> &batch);
   void vec_clear_row_cache();
-  int vec_prepare_aux_metadata(TABLE *aux_table, KEY **aux_faiss_key,
-                               Field **aux_faiss_field, KEY **aux_pk_key,
-                               uint *aux_faiss_index_no);
-  int vec_lookup_base_pk(vec_index_ctx_t *ctx, handler *aux_handler,
-                         TABLE *aux_table, KEY *aux_faiss_key,
-                         Field *aux_faiss_field, KEY *aux_pk_key,
-                         KEY *base_pk_key, uint aux_faiss_index_no,
-                         dict_index_t *faiss_index,
-                         std::vector<uchar> &base_pk_keybuf,
-                         const Vec_hit &hit,
-                         Vec_aux_lookup_state *lookup_state);
-  int vec_prepare_lookup_state(vec_index_ctx_t *ctx, handler *aux_handler,
-                               TABLE *aux_table, dict_index_t *faiss_index,
-                               Vec_aux_lookup_state *lookup_state);
-  void vec_release_lookup_state(Vec_aux_lookup_state *lookup_state);
 
   /** Thread handle of the user currently using the handler;
   this is set in external_lock function */

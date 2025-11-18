@@ -33,6 +33,14 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
     return DB_ERROR;
   }
 
+  dict_table_t* base_table = index->table;
+  dict_index_t* clust_index = base_table ? base_table->first_index() : nullptr;
+  if (clust_index == nullptr) {
+    ib::warn() << "VECINDEX: clustered index missing for base table of "
+               << (index->name ? index->name : "(null)");
+    return DB_ERROR;
+  }
+
   ctx->aux_cache.clear();
 
   const size_t dim = size_t(bucket.dim);
@@ -73,7 +81,8 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
     }
 
     dberr_t cache_err =
-        vec_insert_aux_cache(&ctx->aux_cache, faiss_id, it.pk_columns);
+        vec_insert_aux_cache(&ctx->aux_cache, clust_index, faiss_id,
+                             it.pk_columns);
     if (cache_err != DB_SUCCESS) {
       ib::warn() << "VECINDEX: failed to insert aux cache entry for index "
                  << (index->name ? index->name : "(null)")

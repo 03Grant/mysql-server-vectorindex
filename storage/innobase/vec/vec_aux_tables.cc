@@ -333,30 +333,43 @@ inline void vec_cache_append_u32(std::vector<unsigned char> &buf,
   buf.push_back(static_cast<unsigned char>((value >> 24) & 0xFF));
 }
 
-inline void vec_cache_append_u64(std::vector<unsigned char> &buf,
-                                 uint64_t value) {
-  for (int i = 0; i < 8; ++i) {
-    buf.push_back(static_cast<unsigned char>((value >> (i * 8)) & 0xFF));
+inline bool vec_cache_read_u32(const unsigned char *&p, size_t &remain,
+                               uint32_t &out) {
+  if (remain < sizeof(uint32_t)) {
+    return false;
   }
+  out = static_cast<uint32_t>(p[0]) |
+        (static_cast<uint32_t>(p[1]) << 8) |
+        (static_cast<uint32_t>(p[2]) << 16) |
+        (static_cast<uint32_t>(p[3]) << 24);
+  p += sizeof(uint32_t);
+  remain -= sizeof(uint32_t);
+  return true;
 }
 
-inline void vec_cache_append_u8(std::vector<unsigned char> &buf,
-                                unsigned char value) {
-  buf.push_back(value);
-}
-
-static std::vector<unsigned char> vec_pack_pk_columns(
-    const std::vector<vec_pk_column_t> &pk_columns) {
+static std::vector<unsigned char> vec_pack_pk_entry(
+    const std::vector<vec_pk_column_t> &pk_columns, ulint pk_fields) {
   std::vector<unsigned char> packed;
-  const uint32_t num_cols =
-      static_cast<uint32_t>(std::min<size_t>(pk_columns.size(), UINT32_MAX));
-  packed.reserve(8 + pk_columns.size() * 16);
+  const ulint cols = std::min<ulint>(pk_fields, pk_columns.size());
+  const uint32_t num_cols = static_cast<uint32_t>(cols);
+  size_t total = sizeof(uint32_t);
+  for (ulint i = 0; i < cols; ++i) {
+    const auto &col = pk_columns[i];
+    total += sizeof(uint32_t);
+    if (!col.is_null) {
+      total += col.data.size();
+    }
+  }
+  packed.reserve(total);
 
   vec_cache_append_u32(packed, num_cols);
-  for (const auto &col : pk_columns) {
-    vec_cache_append_u8(packed, col.is_null ? 1 : 0);
-    vec_cache_append_u64(packed, static_cast<uint64_t>(col.mtype));
-    vec_cache_append_u64(packed, static_cast<uint64_t>(col.prtype));
+  for (ulint i = 0; i < cols; ++i) {
+    const auto &col = pk_columns[i];
+    if (col.is_null) {
+      vec_cache_append_u32(packed,
+                           std::numeric_limits<uint32_t>::max());
+      continue;
+    }
     const uint32_t len =
         static_cast<uint32_t>(std::min<size_t>(col.data.size(), UINT32_MAX));
     vec_cache_append_u32(packed, len);
@@ -368,9 +381,10 @@ static std::vector<unsigned char> vec_pack_pk_columns(
 
 }  // namespace
 
-dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache, uint64_t faiss_id,
+dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache,
+                             dict_index_t *clust_index, uint64_t faiss_id,
                              const std::vector<vec_pk_column_t> &pk_columns) {
-  if (cache == nullptr) {
+  if (cache == nullptr || clust_index == nullptr) {
     return DB_ERROR;
   }
 
@@ -380,9 +394,15 @@ dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache, uint64_t faiss_id,
     return DB_ERROR;
   }
 
-  std::vector<unsigned char> packed = vec_pack_pk_columns(pk_columns);
+  const ulint pk_fields = dict_index_get_n_unique(clust_index);
+  if (pk_fields == 0 || pk_columns.size() < pk_fields) {
+    return DB_ERROR;
+  }
+
+  std::vector<unsigned char> packed =
+      vec_pack_pk_entry(pk_columns, pk_fields);
   if (packed.empty()) {
-    packed.push_back(0);  // keep non-empty to distinguish stored entry
+    packed.resize(sizeof(uint32_t));
   }
 
   if (cache->key_length == 0) {
@@ -402,6 +422,71 @@ dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache, uint64_t faiss_id,
 
   cache->ready = true;
   return DB_SUCCESS;
+}
+
+bool vec_aux_cache_bind_tuple(const vec_index_aux_cache_t *cache,
+                              uint64_t faiss_id, dict_index_t *clust_index,
+                              dtuple_t *tuple) {
+  if (cache == nullptr || clust_index == nullptr || tuple == nullptr ||
+      !cache->ready) {
+    return false;
+  }
+
+  if (faiss_id >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return false;
+  }
+
+  const size_t idx = static_cast<size_t>(faiss_id);
+  if (idx >= cache->pk_values.size()) {
+    return false;
+  }
+
+  const std::vector<unsigned char> &entry = cache->pk_values[idx];
+  const unsigned char *p = entry.data();
+  size_t remain = entry.size();
+
+  uint32_t num_cols = 0;
+  if (!vec_cache_read_u32(p, remain, num_cols)) {
+    return false;
+  }
+
+  const ulint expected = dict_index_get_n_unique(clust_index);
+  const ulint total_fields = clust_index->n_fields;
+  if (num_cols != expected) {
+    return false;
+  }
+
+  dtuple_set_n_fields(tuple, total_fields);
+  dtuple_set_n_fields_cmp(tuple, expected);
+
+  for (uint32_t i = 0; i < num_cols; ++i) {
+    uint32_t len = 0;
+    if (!vec_cache_read_u32(p, remain, len)) {
+      return false;
+    }
+
+    dfield_t *df = dtuple_get_nth_field(tuple, i);
+    if (len == std::numeric_limits<uint32_t>::max()) {
+      dfield_set_null(df);
+      continue;
+    }
+
+    if (remain < len) {
+      return false;
+    }
+
+    dfield_set_data(df, const_cast<unsigned char *>(p), len);
+    p += len;
+    remain -= len;
+  }
+
+  for (ulint i = num_cols; i < total_fields; ++i) {
+    dfield_t *df = dtuple_get_nth_field(tuple, i);
+    dfield_set_null(df);
+  }
+
+  return true;
 }
 
 

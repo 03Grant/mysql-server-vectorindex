@@ -12,6 +12,7 @@
 
 struct trx_t;
 struct dict_index_t;
+struct dtuple_t;
 struct TABLE;
 struct KEY;
 class Field;
@@ -30,8 +31,14 @@ dberr_t vec_create_index_tables_low(trx_t *trx, dict_index_t *index,
 dberr_t vec_create_index_dd_tables(dict_table_t *table);
 
 // Append pk snapshot into cache
-dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache, uint64_t faiss_id,
+dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache,
+                             dict_index_t *clust_index, uint64_t faiss_id,
                              const std::vector<vec_pk_column_t> &pk_columns);
+
+// Bind cached PK entry directly to a clustered-index tuple
+bool vec_aux_cache_bind_tuple(const vec_index_aux_cache_t *cache,
+                              uint64_t faiss_id, dict_index_t *clust_index,
+                              dtuple_t *tuple);
 
 
 struct vec_pk_column_t;

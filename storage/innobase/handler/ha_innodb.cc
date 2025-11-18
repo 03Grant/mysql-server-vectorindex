@@ -11245,43 +11245,6 @@ struct VecSearchOptions {
   bool has_ef_search{false};
 };
 
-
-namespace {
-
-class Vec_aux_bitmap_guard {
- public:
-  explicit Vec_aux_bitmap_guard(TABLE *table) : m_table(table) {
-    if (m_table != nullptr && m_table->s != nullptr) {
-      m_saved_read = m_table->read_set;
-      m_saved_write = m_table->write_set;
-      m_table->column_bitmaps_set(&m_table->s->all_set,
-                                  &m_table->s->all_set);
-      m_active = true;
-    }
-  }
-
-  Vec_aux_bitmap_guard(const Vec_aux_bitmap_guard &) = delete;
-  Vec_aux_bitmap_guard &operator=(const Vec_aux_bitmap_guard &) = delete;
-
-  ~Vec_aux_bitmap_guard() { Release(); }
-
-  void Release() {
-    if (m_active) {
-      m_table->column_bitmaps_set(m_saved_read, m_saved_write);
-      m_active = false;
-    }
-  }
-
- private:
-  TABLE *m_table{nullptr};
-  MY_BITMAP *m_saved_read{nullptr};
-  MY_BITMAP *m_saved_write{nullptr};
-  bool m_active{false};
-};
-
-}  // namespace
-
-
 inline void trim_in_place(std::string &value) {
   auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
   auto begin =
@@ -11650,232 +11613,6 @@ void ha_innobase::ha_vec_search_end() {
   m_vec_aux_handle_open = false;
 }
 
-int ha_innobase::vec_prepare_aux_metadata(TABLE *aux_table, KEY **aux_faiss_key,
-                                          Field **aux_faiss_field,
-                                          KEY **aux_pk_key,
-                                          uint *aux_faiss_index_no) {
-  if (aux_table == nullptr || aux_table->s == nullptr ||
-      aux_table->key_info == nullptr) {
-    ib::error() << "VECFETCH[m01] auxiliary table metadata invalid";
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  KEY *faiss_key = nullptr;
-  Field *faiss_field = nullptr;
-  for (uint i = 0; i < aux_table->s->keys; ++i) {
-    KEY *key = aux_table->key_info + i;
-    if (key == nullptr || key->actual_key_parts != 1) {
-      continue;
-    }
-    KEY_PART_INFO *part = key->key_part;
-    if (part == nullptr || part->field == nullptr) {
-      continue;
-    }
-    if (strcmp(part->field->field_name, "faiss_id") == 0) {
-      faiss_key = key;
-      faiss_field = part->field;
-      if (aux_faiss_index_no != nullptr) {
-        *aux_faiss_index_no = static_cast<uint>(i);
-      }
-      break;
-    }
-  }
-
-  if (faiss_key == nullptr || faiss_field == nullptr) {
-    ib::error() << "VECFETCH[m02] failed to locate faiss_id key in auxiliary";
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  if (aux_table->s->primary_key >= aux_table->s->keys) {
-    ib::error() << "VECFETCH[m03] auxiliary primary key metadata invalid";
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  KEY *pk_key = aux_table->key_info + aux_table->s->primary_key;
-  if (pk_key == nullptr) {
-    ib::error() << "VECFETCH[m04] auxiliary primary key pointer null";
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  if (aux_faiss_key != nullptr) {
-    *aux_faiss_key = faiss_key;
-  }
-  if (aux_faiss_field != nullptr) {
-    *aux_faiss_field = faiss_field;
-  }
-  if (aux_pk_key != nullptr) {
-    *aux_pk_key = pk_key;
-  }
-
-  return 0;
-}
-
-struct Vec_aux_lookup_state {
-  handler *aux_handler{nullptr};
-  ha_innobase *aux_innobase{nullptr};
-  TABLE *aux_table{nullptr};
-  row_prebuilt_t *aux_prebuilt{nullptr};
-  dict_index_t *saved_index{nullptr};
-  dict_index_t *faiss_index{nullptr};
-  dtuple_t *search_tuple{nullptr};
-  dfield_t *faiss_id_field{nullptr};
-  trx_t *trx{nullptr};
-  THD *thd{nullptr};
-  bool initialized{false};
-  byte faiss_key_storage[sizeof(longlong)];
-};
-
-int ha_innobase::vec_prepare_lookup_state(vec_index_ctx_t *ctx,
-                                          handler *aux_handler,
-                                          TABLE *aux_table,
-                                          dict_index_t *faiss_index,
-                                          Vec_aux_lookup_state *lookup_state) {
-  if (ctx == nullptr || aux_handler == nullptr || aux_table == nullptr ||
-      faiss_index == nullptr || lookup_state == nullptr || m_prebuilt == nullptr) {
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  lookup_state->aux_handler = aux_handler;
-  lookup_state->aux_innobase = static_cast<ha_innobase *>(aux_handler);
-  lookup_state->aux_table = aux_table;
-  lookup_state->faiss_index = faiss_index;
-  lookup_state->thd = ha_thd();
-
-  if (lookup_state->aux_innobase == nullptr ||
-      lookup_state->aux_innobase->m_prebuilt == nullptr) {
-    ib::error() << "VECFETCH[m14] auxiliary handler missing prebuilt";
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  lookup_state->aux_prebuilt = lookup_state->aux_innobase->m_prebuilt;
-  if (m_prebuilt->trx == nullptr) {
-    ib::error() << "VECFETCH[m15] base transaction missing";
-    return HA_ERR_WRONG_COMMAND;
-  }
-  lookup_state->aux_prebuilt->trx = m_prebuilt->trx;
-  lookup_state->trx = m_prebuilt->trx;
-
-  lookup_state->saved_index = lookup_state->aux_prebuilt->index;
-  lookup_state->aux_prebuilt->index = faiss_index;
-  lookup_state->aux_prebuilt->index_usable =
-      faiss_index->is_usable(lookup_state->aux_prebuilt->trx);
-  lookup_state->aux_prebuilt->init_search_tuples_types();
-
-  dtuple_t *tuple = lookup_state->aux_prebuilt->search_tuple;
-  if (tuple == nullptr) {
-    return HA_ERR_WRONG_COMMAND;
-  }
-  dict_index_copy_types(tuple, faiss_index, faiss_index->n_fields);
-  dtuple_set_n_fields(tuple, faiss_index->n_fields);
-  dtuple_set_n_fields_cmp(tuple, dict_index_get_n_unique(faiss_index));
-  lookup_state->search_tuple = tuple;
-  lookup_state->faiss_id_field = dtuple_get_nth_field(tuple, 0);
-  for (ulint i = 1; i < faiss_index->n_fields; ++i) {
-    dfield_t *df = dtuple_get_nth_field(tuple, i);
-    dfield_set_null(df);
-  }
-
-  lookup_state->aux_innobase->build_template(true);
-  lookup_state->initialized = true;
-  return 0;
-}
-
-void ha_innobase::vec_release_lookup_state(
-    Vec_aux_lookup_state *lookup_state) {
-  if (lookup_state == nullptr || !lookup_state->initialized ||
-      lookup_state->aux_prebuilt == nullptr) {
-    return;
-  }
-
-  lookup_state->aux_prebuilt->index = lookup_state->saved_index;
-  if (lookup_state->saved_index != nullptr) {
-    lookup_state->aux_prebuilt->index_usable =
-        lookup_state->saved_index->is_usable(lookup_state->aux_prebuilt->trx);
-    lookup_state->aux_prebuilt->init_search_tuples_types();
-  } else {
-    lookup_state->aux_prebuilt->index_usable = false;
-    lookup_state->aux_prebuilt->clear_search_tuples();
-  }
-
-  lookup_state->initialized = false;
-}
-
-int ha_innobase::vec_lookup_base_pk(vec_index_ctx_t *ctx, handler *aux_handler,
-                                    TABLE *aux_table, KEY *aux_faiss_key,
-                                    Field *aux_faiss_field, KEY *aux_pk_key,
-                                    KEY *base_pk_key, uint aux_faiss_index_no,
-                                    dict_index_t *faiss_index,
-                                    std::vector<uchar> &base_pk_keybuf,
-                                    const Vec_hit &hit,
-                                    Vec_aux_lookup_state *lookup_state) {
-  if (ctx == nullptr || aux_handler == nullptr || aux_table == nullptr ||
-      aux_faiss_key == nullptr || aux_faiss_field == nullptr ||
-      aux_pk_key == nullptr || base_pk_key == nullptr) {
-    ib::error() << "VECFETCH[m10] invalid metadata when fetching PK";
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  if (faiss_index == nullptr) {
-    ib::error()
-        << "VECFETCH[m13] missing dict index pointer for u_faiss_id";
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  Vec_aux_lookup_state local_state{};
-  Vec_aux_lookup_state *state =
-      (lookup_state != nullptr) ? lookup_state : &local_state;
-
-  if (!state->initialized) {
-    int prepare_err =
-        vec_prepare_lookup_state(ctx, aux_handler, aux_table, faiss_index,
-                                 state);
-    if (prepare_err != 0) {
-      if (state == &local_state) {
-        vec_release_lookup_state(state);
-      }
-      return prepare_err;
-    }
-  }
-
-  auto release_guard = create_scope_guard([&]() {
-    if (state == &local_state) {
-      vec_release_lookup_state(state);
-    }
-  });
-
-  mach_write_to_8(state->faiss_key_storage,
-                  static_cast<ulonglong>(static_cast<longlong>(hit.faiss_id)));
-  dfield_set_data(state->faiss_id_field, state->faiss_key_storage,
-                  sizeof(state->faiss_key_storage));
-
-  if (state->aux_table == nullptr || state->aux_table->s == nullptr) {
-    return HA_ERR_WRONG_COMMAND;
-  }
-
-  restore_record(state->aux_table, s->default_values);
-  dberr_t enter_err = innobase_srv_conc_enter_innodb(state->aux_prebuilt);
-  if (enter_err != DB_SUCCESS) {
-    return convert_error_code_to_mysql(enter_err, 0, state->thd);
-  }
-
-  dberr_t search_err = row_search_for_mysql(
-      state->aux_table->record[0], PAGE_CUR_GE, state->aux_prebuilt,
-      ROW_SEL_EXACT, 0);
-
-  innobase_srv_conc_exit_innodb(state->aux_prebuilt);
-
-  if (search_err != DB_SUCCESS) {
-    return convert_error_code_to_mysql(search_err, 0, state->thd);
-  }
-
-  const uint aux_pk_len = aux_pk_key->key_length;
-  if (base_pk_keybuf.size() != aux_pk_len) {
-    base_pk_keybuf.resize(aux_pk_len);
-  }
-  key_copy(base_pk_keybuf.data(), state->aux_table->record[0], aux_pk_key, 0);
-
-  return 0;
-}
 
 int ha_innobase::ha_vec_fetch_row(const Vec_hit &) {
   return HA_ERR_WRONG_COMMAND;
@@ -11898,81 +11635,30 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   }
 
   dict_index_t *vec_index = m_prebuilt->index;
-  if (vec_index == nullptr) {
+  if (vec_index == nullptr || vec_index->vec_runtime == nullptr) {
     return HA_ERR_WRONG_COMMAND;
-  }
-
-  if (vec_index->vec_runtime == nullptr) {
-    dberr_t aux_err = vec_open_aux_table(vec_index);
-    if (aux_err != DB_SUCCESS) {
-      return HA_ERR_WRONG_COMMAND;
-    }
   }
 
   vec_index_ctx_t *ctx = vec_index->vec_runtime;
-  if (ctx == nullptr) {
+  if (!ctx->aux_cache.ready) {
+    ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready";
     return HA_ERR_WRONG_COMMAND;
   }
 
-  THD *thd = ha_thd();
-  if (!m_vec_aux_handle_open) {
-    vec_close_aux_table_for_thd(thd, &m_vec_aux_handle);
-    dberr_t aux_open_err =
-        vec_open_aux_table_for_thd(vec_index, thd, &m_vec_aux_handle);
-    if (aux_open_err != DB_SUCCESS) {
-      return HA_ERR_WRONG_COMMAND;
-    }
-    m_vec_aux_handle_open = true;
-  }
-
-  vec_aux_table_handle *aux_handle = &m_vec_aux_handle;
-  TABLE *aux_table = aux_handle->table;
-  handler *aux_handler = aux_handle->se_handler;
-  if (aux_table == nullptr || aux_handler == nullptr) {
+  dict_table_t *dict_table = vec_index->table;
+  if (dict_table == nullptr) {
     return HA_ERR_WRONG_COMMAND;
   }
 
-  Vec_aux_bitmap_guard aux_bitmap_guard(aux_table);
-
-  KEY *aux_faiss_key = nullptr;
-  Field *aux_faiss_field = nullptr;
-  KEY *aux_pk_key = nullptr;
-  uint aux_faiss_index_no = 0;
-  int meta_error = vec_prepare_aux_metadata(aux_table, &aux_faiss_key,
-                                            &aux_faiss_field, &aux_pk_key,
-                                            &aux_faiss_index_no);
-  if (meta_error != 0) {
-    return meta_error;
-  }
-
-  dict_table_t *aux_dict = ctx->aux_dict_table;
-  if (aux_dict == nullptr) {
-    vec_clear_row_cache();
-    return HA_ERR_WRONG_COMMAND;
-  }
-  ib::warn() << "VECFETCH[b10] aux_dict=" << aux_dict->name.m_name;
-  dict_index_t *faiss_dict_index =
-      dict_table_get_index_on_name(aux_dict, "u_faiss_id", true);
-  if (faiss_dict_index == nullptr) {
-    vec_clear_row_cache();
-    return HA_ERR_WRONG_COMMAND;
-  }
-  ib::warn() << "VECFETCH[b11] faiss_dict_index" ;
-  if (table->s->primary_key == MAX_KEY) {
+  dict_index_t *clust_index = dict_table->first_index();
+  if (clust_index == nullptr) {
     return HA_ERR_WRONG_COMMAND;
   }
 
-  KEY *base_pk_key = table->key_info + table->s->primary_key;
-  const uint base_pk_len = base_pk_key->key_length;
-  const uint aux_pk_len = aux_pk_key->key_length;
-
-  if (UNIV_UNLIKELY(base_pk_len > aux_pk_len) ||
-      UNIV_UNLIKELY(base_pk_key->actual_key_parts !=
-                    aux_pk_key->actual_key_parts)) {
-    return HA_ERR_INTERNAL_ERROR;
-  }
-
+  const ulint pk_field_count = dict_index_get_n_unique(clust_index);
+  const ulint clust_field_count = clust_index->n_fields;
   trx_t *trx = m_prebuilt->trx;
+
   if (m_prebuilt->select_lock_type == LOCK_NONE && !srv_read_only_mode) {
     if (m_prebuilt->sql_stat_start) {
       trx_assign_read_view(trx);
@@ -11982,19 +11668,9 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
     }
   }
 
+  THD *thd = ha_thd();
+
   m_vec_row_cache_rows.resize(batch.size());
-
-  std::vector<uchar> base_pk_keybuf(std::max(base_pk_len, aux_pk_len));
-
-  Vec_aux_lookup_state lookup_state{};
-  int lookup_state_err = vec_prepare_lookup_state(
-      ctx, aux_handler, aux_table, faiss_dict_index, &lookup_state);
-  if (lookup_state_err != 0) {
-    vec_clear_row_cache();
-    return lookup_state_err;
-  }
-  auto lookup_state_guard =
-      create_scope_guard([&]() { vec_release_lookup_state(&lookup_state); });
 
   auto restore_index_guard = create_scope_guard([&]() {
     m_prebuilt->index = vec_index;
@@ -12006,46 +11682,57 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
     }
   });
 
-  int init_error = ha_index_init(table->s->primary_key, false);
-  if (init_error != 0) {
+  m_prebuilt->index = clust_index;
+  m_prebuilt->index_usable = clust_index->is_usable(trx);
+  m_prebuilt->init_search_tuples_types();
+  build_template(true);
+
+  dtuple_t *tuple = m_prebuilt->search_tuple;
+  if (tuple == nullptr) {
     vec_clear_row_cache();
-    return init_error;
+    return HA_ERR_WRONG_COMMAND;
   }
-  ib::warn() << "VECFETCH[b20] initialized primary index scan";
-  auto finalize_primary_index = [&](int current_error) -> int {
-    int end_error = ha_index_end();
-    if (current_error == 0) {
-      current_error = end_error;
-    }
-    return current_error;
-  };
+
+  dict_index_copy_types(tuple, clust_index, clust_field_count);
+  dtuple_set_n_fields(tuple, clust_field_count);
+  dtuple_set_n_fields_cmp(tuple, pk_field_count);
 
   for (size_t i = 0; i < batch.size(); ++i) {
-    int lookup_error = vec_lookup_base_pk(
-        ctx, aux_handler, aux_table, aux_faiss_key, aux_faiss_field,
-        aux_pk_key, base_pk_key, aux_faiss_index_no, faiss_dict_index,
-        base_pk_keybuf, batch[i], &lookup_state);
-    if (lookup_error != 0) {
+    const Vec_hit &hit = batch[i];
+    if (hit.faiss_id < 0) {
       vec_clear_row_cache();
-      return finalize_primary_index(lookup_error);
+      return HA_ERR_INTERNAL_ERROR;
+    }
+
+    if (!vec_aux_cache_bind_tuple(&ctx->aux_cache,
+                                  static_cast<uint64_t>(hit.faiss_id),
+                                  clust_index, tuple)) {
+      ib::warn() << "VECFETCH[c10] missing or corrupt cache entry for faiss_id="
+                 << hit.faiss_id;
+      vec_clear_row_cache();
+      return HA_ERR_WRONG_COMMAND;
+    }
+
+    restore_record(table, s->default_values);
+    dberr_t enter_err = innobase_srv_conc_enter_innodb(m_prebuilt);
+    if (enter_err != DB_SUCCESS) {
+      vec_clear_row_cache();
+      return convert_error_code_to_mysql(enter_err, 0, thd);
+    }
+
+    dberr_t search_err = row_search_for_mysql(
+        table->record[0], PAGE_CUR_GE, m_prebuilt, ROW_SEL_EXACT, 0);
+
+    innobase_srv_conc_exit_innodb(m_prebuilt);
+
+    if (search_err != DB_SUCCESS) {
+      vec_clear_row_cache();
+      return convert_error_code_to_mysql(search_err, 0, thd);
     }
 
     auto &row = m_vec_row_cache_rows[i];
     row.resize(reclength);
-
-    int read_error = ha_index_read_map(row.data(), base_pk_keybuf.data(),
-                                       HA_WHOLE_KEY, HA_READ_KEY_EXACT);
-
-    if (read_error != 0) {
-      vec_clear_row_cache();
-      return finalize_primary_index(read_error);
-    }
-  }
-
-  int end_error = finalize_primary_index(0);
-  if (end_error != 0) {
-    vec_clear_row_cache();
-    return end_error;
+    std::memcpy(row.data(), table->record[0], reclength);
   }
 
   m_vec_row_cache_ready = true;
