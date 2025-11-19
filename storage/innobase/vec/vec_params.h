@@ -4,8 +4,10 @@
 #include <string>
 #include <optional>
 
-
-
+enum class BackendType {
+    Faiss,
+    Hnswlib
+};
 
 enum : uint8_t {
   VEC_T_FLAT    = 0,
@@ -22,6 +24,7 @@ enum : uint8_t {
 
 // 纯 POD，适合放到 mem_heap 里；不要 std::string
 struct vec_params_t {
+  BackendType backend{BackendType::Faiss};
   uint8_t   type_tag{VEC_T_FLAT};   // 上面枚举
   uint8_t   metric_tag{VEC_M_L2};   // 上面枚举
   uint32_t  dim{0};

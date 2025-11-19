@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <mutex>
 #include <limits>
-#include "vec_faiss_includes.h"
 #include "db0err.h"
 #include "trx0trx.h"
 

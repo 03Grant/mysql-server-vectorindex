@@ -550,6 +550,12 @@ if (WITH_FAISS)
   add_subdirectory(external/faiss)
 endif()
 
+option(WITH_HNSWLIB "Build HNSWLIB for InnoDB VECINDEX" ON)
+
+if (WITH_HNSWLIB)
+  add_subdirectory(external/hnswlib)
+endif()
+
 # Ninja only: List of available pools.
 SET_PROPERTY(GLOBAL PROPERTY JOB_POOLS one_job=1)
 

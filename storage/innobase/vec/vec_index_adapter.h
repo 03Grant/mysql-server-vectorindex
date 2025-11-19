@@ -2,7 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <memory>
-#include "vec_faiss_includes.h"
+#include <cstdint>
 #include "vec_params.h"
 #include "univ.i" 
 #include "db0err.h"
@@ -39,7 +39,7 @@ void vec_destroy(vec_index_ctx_t* ctx);
 // 最小检索/插入（后面你再接入 InnoDB 行数据）
 int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   // 添加 n 向量
 
-int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const faiss::idx_t* ids, size_t n);
+int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n);
 
 int vec_search(vec_index_ctx_t& ctx, const float* q, size_t nq,
-           size_t k, float* distances, faiss::idx_t* labels);                   // 召回
+           size_t k, float* distances, int64_t* labels);                   // 召回

@@ -3,7 +3,7 @@
 #include "vec_index_adapter.h"
 #include "vec_index_runtime.h"
 #include "vec_faiss_factory.h"
-#include "vec_faiss_includes.h"
+#include "vec_hnswlib_factory.h"
 
 #include "dict0mem.h"
 #include "dict0dd.h"
@@ -105,16 +105,15 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
   //                          hnsw_m: 0,
   //                          efConstruction: 0};
 
-  vec_params_t im_mem_p = {type_tag: VEC_T_HNSW,
-                           metric_tag: p.metric_tag,
-                           dim: p.dim,
-                           size: 0,  // in-mem index has no size limit
-                           build_threads: p.build_threads,
-                           nlist: 0,
-                           m: 0,
-                           nbits: 0,
-                           hnsw_m: 32,
-                           efConstruction: 128};
+  vec_params_t im_mem_p{};
+  im_mem_p.backend = p.backend;
+  im_mem_p.type_tag = VEC_T_HNSW;
+  im_mem_p.metric_tag = p.metric_tag;
+  im_mem_p.dim = p.dim;
+  im_mem_p.size = 0;  // in-mem index has no size limit
+  im_mem_p.build_threads = p.build_threads;
+  im_mem_p.hnsw_m = 32;
+  im_mem_p.efConstruction = 128;
 
   std::unique_ptr<vec_index_ctx_t> ctx = vec_create(im_mem_p);
   if (!ctx || !ctx->inited) {
@@ -308,10 +307,20 @@ std::unique_ptr<vec_index_ctx_t> vec_create(const vec_params_t& p) {
   auto ctx = std::make_unique<vec_index_ctx_t>();
   ctx->params = p;
 
-  auto index = vec_make_faiss_index(p);
+  std::unique_ptr<IVectorIndex> index;
+  switch (p.backend) {
+    case BackendType::Faiss:
+      index = vec_make_faiss_index(p);
+      break;
+    case BackendType::Hnswlib:
+      index = vec_make_hnswlib_index(p);
+      break;
+    default:
+      break;
+  }
 
   if (!index) {
-    ib::warn() << "VECINDEX: vec_make_faiss_index() failed.";
+    ib::warn() << "VECINDEX: vec_make_index() failed.";
     ctx->inited = false;
     return ctx;
   }
@@ -345,15 +354,15 @@ int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n) {
   std::lock_guard<std::mutex> lk(ctx.mu);
   if (!ctx.inited || ctx.indices.empty() || !ctx.indices[0]) return -1;
   // 假设 dim 匹配，由你在外面保证；FAISS 可能会抛异常，后续你可以做 try/catch
-  ctx.indices[0]->add(n, xb);
+  ctx.indices[0]->add(n, xb, nullptr);
   return n;
 }
 
-int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const faiss::idx_t* ids, size_t n){
+int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n){
   std::lock_guard<std::mutex> lk(ctx.mu);
   if (!ctx.inited || ctx.indices.empty() || !ctx.indices[0]) return -1;
 
-  ctx.indices[0]->add_with_ids(n, xb, ids);
+  ctx.indices[0]->add(n, xb, ids);
   return 0;
 }
 
@@ -364,7 +373,7 @@ static inline bool is_min_better(const vec_params_t& params) {
 
 int vec_search(vec_index_ctx_t& ctx,
                const float* q, size_t nq, size_t k,
-               float* D_out, faiss::idx_t* I_out)
+               float* D_out, int64_t* I_out)
 {
   std::lock_guard<std::mutex> lk(ctx.mu);
   if (!ctx.inited || ctx.indices.empty()) return -1;
@@ -375,7 +384,7 @@ int vec_search(vec_index_ctx_t& ctx,
   // MVP：按“每个查询”循环，便于把各段结果做 k-way 合并
   for (size_t qi = 0; qi < nq; ++qi) {
     // 收集所有段的候选
-    std::vector<std::pair<float, faiss::idx_t>> cand;
+    std::vector<std::pair<float, int64_t>> cand;
     cand.reserve(nseg * k);
 
     const float* qvec = q + qi * ctx.params.dim;
@@ -385,9 +394,9 @@ int vec_search(vec_index_ctx_t& ctx,
       if (!seg) continue;
 
       std::vector<float>  D(k);
-      std::vector<faiss::idx_t> I(k);
+      std::vector<int64_t> I(k);
 
-      seg->search(1, qvec, k, D.data(), I.data());
+      seg->search(1, qvec, k, I.data(), D.data());
 
       // 过滤掉无效 id（Faiss 可能返回 -1 表示候选不足）
       for (size_t t = 0; t < k; ++t) {
@@ -400,7 +409,7 @@ int vec_search(vec_index_ctx_t& ctx,
       // 全部填充为 “空”
       std::fill_n(D_out + qi * k, k, prefer_small ? std::numeric_limits<float>::infinity()
                                                   : -std::numeric_limits<float>::infinity());
-      std::fill_n(I_out + qi * k, k, faiss::idx_t(-1));
+      std::fill_n(I_out + qi * k, k, int64_t(-1));
       continue;
     }
 
@@ -428,7 +437,7 @@ int vec_search(vec_index_ctx_t& ctx,
 
     // 写回输出
     float*       Dq = D_out + qi * k;
-    faiss::idx_t* Iq = I_out + qi * k;
+    int64_t* Iq = I_out + qi * k;
 
     size_t m = std::min(k, cand.size());
     for (size_t t = 0; t < m; ++t) {
@@ -439,7 +448,7 @@ int vec_search(vec_index_ctx_t& ctx,
     for (size_t t = m; t < k; ++t) {
       Dq[t] = prefer_small ? std::numeric_limits<float>::infinity()
                            : -std::numeric_limits<float>::infinity();
-      Iq[t] = faiss::idx_t(-1);
+      Iq[t] = int64_t(-1);
     }
   }
 

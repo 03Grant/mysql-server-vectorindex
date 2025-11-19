@@ -206,10 +206,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "storage/innobase/vec/vec_aux_tables.h"
 #include "storage/innobase/vec/vec_index_adapter.h"
 #include "storage/innobase/vec/vec_index_runtime.h"
-
-#include <faiss/Index.h>
-#include <faiss/IndexHNSW.h>
-#include <faiss/IndexIVF.h>
+#include "storage/innobase/vec/vec_index.h"
 
 #include "sql/field.h"
 #include "sql/key.h"
@@ -11458,20 +11455,12 @@ void apply_vec_search_runtime_options(vec_index_ctx_t *ctx,
   }
 
   std::lock_guard<std::mutex> guard(ctx->mu);
+  VecRuntimeSearchParams params;
+  if (opts.has_nprobe) params.nprobe = opts.nprobe;
+  if (opts.has_ef_search) params.ef_search = opts.ef_search;
+
   for (auto &holder : ctx->indices) {
-    faiss::Index *index = holder.get();
-    if (index == nullptr) {
-      continue;
-    }
-
-    if (auto *ivf = dynamic_cast<faiss::IndexIVF *>(index); ivf != nullptr) {
-      ivf->nprobe = opts.nprobe;
-    }
-
-    if (auto *hnsw = dynamic_cast<faiss::IndexHNSW *>(index);
-        hnsw != nullptr) {
-      hnsw->hnsw.efSearch = opts.ef_search;
-    }
+    if (holder) holder->set_search_params(params);
   }
 }
 
@@ -11539,7 +11528,7 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
   apply_vec_search_runtime_options(ctx, parsed_options);
 
   std::vector<float> distances(top_k);
-  std::vector<faiss::idx_t> labels(top_k);
+  std::vector<int64_t> labels(top_k);
 
   const float *query_vec = reinterpret_cast<const float *>(query);
   const int search_error =

@@ -68,6 +68,7 @@ dberr_t vec_params_from_string(const std::string& s,
   }
 
   bool seen_type = false, seen_dim = false, seen_size = false;
+  bool seen_backend = false;
 
   std::stringstream ss(line);
   std::string item;
@@ -85,7 +86,16 @@ dberr_t vec_params_from_string(const std::string& s,
     std::string key_l = key; to_lower(key_l);
     std::string val_l = val; to_lower(val_l);
 
-    if (key_l == "type") {
+    if (key_l == "backend") {
+      if (val_l == "faiss") out->backend = BackendType::Faiss;
+      else if (val_l == "hnswlib" || val_l == "hnsw") out->backend = BackendType::Hnswlib;
+      else {
+        if (err) *err = "unsupported backend: " + val;
+        return DB_UNSUPPORTED;
+      }
+      seen_backend = true;
+
+    } else if (key_l == "type") {
       if      (val_l == "flat")    out->type_tag = VEC_T_FLAT;
       else if (val_l == "hnsw")    out->type_tag = VEC_T_HNSW;
       else if (val_l == "ivfflat") out->type_tag = VEC_T_IVFFLAT;
@@ -188,6 +198,7 @@ dberr_t vec_params_from_string(const std::string& s,
     }
     return DB_FAIL;
   }
+  static_cast<void>(seen_backend);
 
   // 默认值
   if (out->build_threads <= 0) out->build_threads = 16;
