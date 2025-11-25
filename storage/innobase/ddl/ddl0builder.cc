@@ -2030,6 +2030,14 @@ dberr_t Builder::flush_vector_rows() noexcept {
   if (global_bucket.index == nullptr) {
     global_bucket.index = index;
     global_bucket.dim = index->vec_params->dim;
+    global_bucket.aux_mode = vec_aux_mode_t::DIRECT_INSERT;
+  }
+
+  if (global_bucket.aux_mode == vec_aux_mode_t::UNKNOWN) {
+    global_bucket.aux_mode = vec_aux_mode_t::DIRECT_INSERT;
+  } else if (global_bucket.aux_mode != vec_aux_mode_t::DIRECT_INSERT) {
+    ib::warn() << "VECINDEX: inconsistent aux mode when flushing vector rows";
+    return DB_ERROR;
   }
 
   for (auto *thread_ctx : m_thread_ctxs) {

@@ -48,6 +48,14 @@ dberr_t vec_aux_insert_one(trx_t* trx,
                            const std::vector<vec_pk_column_t>& pk_columns,
                            uint64_t faiss_id);
 
+dberr_t vec_aux_insert_pk_null(trx_t* trx,
+                               dict_index_t* index,
+                               const std::vector<vec_pk_column_t>& pk_columns);
+
+dberr_t vec_aux_update_pk_vid(trx_t* trx,
+                              dict_index_t* index,
+                              const std::vector<vec_pk_column_t>& pk_columns,
+                              uint64_t faiss_id);
 
 que_t* vec_parse_sql(const char* table_name_or_null, pars_info_t* info, const char* sql_body); 
 

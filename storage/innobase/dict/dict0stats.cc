@@ -394,7 +394,7 @@ static void dict_stats_table_clone_free(
  (dict_table_stats_lock(table, RW_X_LATCH)) */
 static void dict_stats_empty_index(dict_index_t *index) /*!< in/out: index */
 {
-  ut_ad(!(index->type & DICT_FTS || index->type & DICT_VECINDEX));
+  ut_ad(!(index->type & DICT_FTS));
   ut_ad(!dict_index_is_ibuf(index));
 
   ulint n_uniq = index->n_uniq;

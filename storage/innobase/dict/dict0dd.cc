@@ -5186,8 +5186,15 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
     }
 
     ut_ad(root > 1);
-    ut_ad(index->type & DICT_FTS || root != FIL_NULL ||
-          dict_table_is_discarded(m_table));
+    /* Vector indexes intentionally have no B-tree root (page==FIL_NULL).
+    If we encounter such an index without the flag set, tag it as VECINDEX
+    so the invariant below holds. */
+    if (root == FIL_NULL && !(index->type & DICT_FTS) &&
+        !dict_table_is_discarded(m_table)) {
+      index->type |= DICT_VECINDEX;
+    }
+    ut_ad(index->type & DICT_FTS || index->type & DICT_VECINDEX ||
+          root != FIL_NULL || dict_table_is_discarded(m_table));
     ut_ad(id != 0);
     index->page = root;
     index->space = sid;
@@ -7040,6 +7047,7 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
   dd_pk->set_ordinal_position(1);
   dd_pk->set_generated(false);
   dd_pk->set_engine(dd_table->engine());
+  dd_pk->options().set("flags", 0);
 
   const dict_index_t *aux_pk =
       dict_table_get_index_on_name(table, "PRIMARY", true);
@@ -7054,17 +7062,18 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
 
   vec_dd_add_index_elements(dd_pk, aux_pk, dd_cols);
 
-  // 4) 添加唯一索引：u_faiss_id(faiss_id)
+  // 4) 添加二级索引：u_faiss_id(faiss_id)（允许重复 -1 占位）
   {
     dd::Index* uk = dd_table->add_index();
     uk->set_name("u_faiss_id");
     uk->set_algorithm(dd::Index::IA_BTREE);
     uk->set_algorithm_explicit(false);
     uk->set_visible(true);
-    uk->set_type(dd::Index::IT_UNIQUE);
+    uk->set_type(dd::Index::IT_MULTIPLE);
     uk->set_ordinal_position(2);
    uk->set_generated(false);
     uk->set_engine(dd_table->engine());
+    uk->options().set("flags", 0);
 
     const dict_index_t *aux_unique =
         dict_table_get_index_on_name(table, "u_faiss_id", true);

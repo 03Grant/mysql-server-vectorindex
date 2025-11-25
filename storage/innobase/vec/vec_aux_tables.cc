@@ -6,6 +6,8 @@
 #include "row0mysql.h"      // row_create_table_for_mysql, row_create_index_for_mysql
 #include "mem0mem.h"        // mem_heap_create/free
 #include "ut0ut.h"          // ib::info, ib::warn
+#include "my_sys.h"         // DEBUG_SYNC_C
+#include "my_dbug.h"        // DBUG_EXECUTE_IF / DBUG_SUICIDE
 
 
 #include <cstring>
@@ -81,53 +83,55 @@ static bool is_gen_clust_name(const dict_index_t* idx) {
   return std::strcmp(idx->name, "GEN_CLUST_INDEX") == 0;
 }
 
-dberr_t vec_aux_insert_one(
-    trx_t* trx,
-    dict_index_t* index,
-    const std::vector<vec_pk_column_t>& pk_columns,
-    uint64_t faiss_id){
-  pars_info_t *info = pars_info_create();
-  const std::string aux_full = vec_aux_full_name(index);
-  ib::warn() << "Insert Aux step 1 with name:" << aux_full;
-  pars_info_bind_id(info, true, "index_table_name", aux_full.c_str());
-  
-  ib::warn() << "Insert Aux step 2" << faiss_id;
-  
-  ib::warn() << "Insert Aux step 3" << faiss_id;
+struct vec_aux_pk_meta_t {
+  dict_index_t* clust{nullptr};
+  bool use_row_id{false};
+  ulint pk_cols{0};
+};
+
+static dberr_t vec_aux_prepare_pk_meta(dict_index_t* index,
+                                       vec_aux_pk_meta_t* meta) {
+  if (index == nullptr || meta == nullptr) {
+    return DB_ERROR;
+  }
 
   dict_table_t* base = index->table;
-  if (!base) {
+  if (base == nullptr) {
     ib::warn() << "VECINDEX: index has no base table";
-    pars_info_free(info);
     return DB_ERROR;
   }
 
   dict_index_t* clust = base->first_index();
-  if (!clust) {
+  if (clust == nullptr) {
     ib::warn() << "VECINDEX: base table has no clustered index";
-    pars_info_free(info);
     return DB_ERROR;
   }
 
-  ib::warn() << "Insert Aux step 4" << faiss_id;
+  meta->clust = clust;
+  meta->use_row_id = is_gen_clust_name(clust);
+  meta->pk_cols = meta->use_row_id ? 1 : clust->n_uniq;
 
-  const bool use_row_id = is_gen_clust_name(clust);
-  const ulint pk_cols = use_row_id ? 1 : clust->n_uniq;
+  return DB_SUCCESS;
+}
 
-  for (ulint i = 0; i < pk_cols; ++i) {
+static dberr_t vec_aux_bind_pk_column_ids(pars_info_t* info,
+                                          const vec_aux_pk_meta_t& meta) {
+  if (info == nullptr || meta.clust == nullptr) {
+    return DB_ERROR;
+  }
+
+  for (ulint i = 0; i < meta.pk_cols; ++i) {
     const char* colname = nullptr;
-    if (use_row_id) {
+    if (meta.use_row_id) {
       colname = "row_id";
     } else {
-      dict_field_t* field = clust->get_field(i);
-      if (!field || !field->name) {
-        ib::warn() << "VECINDEX: failed to fetch PK column meta at position " << i;
-        pars_info_free(info);
+      dict_field_t* field = meta.clust->get_field(i);
+      if (field == nullptr || field->name == nullptr) {
+        ib::warn() << "VECINDEX: failed to fetch PK column meta at position "
+                   << i;
         return DB_ERROR;
       }
       colname = static_cast<const char*>(field->name);
-
-      ib::warn() << "Insert Aux step 5." << i << " with colname:" << colname;
     }
 
     char key[8];
@@ -135,81 +139,124 @@ dberr_t vec_aux_insert_one(
     pars_info_bind_id(info, true, key, colname);
   }
 
-  {
-    char key[8];
-    snprintf(key, sizeof(key), "c%u", static_cast<unsigned>(pk_cols));
-    pars_info_bind_id(info, true, key, "faiss_id");
+  char key[8];
+  snprintf(key, sizeof(key), "c%u", static_cast<unsigned>(meta.pk_cols));
+  pars_info_bind_id(info, true, key, "faiss_id");
+
+  return DB_SUCCESS;
+}
+
+static const char* vec_aux_literal_name(pars_info_t* info, ulint idx) {
+  ut_ad(info != nullptr && info->heap != nullptr);
+
+  char key[16];
+  snprintf(key, sizeof(key), "v%u", static_cast<unsigned>(idx));
+
+  if (auto* existing = pars_info_get_bound_lit(info, key); existing != nullptr) {
+    return existing->name;
   }
 
-  ib::warn() << "Insert Aux step 6";
-  pars_info_add_ull_literal(info, "faiss_id", faiss_id);
+  return mem_heap_strdup(info->heap, key);
+}
 
+static dberr_t vec_aux_bind_pk_values(
+    pars_info_t* info, const vec_aux_pk_meta_t& meta,
+    const std::vector<vec_pk_column_t>& pk_columns) {
+  if (info == nullptr) {
+    return DB_ERROR;
+  }
 
-  ib::warn() << "Insert Aux step 7";
-  if(use_row_id){
-    char vname[8];
-    snprintf(vname, sizeof(vname), "v%u", (unsigned)0);
+  if (meta.use_row_id) {
     if (pk_columns.empty() || pk_columns[0].is_null) {
       ib::warn() << "VECINDEX: NULL in PK column for row_id not allowed";
       return DB_ERROR;
     }
     const auto& c = pk_columns[0];
-    if (c.data.size() == 6) {
-      // 是隐藏 row_id 的 6B：转成 8B 再绑定
-      byte be8[8];
-      uint64_t v = rowid6_to_u64(reinterpret_cast<const byte*>(c.data.data()));
-      u64_to_storage8(v, be8);
-      pars_info_bind_literal(info, vname,
-                              be8, sizeof(be8),
-                              DATA_INT, DATA_UNSIGNED);
-    } else{
-      ib::warn() << "Row_id is not 6 bytes length.";
+    if (c.data.size() != 6) {
+      ib::warn() << "Row_id snapshot is not 6 bytes.";
       return DB_ERROR;
     }
 
-  }else{
-    for (ulint i = 0; i < pk_cols; ++i) {
-      const auto& col = pk_columns[i];
+    const char* vname = vec_aux_literal_name(info, 0);
+    byte* be8 = static_cast<byte*>(mem_heap_alloc(info->heap, 8));
+    uint64_t v = rowid6_to_u64(reinterpret_cast<const byte*>(c.data.data()));
+    u64_to_storage8(v, be8);
+    pars_info_bind_literal(info, vname, be8, sizeof(be8), DATA_INT,
+                           DATA_UNSIGNED);
+    return DB_SUCCESS;
+  }
 
-      char vname[8];
-      snprintf(vname, sizeof(vname), "v%u", (unsigned)i);
+  if (pk_columns.size() < meta.pk_cols) {
+    ib::warn() << "VECINDEX: PK column snapshot missing entries, have "
+               << pk_columns.size() << " expect " << meta.pk_cols;
+    return DB_ERROR;
+  }
 
-      const void* ptr = (col.is_null || col.data.empty())
+  for (ulint i = 0; i < meta.pk_cols; ++i) {
+    const auto& col = pk_columns[i];
+
+    const char* vname = vec_aux_literal_name(info, i);
+
+    const void* ptr = (col.is_null || col.data.empty())
                           ? nullptr
                           : static_cast<const void*>(col.data.data());
-      uint32_t len = static_cast<uint32_t>(col.data.size());
+    assert(ptr != nullptr);
+    uint32_t len = static_cast<uint32_t>(col.data.size());
 
-      // mtype/prtype 直接用你保存的 InnoDB dtype 三元组
-      pars_info_bind_literal(info, vname, ptr, len, col.mtype, col.prtype);
+    pars_info_bind_literal(info, vname, ptr, len, col.mtype, col.prtype);
+  }
+
+  return DB_SUCCESS;
+}
+
+dberr_t vec_aux_insert_one(
+    trx_t* trx,
+    dict_index_t* index,
+    const std::vector<vec_pk_column_t>& pk_columns,
+    uint64_t faiss_id){
+  pars_info_t *info = pars_info_create();
+  const std::string aux_full = vec_aux_full_name(index);
+  pars_info_bind_id(info, true, "index_table_name", aux_full.c_str());
+
+  vec_aux_pk_meta_t meta;
+  dberr_t err = vec_aux_prepare_pk_meta(index, &meta);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    return err;
+  }
+
+  err = vec_aux_bind_pk_column_ids(info, meta);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    return err;
+  }
+
+  err = vec_aux_bind_pk_values(info, meta, pk_columns);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    return err;
+  }
+
+  /* Store FAISS id as unsigned 64-bit. */
+  pars_info_add_ull_literal(info, "faiss_id", faiss_id);
+
+  /* InnoDB's internal SQL parser (pars0grm.yy) only supports INSERT ... VALUES
+  without a column list, so the aux table definition must keep PK columns first
+  followed by faiss_id. */
+  std::ostringstream sql;
+  sql << "BEGIN\nINSERT INTO $index_table_name VALUES (";
+  for (ulint i = 0; i < meta.pk_cols; ++i) {
+    if (i != 0) {
+      sql << ", ";
     }
+    sql << ":v" << i;
   }
-  
-  std::string sql = "BEGIN\nINSERT INTO $index_table_name ";
-  sql += " VALUES (";
-  for (ulint i = 0; i < pk_cols; ++i) {
-    if (i) sql += ", ";
-    sql += ":v" + std::to_string(i);
+  if (meta.pk_cols > 0) {
+    sql << ", ";
   }
-  sql += ", :faiss_id);";
+  sql << ":faiss_id);";
 
-  // std::string sql = "BEGIN\nINSERT INTO $index_table_name (";
-  // for (ulint i = 0; i < pk_cols; ++i) {
-  //   if (i) sql += ", ";
-  //   sql += "$c" + std::to_string(i);
-  // }
-  // sql += ", $c" + std::to_string(pk_cols);  // 绑定成 "faiss_id"
-  // sql += ") VALUES (";
-  // for (ulint i = 0; i < pk_cols; ++i) {
-  //   if (i) sql += ", ";
-  //   sql += ":v" + std::to_string(i);
-  // }
-  // sql += ", :faiss_id);";
-
-  ib::warn() << "Insert Aux step 8 with sql:" << sql;
-
-  que_t* graph = vec_parse_sql(aux_full.c_str(), info, sql.c_str());
-
-  ib::warn() << "Insert Aux step 9";
+  que_t* graph = vec_parse_sql(aux_full.c_str(), info, sql.str().c_str());
 
   dberr_t error = vec_eval_sql(trx, graph);
   if(error != DB_SUCCESS){
@@ -226,6 +273,156 @@ dberr_t vec_aux_insert_one(
                           
 }
 
+
+dberr_t vec_aux_insert_pk_null(trx_t* trx,
+    dict_index_t* index,
+    const std::vector<vec_pk_column_t>& pk_columns){
+  ib::warn() << "vec_aux_insert_pk_null called.";
+  pars_info_t *info = pars_info_create();
+  
+  ib::warn() << "vec_aux_insert_pk_null created pars_info.";
+
+  const std::string aux_full = vec_aux_full_name(index);
+  pars_info_bind_id(info, true, "index_table_name", aux_full.c_str());
+  ib::warn() << "vec_aux_insert_pk_null called for index: " << aux_full;
+
+  vec_aux_pk_meta_t meta;
+  dberr_t err = vec_aux_prepare_pk_meta(index, &meta);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    ib::warn() << "vec_aux_insert_pk_null failed at prepare_pk_meta, error:" << err;
+    return err;
+  }
+  ib::warn() << "vec_aux_insert_pk_null prepare_pk_meta success.";
+
+  err = vec_aux_bind_pk_column_ids(info, meta);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    ib::warn() << "vec_aux_insert_pk_null failed at bind_pk_column_ids, error:" << err;
+    return err;
+  }
+  ib::warn() << "vec_aux_insert_pk_null bind_pk_column_ids success.";
+
+  err = vec_aux_bind_pk_values(info, meta, pk_columns);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    ib::warn() << "vec_aux_insert_pk_null failed at bind_pk_values, error:" << err;
+    return err;
+  }
+  ib::warn() << "vec_aux_insert_pk_null bind_pk_values success.";
+
+  /* Insert sentinel UINT64_MAX instead of NULL because the aux table column is
+  NONNULL and unsigned. */
+  const char *faiss_null_name = "faiss_id_null";
+  pars_info_add_ull_literal(info, faiss_null_name, UINT64_MAX);
+
+  /* Same parser restriction as vec_aux_insert_one(): rely on table column
+  order for the INSERT target list. */
+  std::ostringstream sql;
+  sql << "BEGIN\nINSERT INTO $index_table_name VALUES (";
+  for (ulint i = 0; i < meta.pk_cols; ++i) {
+    if (i != 0) {
+      sql << ", ";
+    }
+    sql << ":v" << i;
+  }
+  if (meta.pk_cols > 0) {
+    sql << ", ";
+  }
+  sql << ":" << faiss_null_name << ");";
+  ib::warn() << "vec_aux_insert_pk_null executing SQL: " << sql.str();
+  que_t* graph = vec_parse_sql(aux_full.c_str(), info, sql.str().c_str());
+  ib::warn() << "vec_aux_insert_pk_null parsed SQL into graph.";
+
+  dberr_t error = vec_eval_sql(trx, graph);
+  ib::warn() << "vec_aux_insert_pk_null vec_eval_sql returned: " << error;
+  if (error != DB_SUCCESS) {
+    ib::warn() << "vec_aux_insert_pk_null failed with error:" << error;
+    if (trx->error_state == DB_SUCCESS) {
+      trx->error_state = error;
+    }
+    que_graph_free(graph);
+    return error;
+  }
+
+  que_graph_free(graph);
+
+  /* Debug-only injection: pause/crash right after inserting the sentinel row,
+  before the caller continues (used to simulate crash during forward roll). */
+  DEBUG_SYNC_C("vec_aux_insert_pk_null_after");
+  DBUG_EXECUTE_IF("crash_vec_aux_insert_pk_null_after", DBUG_SUICIDE(););
+
+
+  return DB_SUCCESS;
+}
+
+dberr_t vec_aux_update_pk_vid(trx_t* trx,
+    dict_index_t* index,
+    const std::vector<vec_pk_column_t>& pk_columns,
+    uint64_t faiss_id){
+  
+  DEBUG_SYNC_C("vec_aux_update_pk_vid_after");
+  DBUG_EXECUTE_IF("crash_vec_aux_update_pk_vid_after", DBUG_SUICIDE(););
+
+
+  ib::warn() << "vec_aux_update_pk_vid called.";
+  pars_info_t *info = pars_info_create();
+  const std::string aux_full = vec_aux_full_name(index);
+  pars_info_bind_id(info, true, "index_table_name", aux_full.c_str());
+
+  vec_aux_pk_meta_t meta;
+  dberr_t err = vec_aux_prepare_pk_meta(index, &meta);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    return err;
+  }
+
+  err = vec_aux_bind_pk_column_ids(info, meta);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    return err;
+  }
+
+  err = vec_aux_bind_pk_values(info, meta, pk_columns);
+  if (err != DB_SUCCESS) {
+    pars_info_free(info);
+    return err;
+  }
+
+  pars_info_add_ull_literal(info, "faiss_id", faiss_id);
+
+  ib::warn() << "vec_aux_update_pk_vid preparing SQL statement.";
+
+  std::ostringstream sql;
+  sql << "BEGIN\nUPDATE $index_table_name SET $c" << meta.pk_cols
+      << " = :faiss_id WHERE ";
+  for (ulint i = 0; i < meta.pk_cols; ++i) {
+    if (i != 0) {
+      sql << " AND ";
+    }
+    sql << "$c" << i << " = :v" << i;
+  }
+  sql << ";";
+
+  ib::warn() << "vec_aux_update_pk_vid executing SQL: " << sql.str();
+  que_t* graph = vec_parse_sql(aux_full.c_str(), info, sql.str().c_str());
+  
+  ib::warn() << "vec_aux_update_pk_vid parsed SQL into graph.";
+  dberr_t error = vec_eval_sql(trx, graph);
+  if (error != DB_SUCCESS) {
+    ib::warn() << "vec_aux_update_pk_vid failed with error:" << error;
+    if (trx->error_state == DB_SUCCESS) {
+      trx->error_state = error;
+    }
+    que_graph_free(graph);
+    return error;
+  }
+
+  ib::warn() << "vec_aux_update_pk_vid vec_eval_sql returned: " << error;
+
+  que_graph_free(graph);
+  return DB_SUCCESS;
+}
 
 /** Extract only the required flags from table->flags2 for FTS Aux
 tables.
@@ -410,15 +607,10 @@ dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache,
   }
 
   const size_t target = static_cast<size_t>(faiss_id);
-  if (target < cache->pk_values.size()) {
-    cache->pk_values[target] = std::move(packed);
-  } else if (target == cache->pk_values.size()) {
-    cache->pk_values.emplace_back(std::move(packed));
-  } else {
-    ib::error() << "VECINDEX: faiss_id gap when inserting into cache, expected "
-                << cache->pk_values.size() << " got " << target;
-    return DB_ERROR;
+  if (target >= cache->pk_values.size()) {
+    cache->pk_values.resize(target + 1);
   }
+  cache->pk_values[target] = std::move(packed);
 
   cache->ready = true;
   return DB_SUCCESS;
@@ -621,7 +813,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     }
   }
 
-  // 追加 faiss_id BIGINT UNSIGNED NOT NULL
+  // 追加 faiss_id BIGINT UNSIGNED NOT NULL（使用 UINT64_MAX 作为未赋值哨兵）
   dict_mem_table_add_col(new_table, heap,
                          "faiss_id",
                          DATA_INT,
@@ -672,13 +864,13 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     }
   }
 
-  // 8) 建唯一二级索引：u_faiss_id(faiss_id)
+  // 8) 建二级索引：u_faiss_id(faiss_id)
   {
     dict_index_t* uk = dict_mem_index_create(
         full_name.c_str(),
         "u_faiss_id",
         new_table->space,
-        DICT_UNIQUE,
+        0,
         1);
     uk->add_field("faiss_id", 0, true);
 

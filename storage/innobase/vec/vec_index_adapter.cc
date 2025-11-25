@@ -198,8 +198,9 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
   }
 
   MDL_request mdl_request;
+  /* Use EXPLICIT duration so we can release at close. */
   MDL_REQUEST_INIT(&mdl_request, MDL_key::TABLE, parts.db.c_str(),
-                   parts.table.c_str(), MDL_SHARED_READ, MDL_TRANSACTION);
+                   parts.table.c_str(), MDL_SHARED_READ, MDL_EXPLICIT);
 
   if (thd->mdl_context.acquire_lock(&mdl_request,
                                     thd->variables.lock_wait_timeout)) {

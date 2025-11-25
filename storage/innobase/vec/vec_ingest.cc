@@ -46,7 +46,7 @@ class ScopedVecThreads {
 
 } // namespace
 
-// 批量落一“桶”：先 add_with_ids 到 m 段，再写辅助表
+// 批量add_with_ids，再insert辅助表
 static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
   dict_index_t* index = bucket.index;
   if (!index || bucket.items.empty()) {
@@ -77,8 +77,6 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
     return DB_ERROR;
   }
 
-  ctx->aux_cache.clear();
-
   const size_t dim = size_t(bucket.dim);
   const size_t k   = bucket.items.size();
 
@@ -105,12 +103,21 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
 
   // 3) 锁外写辅助表：把主键快照与 start+i 写入辅助表（与事务同生死）
 
-  
+  vec_aux_mode_t aux_mode = bucket.aux_mode;
+  if (aux_mode == vec_aux_mode_t::UNKNOWN) {
+    aux_mode = vec_aux_mode_t::DIRECT_INSERT;
+  }
+
   for (size_t i = 0; i < k; ++i) {
     const uint64_t faiss_id = static_cast<uint64_t>(allocated_ids[i]);
     const vec_item_t& it = bucket.items[i];
 
-    dberr_t last_err = vec_aux_insert_one(exec_trx, index, it.pk_columns, faiss_id);
+    dberr_t last_err = DB_SUCCESS;
+    if (aux_mode == vec_aux_mode_t::PREINSERT_NULL) {
+      last_err = vec_aux_update_pk_vid(exec_trx, index, it.pk_columns, faiss_id);
+    } else {
+      last_err = vec_aux_insert_one(exec_trx, index, it.pk_columns, faiss_id);
+    }
     if (last_err != DB_SUCCESS) {
       ib::warn() << "VECINDEX: aux insert failed for index "
                  << (index->name ? index->name : "(null)")
@@ -156,18 +163,28 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
       ib::warn() << "VECINDEX: failed to allocate background transaction for aux insert";
       return DB_ERROR;
     }
+    trx_start_internal(background, UT_LOCATION_HERE);
     exec_trx = background;
     owns_exec_trx = true;
   }
+
+  ib::warn() << "VECINDEX: flushing vector rows for trx " << trx->id
+             << " using exec_trx " << exec_trx->id;
 
   for (auto& kv : tctx->by_index) {
     last_err = vec_apply_bucket(exec_trx, kv.second);
     if (last_err != DB_SUCCESS) {
       ib::warn() << "VECINDEX: vec_apply_bucket failed with error " << last_err;
+      vec_trx_ctx_clear(tctx);
       break;
     }
   }
-  // 
+
+
+  DEBUG_SYNC_C("vec_aux_before_aux_commit");
+  DBUG_EXECUTE_IF("crash_vec_aux_before_aux_commit", DBUG_SUICIDE(););
+
+
   if (owns_exec_trx) {
     if (last_err == DB_SUCCESS) {
       dberr_t commit_err = trx_commit_for_mysql(exec_trx);
@@ -177,7 +194,9 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
         last_err = commit_err;
       }
     } else {
-      trx_rollback_for_mysql(exec_trx);
+      /* Background trx is not on mysql_trx_list; use savepoint rollback to
+      avoid the in_mysql_trx_list assertion. */
+      trx_rollback_to_savepoint(exec_trx, nullptr);
     }
     trx_free_for_background(exec_trx);
   }
@@ -185,6 +204,9 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
   if (last_err != DB_SUCCESS) {
     return last_err;
   }
+
+  DEBUG_SYNC_C("vec_aux_after_aux_commit");
+  DBUG_EXECUTE_IF("crash_vec_aux_after_aux_commit", DBUG_SUICIDE(););
 
   // 成功后清空缓冲
   vec_trx_ctx_clear(tctx);

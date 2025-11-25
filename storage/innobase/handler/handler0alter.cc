@@ -2601,13 +2601,19 @@ static void innobase_create_index_field_def(const TABLE *altered_table,
   }
   index_field->m_is_ascending = !(key_part->key_part_flag & HA_REVERSE_SORT);
 
-  /* No prefix index on multi-value field */
-  if (!index_field->m_is_multi_value &&
-      (DATA_LARGE_MTYPE(col_type) ||
-       (key_part->length < field->pack_length() &&
-        field->type() != MYSQL_TYPE_VARCHAR) ||
-       (field->type() == MYSQL_TYPE_VARCHAR &&
-        key_part->length < field->pack_length() - field->get_length_bytes()))) {
+  const bool is_vector_field = (field->type() == MYSQL_TYPE_VECTOR);
+
+  /* No prefix index on multi-value field.
+  Vector indexes must always use the full column, so skip prefix logic. */
+  if (is_vector_field) {
+    index_field->m_prefix_len = 0;
+  } else if (!index_field->m_is_multi_value &&
+             (DATA_LARGE_MTYPE(col_type) ||
+              (key_part->length < field->pack_length() &&
+               field->type() != MYSQL_TYPE_VARCHAR) ||
+              (field->type() == MYSQL_TYPE_VARCHAR &&
+               key_part->length < field->pack_length() -
+                                     field->get_length_bytes()))) {
     index_field->m_prefix_len = key_part->length;
   } else {
     index_field->m_prefix_len = 0;
@@ -2759,6 +2765,10 @@ static void innobase_create_index_def(const TABLE *altered_table,
     assert(!(key->flags & (HA_FULLTEXT | HA_SPATIAL | HA_NOSAME)));
     index_def->m_ind_type = DICT_VECINDEX;
     ut_ad(n_fields == 1);
+
+    /* Vector indexes must never use a prefix; initialize to zero before the
+    assert to avoid junk values from the heap allocation. */
+    index_def->m_fields[0].m_prefix_len = 0;
     ut_ad(index_def->m_fields[0].m_prefix_len == 0);
 
     // Keep the vector index parameters.

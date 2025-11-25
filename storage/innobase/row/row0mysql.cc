@@ -1720,11 +1720,16 @@ run_again:
     const dfield_t *vec_value = dtuple_get_nth_field(node->row, col_no);
     int rc = vec_collect_one_row(trx, table, vec_index, vec_value, dim, node->row);
     if (rc != 0) {
+      dberr_t vec_err = trx->error_state;
+      if (vec_err == DB_SUCCESS) {
+        vec_err = DB_ERROR;
+      }
       ib::warn() << "VECINDEX: buffering vector for index '"
                  << (vec_index->name ? vec_index->name : "(null)")
-                 << "' failed with rc=" << rc;
-      err = DB_ERROR;
-      trx->error_state = err;
+                 << "' failed with rc=" << rc
+                 << " error_state=" << vec_err;
+      err = vec_err;
+      trx->error_state = vec_err;
       goto error_exit;
     }
   }

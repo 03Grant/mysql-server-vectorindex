@@ -27,10 +27,17 @@ struct vec_item_t {
   std::vector<float>           vec;         // dim 个 float（不做任何预处理）
 };
 
+enum class vec_aux_mode_t : uint8_t {
+  UNKNOWN = 0,
+  PREINSERT_NULL,   // DML path: PK inserted with NULL faiss_id during collect
+  DIRECT_INSERT     // DDL/builder path: insert final rows during commit
+};
+
 // 每个向量索引一个桶
 struct vec_trx_bucket_t {
   dict_index_t* index{nullptr};        // 逻辑索引
   uint32_t      dim{0};
+  vec_aux_mode_t aux_mode{vec_aux_mode_t::UNKNOWN};
   std::vector<vec_item_t> items;       // 本事务要写的条目
 };
 

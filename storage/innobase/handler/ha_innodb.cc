@@ -11648,6 +11648,12 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   const ulint clust_field_count = clust_index->n_fields;
   trx_t *trx = m_prebuilt->trx;
 
+  /* Ensure the transaction is started before assigning a read view
+  for vector fetches. */
+  if (!trx_is_started(trx)) {
+    trx_start_if_not_started_xa(trx, false, UT_LOCATION_HERE);
+  }
+
   if (m_prebuilt->select_lock_type == LOCK_NONE && !srv_read_only_mode) {
     if (m_prebuilt->sql_stat_start) {
       trx_assign_read_view(trx);

@@ -2145,16 +2145,16 @@ void trx_commit_low(trx_t *trx, mtr_t *mtr) {
     }
   }
 
-  if (vec_trx_has_work(trx) && trx->undo_no != 0 &&
-    trx->lock.que_state != TRX_QUE_ROLLING_BACK) {
-    dberr_t err = vec_on_trx_commit(trx);
-    if (err != DB_SUCCESS) {
-        trx->error_state = err;
-        // fall through so the normal error handling aborts the commit
-        ib::warn() << "VECINDEX: Failed to commit vector index changes";
-        ut_error;
-    }
-  }
+  // if (vec_trx_has_work(trx) && trx->undo_no != 0 &&
+  //   trx->lock.que_state != TRX_QUE_ROLLING_BACK) {
+  //   dberr_t err = vec_on_trx_commit(trx);
+  //   if (err != DB_SUCCESS) {
+  //       trx->error_state = err;
+  //       // fall through so the normal error handling aborts the commit
+  //       ib::warn() << "VECINDEX: Failed to commit vector index changes";
+  //       ut_error;
+  //   }
+  // }
 
 
   bool serialised;
@@ -2219,6 +2219,19 @@ void trx_commit_low(trx_t *trx, mtr_t *mtr) {
 #endif
 
   trx_commit_in_memory(trx, mtr, serialised);
+
+  /* vec_trx_has_work() already guarantees we buffered vector ops; undo_no can
+  be cleared late in commit, so do not gate on it here. */
+  if (vec_trx_has_work(trx) &&
+    trx->lock.que_state != TRX_QUE_ROLLING_BACK) {
+    dberr_t err = vec_on_trx_commit(trx);
+    if (err != DB_SUCCESS) {
+        trx->error_state = err;
+        // fall through so the normal error handling aborts the commit
+        ib::warn() << "VECINDEX: Failed to commit vector index changes";
+        ut_error;
+    }
+  }
 }
 
 /** Commits a transaction. */

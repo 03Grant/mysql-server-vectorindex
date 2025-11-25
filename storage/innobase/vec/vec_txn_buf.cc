@@ -4,6 +4,8 @@
 #include "mem0mem.h"
 #include "row0row.h"
 #include "ut0dbg.h"
+#include "trx0trx.h"
+#include "vec_aux_tables.h"
 
 #include "data0data.h"
 #include "my_byteorder.h"
@@ -146,6 +148,18 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
     return;
   }
 
+  auto reset_buckets = [](vec_trx_ctx_t *c) {
+    if (c == nullptr) {
+      return;
+    }
+    for (auto &kv : c->by_index) {
+      kv.second.items.clear();
+      kv.second.aux_mode = vec_aux_mode_t::UNKNOWN;
+    }
+  };
+
+  reset_buckets(ctx);
+
   trx_t *owner = ctx->owner;
   if (owner == nullptr) {
     ctx->by_index.clear();
@@ -184,17 +198,38 @@ int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
   if (bucket.index == nullptr) {
     bucket.index = vindex;
     bucket.dim = dim;
+    bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
   } else if (bucket.dim != dim) {
+    trx->error_state = DB_ERROR;
     return -4;  // dim 不一致
+  }
+
+  if (bucket.aux_mode == vec_aux_mode_t::UNKNOWN) {
+    bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
+  } else if (bucket.aux_mode != vec_aux_mode_t::PREINSERT_NULL) {
+    if (bucket.items.empty()) {
+      bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
+    } else {
+      trx->error_state = DB_ERROR;
+      return -6;
+    }
   }
 
   vec_item_t item;
   if (!vec_extract_and_validate(vector_field, dim, item.vec)) {
+    trx->error_state = DB_ERROR;
     return -2;  // 长度/数据非法
   }
 
   if (!vec_capture_pk_columns(table, row_tuple, item.pk_columns)) {
+    trx->error_state = DB_ERROR;
     return -3;
+  }
+
+  dberr_t aux_err = vec_aux_insert_pk_null(trx, vindex, item.pk_columns);
+  if (aux_err != DB_SUCCESS) {
+    trx->error_state = aux_err;
+    return -5;
   }
 
   bucket.items.emplace_back(std::move(item));
