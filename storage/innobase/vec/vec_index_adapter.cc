@@ -4,6 +4,7 @@
 #include "vec_index_runtime.h"
 #include "vec_faiss_factory.h"
 #include "vec_hnswlib_factory.h"
+#include "vec_aux_tables.h"
 
 #include "dict0mem.h"
 #include "dict0dd.h"
@@ -105,28 +106,66 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
   //                          hnsw_m: 0,
   //                          efConstruction: 0};
 
+  const std::string aux_name = vec_aux_table_name(idx);
+
   vec_params_t im_mem_p{};
   im_mem_p.backend = p.backend;
-  im_mem_p.type_tag = VEC_T_HNSW;
+  im_mem_p.type_tag = VEC_T_FLAT;
   im_mem_p.metric_tag = p.metric_tag;
   im_mem_p.dim = p.dim;
   im_mem_p.size = 0;  // in-mem index has no size limit
   im_mem_p.build_threads = p.build_threads;
-  im_mem_p.hnsw_m = 32;
-  im_mem_p.efConstruction = 128;
+  //im_mem_p.hnsw_m = 32;
+  //im_mem_p.efConstruction = 128;
 
-  std::unique_ptr<vec_index_ctx_t> ctx = vec_create(im_mem_p);
-  if (!ctx || !ctx->inited) {
-    ib::warn() << "VECINDEX checkpoint: vec_create() failed. "
-               << "table=" << (idx->table ? idx->table->name.m_name : "(null)")
-               << ", index_name=" << (idx->name ? idx->name : "(null)")
-               << ", index_id=" << (unsigned long long)idx->id;
-    return DB_FAIL;
+  std::unique_ptr<vec_index_ctx_t> new_ctx;
+  vec_index_ctx_t *ctx = idx->vec_runtime;
+
+  if (ctx == nullptr) {
+    new_ctx = std::make_unique<vec_index_ctx_t>();
+    ctx = new_ctx.get();
+    ctx->params = p;  // keep target params on context
+    ctx->index_name_prefix = aux_name;
+    if (!vec_create(*ctx, im_mem_p)) {
+      ib::warn() << "VECINDEX checkpoint: vec_create() failed for in-memory segment. "
+                 << "table=" << (idx->table ? idx->table->name.m_name : "(null)")
+                 << ", index_name=" << (idx->name ? idx->name : "(null)")
+                 << ", index_id=" << (unsigned long long)idx->id;
+      return DB_FAIL;
+    }
+  } else {
+    ctx->params = p;
+    if (!vec_create(*ctx, p)) {
+      ib::warn() << "VECINDEX checkpoint: vec_create() failed for persistent segment. "
+                 << "table=" << (idx->table ? idx->table->name.m_name : "(null)")
+                 << ", index_name=" << (idx->name ? idx->name : "(null)")
+                 << ", index_id=" << (unsigned long long)idx->id;
+      return DB_FAIL;
+    }
   }
 
-  idx->vec_runtime = ctx.release();
+  // Persist a naming stem so aux tables / persisted segments can stay aligned.
+  if (!aux_name.empty()) {
+    ctx->index_name_prefix = aux_name;
+  }
+  if (auto *mutable_seg = ctx->mutable_segment()) {
+    const std::string prefix = ctx->index_name_prefix.empty() ? aux_name
+                                                              : ctx->index_name_prefix;
+    std::string mem_name = vec_aux_mem_name(prefix);
+    if (!vec_aux_table_exists(mem_name)) {
+      mem_name = prefix;
+    }
+    mutable_seg->aux_table_name = mem_name;
+    if (ctx->max_vecindex_id == 0 && !prefix.empty()) {
+      ctx->max_vecindex_id = vec_aux_scan_max_segment(prefix);
+    }
+  }
 
-    // 3) TODO: there will be more than one index pointers in the context. Handle it!
+  if (new_ctx) {
+    idx->vec_runtime = new_ctx.release();
+  }
+
+  // 3) TODO: there will be more than one index pointers in the context. Handle it!
 
   return DB_SUCCESS;
 }
@@ -137,18 +176,23 @@ dberr_t vec_open_aux_table(dict_index_t *idx) {
   }
 
   vec_index_ctx_t *ctx = idx->vec_runtime;
-  if (ctx->aux_dict_table != nullptr) {
+  vec_index_segment_t *mutable_seg = ctx->mutable_segment();
+  if (mutable_seg == nullptr) {
+    return DB_ERROR;
+  }
+
+  if (mutable_seg->aux_dict_table != nullptr) {
     return DB_SUCCESS;
   }
 
-  const std::string aux_name = vec_aux_table_name(idx);
+  std::string aux_name = vec_aux_active_name(idx);
   if (aux_name.empty()) {
     ib::warn() << "VECINDEX: failed to derive auxiliary table name for index "
                << (idx->name ? idx->name : "(null)");
     return DB_FAIL;
   }
 
-  if (ctx->aux_dict_table == nullptr) {
+  if (mutable_seg->aux_dict_table == nullptr) {
     dict_table_t *aux_table =
         dd_table_open_on_name_in_mem(aux_name.c_str(), false);
     if (aux_table == nullptr) {
@@ -156,14 +200,20 @@ dberr_t vec_open_aux_table(dict_index_t *idx) {
                  << "' is not available in dictionary cache";
       return DB_FAIL;
     }
-    ctx->aux_dict_table = aux_table;
+    mutable_seg->aux_dict_table = aux_table;
+    mutable_seg->aux_table_name = aux_name;
+  } else if (mutable_seg->aux_table_name.empty()) {
+    mutable_seg->aux_table_name = aux_name;
   }
 
   return DB_SUCCESS;
 }
 
+/* Retained for potential future fallback: current cache-only search path
+does not open per-THD aux tables. */
 dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
                                    vec_aux_table_handle *handle) {
+
   if (handle == nullptr) return DB_ERROR;
   handle->table = nullptr;
   handle->se_handler = nullptr;
@@ -174,13 +224,18 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
   }
 
   vec_index_ctx_t *ctx = idx->vec_runtime;
+  vec_index_segment_t *mutable_seg = ctx->mutable_segment();
+  if (mutable_seg == nullptr) {
+    return DB_ERROR;
+  }
+
   dberr_t dict_err = vec_open_aux_table(idx);
   if (dict_err != DB_SUCCESS) {
     ib::warn() << "VECINDEX: unable to cache auxiliary dictionary table for index '"
                << (idx->name ? idx->name : "(null)")
                << "', err=" << dict_err << ". Continuing with per-THD open.";
   } else {
-    dict_table_t *dict_table = ctx->aux_dict_table;
+    dict_table_t *dict_table = mutable_seg->aux_dict_table;
     // ib::warn() << "VECINDEX: cached auxiliary dict table for index '"
     //            << (idx->name ? idx->name : "(null)")
     //            << "' ref_count="
@@ -188,7 +243,7 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
     //            << " ctx=" << ctx;
   }
 
-  const std::string aux_name = vec_aux_table_name(idx);
+  std::string aux_name = vec_aux_active_name(idx);
 
   AuxNameParts parts;
   if (!vec_parse_aux_table_name(aux_name, &parts)) {
@@ -265,7 +320,7 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
   handle->mdl_ticket = mdl_request.ticket;
   mdl_request.ticket = nullptr;
 
-  dict_table_t *dict_table = ctx->aux_dict_table;
+  dict_table_t *dict_table = mutable_seg->aux_dict_table;
   // ib::warn() << "VECINDEX: open_aux_table_for_thd success idx='"
   //            << (idx->name ? idx->name : "(null)")
   //            << "' aux='" << aux_name << "' thd=" << thd
@@ -277,7 +332,10 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
   return DB_SUCCESS;
 }
 
+/* Retained for potential future fallback: current cache-only search path
+does not open per-THD aux tables. */
 void vec_close_aux_table_for_thd(THD *thd, vec_aux_table_handle *handle) {
+
   if (handle == nullptr) return;
 
   // ib::warn() << "VECINDEX: close_aux_table_for_thd thd=" << thd
@@ -304,10 +362,7 @@ void vec_close_aux_table_for_thd(THD *thd, vec_aux_table_handle *handle) {
   // ib::warn() << "VECINDEX: close_aux_table_for_thd completed.";
 }
 
-std::unique_ptr<vec_index_ctx_t> vec_create(const vec_params_t& p) {
-  auto ctx = std::make_unique<vec_index_ctx_t>();
-  ctx->params = p;
-
+bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
   std::unique_ptr<IVectorIndex> index;
   switch (p.backend) {
     case BackendType::Faiss:
@@ -322,48 +377,72 @@ std::unique_ptr<vec_index_ctx_t> vec_create(const vec_params_t& p) {
 
   if (!index) {
     ib::warn() << "VECINDEX: vec_make_index() failed.";
-    ctx->inited = false;
-    return ctx;
+    ctx.inited = false;
+    return false;
   }
 
-  ctx->indices.push_back(std::move(index));
-  ctx->inited = true;
-  return ctx;
+  vec_index_segment_t seg{};
+  seg.index = std::move(index);
+  seg.immutable = false;
+  seg.aux_table_name = ctx.index_name_prefix;
+  ctx.segments.push_back(std::move(seg));
+  ctx.inited = true;
+  return true;
 }
 
 bool vec_drop_index(vec_index_ctx_t& ctx, size_t seg_idx, bool allow_drop_mutable){
   std::lock_guard<std::mutex> lk(ctx.mu);
-  if (seg_idx >= ctx.indices.size()) return false;
+  if (seg_idx >= ctx.segments.size()) return false;
   if (seg_idx == 0 && !allow_drop_mutable) return false;
 
+  auto &seg = ctx.segments[seg_idx];
+  if (seg.aux_dict_table != nullptr) {
+    dd_table_close(seg.aux_dict_table, nullptr, nullptr, false);
+    seg.aux_dict_table = nullptr;
+  }
+
   // erase to release the memory
-  ctx.indices.erase(ctx.indices.begin() + seg_idx);
+  ctx.segments.erase(ctx.segments.begin() + seg_idx);
   return true;
 
 }
 
 void vec_destroy(vec_index_ctx_t* ctx) {
   if (ctx == nullptr) return;
-  if (ctx->aux_dict_table != nullptr) {
-    dd_table_close(ctx->aux_dict_table, nullptr, nullptr, false);
-    ctx->aux_dict_table = nullptr;
+  auto close_table = [](dict_table_t *t) {
+    if (t != nullptr) {
+      dd_table_close(t, nullptr, nullptr, false);
+    }
+  };
+
+  for (auto &seg : ctx->segments) {
+    close_table(seg.aux_dict_table);
+    seg.aux_dict_table = nullptr;
+  }
+  close_table(ctx->staging_segment.aux_dict_table);
+  ctx->staging_segment.aux_dict_table = nullptr;
+  if(ctx->pending_aux_dict != nullptr) {
+    close_table(ctx->pending_aux_dict);
+    ctx->pending_aux_dict = nullptr;
   }
   delete ctx;
 }
 
 int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n) {
   std::lock_guard<std::mutex> lk(ctx.mu);
-  if (!ctx.inited || ctx.indices.empty() || !ctx.indices[0]) return -1;
+  vec_index_segment_t *seg = ctx.mutable_segment();
+  if (!ctx.inited || seg == nullptr || !seg->index) return -1;
   // 假设 dim 匹配，由你在外面保证；FAISS 可能会抛异常，后续你可以做 try/catch
-  ctx.indices[0]->add(n, xb, nullptr);
+  seg->index->add(n, xb, nullptr);
   return n;
 }
 
 int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n){
   std::lock_guard<std::mutex> lk(ctx.mu);
-  if (!ctx.inited || ctx.indices.empty() || !ctx.indices[0]) return -1;
+  vec_index_segment_t *seg = ctx.mutable_segment();
+  if (!ctx.inited || seg == nullptr || !seg->index) return -1;
 
-  ctx.indices[0]->add(n, xb, ids);
+  seg->index->add(n, xb, ids);
   return 0;
 }
 
@@ -374,25 +453,36 @@ static inline bool is_min_better(const vec_params_t& params) {
 
 int vec_search(vec_index_ctx_t& ctx,
                const float* q, size_t nq, size_t k,
-               float* D_out, int64_t* I_out)
+               float* D_out, int64_t* I_out, uint32_t* S_out)
 {
   std::lock_guard<std::mutex> lk(ctx.mu);
-  if (!ctx.inited || ctx.indices.empty()) return -1;
+  if (!ctx.inited || ctx.segments.empty()) return -1;
 
   const bool prefer_small = is_min_better(ctx.params);
-  const size_t nseg = ctx.indices.size();
+  const size_t nseg = ctx.segments.size();
+  const uint32_t invalid_segment = 0;
+
+  struct Candidate {
+    float distance;
+    int64_t id;
+    uint32_t segment;
+  };
 
   // MVP：按“每个查询”循环，便于把各段结果做 k-way 合并
   for (size_t qi = 0; qi < nq; ++qi) {
     // 收集所有段的候选
-    std::vector<std::pair<float, int64_t>> cand;
+    std::vector<Candidate> cand;
     cand.reserve(nseg * k);
 
     const float* qvec = q + qi * ctx.params.dim;
 
     for (size_t s = 0; s < nseg; ++s) {
-      auto* seg = ctx.indices[s].get();
+      auto& seg_meta = ctx.segments[s];
+      auto* seg = seg_meta.index.get();
       if (!seg) continue;
+      const uint32_t seg_id =
+          seg_meta.vecindex_id != 0 ? seg_meta.vecindex_id
+                                    : static_cast<uint32_t>(s);
 
       std::vector<float>  D(k);
       std::vector<int64_t> I(k);
@@ -401,7 +491,9 @@ int vec_search(vec_index_ctx_t& ctx,
 
       // 过滤掉无效 id（Faiss 可能返回 -1 表示候选不足）
       for (size_t t = 0; t < k; ++t) {
-        if (I[t] >= 0) cand.emplace_back(D[t], I[t]);
+        if (I[t] >= 0) {
+          cand.push_back({D[t], I[t], seg_id});
+        }
       }
     }
 
@@ -411,6 +503,9 @@ int vec_search(vec_index_ctx_t& ctx,
       std::fill_n(D_out + qi * k, k, prefer_small ? std::numeric_limits<float>::infinity()
                                                   : -std::numeric_limits<float>::infinity());
       std::fill_n(I_out + qi * k, k, int64_t(-1));
+      if (S_out != nullptr) {
+        std::fill_n(S_out + qi * k, k, invalid_segment);
+      }
       continue;
     }
 
@@ -418,20 +513,20 @@ int vec_search(vec_index_ctx_t& ctx,
     if (cand.size() > k) {
       if (prefer_small) {
         std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
-                          [](auto& a, auto& b){ return a.first < b.first; });
+                          [](auto& a, auto& b){ return a.distance < b.distance; });
         cand.resize(k);
       } else {
         std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
-                          [](auto& a, auto& b){ return a.first > b.first; });
+                          [](auto& a, auto& b){ return a.distance > b.distance; });
         cand.resize(k);
       }
     } else {
       if (prefer_small) {
         std::sort(cand.begin(), cand.end(),
-                  [](auto& a, auto& b){ return a.first < b.first; });
+                  [](auto& a, auto& b){ return a.distance < b.distance; });
       } else {
         std::sort(cand.begin(), cand.end(),
-                  [](auto& a, auto& b){ return a.first > b.first; });
+                  [](auto& a, auto& b){ return a.distance > b.distance; });
       }
       // if cand.size() < k，fill others with invalid values
     }
@@ -439,17 +534,24 @@ int vec_search(vec_index_ctx_t& ctx,
     // 写回输出
     float*       Dq = D_out + qi * k;
     int64_t* Iq = I_out + qi * k;
+    uint32_t* Sq = S_out != nullptr ? S_out + qi * k : nullptr;
 
     size_t m = std::min(k, cand.size());
     for (size_t t = 0; t < m; ++t) {
-      Dq[t] = cand[t].first;
-      Iq[t] = cand[t].second;
+      Dq[t] = cand[t].distance;
+      Iq[t] = cand[t].id;
+      if (Sq != nullptr) {
+        Sq[t] = cand[t].segment;
+      }
     }
     // 不足部分用“空”填充
     for (size_t t = m; t < k; ++t) {
       Dq[t] = prefer_small ? std::numeric_limits<float>::infinity()
                            : -std::numeric_limits<float>::infinity();
       Iq[t] = int64_t(-1);
+      if (Sq != nullptr) {
+        Sq[t] = invalid_segment;
+      }
     }
   }
 

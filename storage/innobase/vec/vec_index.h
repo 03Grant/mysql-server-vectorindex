@@ -29,6 +29,7 @@ public:
   virtual void load(const std::string& path) = 0;
 
   virtual size_t ntotal() const = 0;
+  virtual bool reconstruct(size_t id, float* out) const = 0;
 
   // Optional runtime tuning knobs (ignored if backend/type does not support).
   virtual void set_search_params(const VecRuntimeSearchParams& params) = 0;

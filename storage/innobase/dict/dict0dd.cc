@@ -6897,9 +6897,12 @@ static inline void vec_dd_add_index_elements(
   ut_ad(dd_index != nullptr);
   ut_ad(dict_index != nullptr);
 
-  const ulint n_unique = dict_index_get_n_unique(dict_index);
+  const ulint n_parts = dict_index->n_user_defined_cols;
+  if (n_parts == 0) {
+    return;
+  }
 
-  for (ulint i = 0; i < n_unique; ++i) {
+  for (ulint i = 0; i < n_parts; ++i) {
     const dict_field_t *field = dict_index->get_field(i);
     ut_ad(field != nullptr);
     const char *field_name =
@@ -6923,10 +6926,7 @@ static inline void vec_dd_add_index_elements(
   }
 }
 
-/** 把 dict_col_t -> dd::Column，尽量和物理表一致。
-    这里只给出骨架：你可以根据 mtype/prtype 映射到 DD 的枚举类型，
-    并设置 collation/unsigned/nullable/length/prefix 等。
-*/
+
 static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
                                              const char*       name,
                                              dd::Column*       out)
@@ -6943,14 +6943,35 @@ static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
   out->set_unsigned(is_unsigned);
 
   out->set_default_value_null(true);
-  // —— 类型映射 (TODO: 按你的版本补全) ——————————————
+  // —— 类型映射：依据 InnoDB dict 列类型，生成 DD 列定义 ——
   switch (c->mtype) {
     case DATA_INT:
-      out->set_type(dd::enum_column_types::LONGLONG); // 简化：统一用 BIGINT
-      out->set_numeric_precision(static_cast<uint>(c->len * 8));
+      /* len 为存储字节数：1/2/3/4/8 分别对应 TINY/SMALL/MEDIUM/INT/BIGINT */
+      switch (c->len) {
+        case 1:
+          out->set_type(dd::enum_column_types::TINY);
+          out->set_char_length(4);
+          break;
+        case 2:
+          out->set_type(dd::enum_column_types::SHORT);
+          out->set_char_length(6);
+          break;
+        case 3:
+          out->set_type(dd::enum_column_types::INT24);
+          out->set_char_length(9);
+          break;
+        case 4:
+          out->set_type(dd::enum_column_types::LONG);
+          out->set_char_length(11);
+          break;
+        case 8:
+        default:
+          out->set_type(dd::enum_column_types::LONGLONG);
+          out->set_char_length(20);
+          break;
+      }
       out->set_numeric_scale(0);
       out->set_collation_id(my_charset_bin.number);
-      out->set_char_length(static_cast<uint>(c->len));
       break;
 
     case DATA_VARMYSQL:
@@ -7115,6 +7136,9 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
     ib::warn() << "VECINDEX: DD store failed for " << db_name << "." << tbl_name;
     return false;
   }
+  // Flush pending DD objects so the background Auto_releaser destructor
+  // does not trip on leftover uncommitted entries (no transactional DDL here).
+  client->commit_modified_objects();
 
   ib::info() << "VECINDEX: DD registered aux table " << db_name << "." << tbl_name
              << " (space=" << (unsigned)table->space

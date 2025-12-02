@@ -73,6 +73,16 @@ class FaissVectorIndex : public IVectorIndex {
     return index_ ? static_cast<size_t>(index_->ntotal) : 0;
   }
 
+  bool reconstruct(size_t id, float* out) const override {
+    if (!index_ || out == nullptr) return false;
+    try {
+      index_->reconstruct(static_cast<faiss::idx_t>(id), out);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
   void set_search_params(const VecRuntimeSearchParams& params) override {
     if (!index_) return;
 

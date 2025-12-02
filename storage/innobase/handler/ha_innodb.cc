@@ -11459,8 +11459,8 @@ void apply_vec_search_runtime_options(vec_index_ctx_t *ctx,
   if (opts.has_nprobe) params.nprobe = opts.nprobe;
   if (opts.has_ef_search) params.ef_search = opts.ef_search;
 
-  for (auto &holder : ctx->indices) {
-    if (holder) holder->set_search_params(params);
+  for (auto &seg : ctx->segments) {
+    if (seg.index) seg.index->set_search_params(params);
   }
 }
 
@@ -11529,10 +11529,12 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
 
   std::vector<float> distances(top_k);
   std::vector<int64_t> labels(top_k);
+  std::vector<uint32_t> segments(top_k);
 
   const float *query_vec = reinterpret_cast<const float *>(query);
   const int search_error =
-      vec_search(*ctx, query_vec, 1, top_k, distances.data(), labels.data());
+      vec_search(*ctx, query_vec, 1, top_k, distances.data(), labels.data(),
+                 segments.data());
   if (search_error != 0) {
     ib::warn() << "Vector search failed with error code: " << search_error;
     return HA_ERR_INTERNAL_ERROR;
@@ -11545,6 +11547,7 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
     if (labels[i] < 0) continue;
     Vec_hit hit;
     hit.faiss_id = static_cast<longlong>(labels[i]);
+    hit.segment = segments[i];
     hit.distance = distances[i];
     result->push_back(hit);
   }
@@ -11575,16 +11578,18 @@ void ha_innobase::ha_vec_search_begin() {
     return;
   }
 
-  vec_aux_table_handle handle{};
-  dberr_t aux_open_err = vec_open_aux_table_for_thd(vec_index, thd, &handle);
-  if (aux_open_err != DB_SUCCESS) {
-    ib::warn() << "VECFETCH[b01] failed to open auxiliary table in begin: err="
-               << aux_open_err;
-    return;
-  }
-
-  m_vec_aux_handle = handle;
-  m_vec_aux_handle_open = true;
+  /* Cache-only path: aux table open is disabled for now. Keep logic for
+  future fallback-to-table needs. */
+  // vec_aux_table_handle handle{};
+  // dberr_t aux_open_err = vec_open_aux_table_for_thd(vec_index, thd, &handle);
+  // if (aux_open_err != DB_SUCCESS) {
+  //   ib::warn() << "VECFETCH[b01] failed to open auxiliary table in begin: err="
+  //              << aux_open_err;
+  //   return;
+  // }
+  //
+  // m_vec_aux_handle = handle;
+  // m_vec_aux_handle_open = true;
 }
 
 void ha_innobase::ha_vec_search_end() {
@@ -11592,12 +11597,14 @@ void ha_innobase::ha_vec_search_end() {
 
   vec_clear_row_cache();
 
-  if (!m_vec_aux_handle_open) {
-    return;
-  }
-
-  THD *thd = ha_thd();
-  vec_close_aux_table_for_thd(thd, &m_vec_aux_handle);
+  /* Cache-only path: no per-THD aux handle to close for now.
+  // if (!m_vec_aux_handle_open) {
+  //   return;
+  // }
+  //
+  // THD *thd = ha_thd();
+  // vec_close_aux_table_for_thd(thd, &m_vec_aux_handle);
+  */
   m_vec_aux_handle = vec_aux_table_handle{};
   m_vec_aux_handle_open = false;
 }
@@ -11605,6 +11612,26 @@ void ha_innobase::ha_vec_search_end() {
 
 int ha_innobase::ha_vec_fetch_row(const Vec_hit &) {
   return HA_ERR_WRONG_COMMAND;
+}
+
+/** Locate vector segment by its runtime ID. */
+static vec_index_segment_t *vec_find_segment(vec_index_ctx_t *ctx,
+                                             uint32_t segment_id) {
+  if (ctx == nullptr) {
+    return nullptr;
+  }
+
+  for (auto &seg : ctx->segments) {
+    if (seg.vecindex_id == segment_id) {
+      return &seg;
+    }
+  }
+
+  if (segment_id < ctx->segments.size()) {
+    return &ctx->segments[segment_id];
+  }
+
+  return nullptr;
 }
 
 int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
@@ -11629,11 +11656,9 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   }
 
   vec_index_ctx_t *ctx = vec_index->vec_runtime;
-  if (!ctx->aux_cache.ready) {
-    ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready";
+  if (ctx == nullptr) {
     return HA_ERR_WRONG_COMMAND;
   }
-
   dict_table_t *dict_table = vec_index->table;
   if (dict_table == nullptr) {
     return HA_ERR_WRONG_COMMAND;
@@ -11682,6 +11707,33 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   m_prebuilt->init_search_tuples_types();
   build_template(true);
 
+  auto ensure_segment_ready = [&](const Vec_hit &hit) -> vec_index_segment_t * {
+    vec_index_segment_t *seg =
+        vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
+    if (seg == nullptr || seg->index == nullptr) {
+      ib::warn() << "VECFETCH[c02] unknown segment id=" << hit.segment;
+      return nullptr;
+    }
+    if (seg->index->ntotal() > 0 && !seg->aux_cache.ready) {
+      ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready for segment "
+                 << hit.segment;
+      return nullptr;
+    }
+    return seg;
+  };
+
+  for (const auto &hit : batch) {
+    if (hit.faiss_id < 0) {
+      ib::warn() << "VECFETCH[c03] negative faiss_id in batch";
+      vec_clear_row_cache();
+      return HA_ERR_INTERNAL_ERROR;
+    }
+    if (ensure_segment_ready(hit) == nullptr) {
+      vec_clear_row_cache();
+      return HA_ERR_WRONG_COMMAND;
+    }
+  }
+
   dtuple_t *tuple = m_prebuilt->search_tuple;
   if (tuple == nullptr) {
     vec_clear_row_cache();
@@ -11694,16 +11746,16 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
 
   for (size_t i = 0; i < batch.size(); ++i) {
     const Vec_hit &hit = batch[i];
-    if (hit.faiss_id < 0) {
-      vec_clear_row_cache();
-      return HA_ERR_INTERNAL_ERROR;
-    }
+    vec_index_segment_t *seg =
+        vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
 
-    if (!vec_aux_cache_bind_tuple(&ctx->aux_cache,
+    if (seg == nullptr ||
+        !vec_aux_cache_bind_tuple(&seg->aux_cache,
                                   static_cast<uint64_t>(hit.faiss_id),
                                   clust_index, tuple)) {
-      ib::warn() << "VECFETCH[c10] missing or corrupt cache entry for faiss_id="
-                 << hit.faiss_id;
+      ib::warn() << "VECFETCH[c10] missing or corrupt cache entry for "
+                 << "segment=" << hit.segment
+                 << " faiss_id=" << hit.faiss_id;
       vec_clear_row_cache();
       return HA_ERR_WRONG_COMMAND;
     }

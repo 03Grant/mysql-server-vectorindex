@@ -28,7 +28,7 @@ struct vec_params_t {
   uint8_t   type_tag{VEC_T_FLAT};   // 上面枚举
   uint8_t   metric_tag{VEC_M_L2};   // 上面枚举
   uint32_t  dim{0};
-  uint64_t  size{0};
+  uint64_t  size{0};             // Size to flush, build immutable index when exceeded
 
   int32_t   build_threads{16};
 

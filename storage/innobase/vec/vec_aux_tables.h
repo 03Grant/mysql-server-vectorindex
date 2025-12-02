@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <string>
 #include "dict0dict.h"
 #include "dict0mem.h"
 #include "row0mysql.h"
@@ -27,6 +28,25 @@ class handler;
 dberr_t vec_create_index_tables_low(trx_t *trx, dict_index_t *index,
                                     const char *table_name,
                                     table_id_t table_id);
+
+// Naming helpers for segment-specific auxiliary tables.
+// Base prefix: "<db>/I_VEC_<table_id>_<index_id>"
+std::string vec_aux_prefix(const dict_index_t *index);
+std::string vec_aux_active_name(const dict_index_t *index);
+std::string vec_aux_segment_name(const std::string& prefix, uint32_t seg_id);
+std::string vec_aux_mem_name(const std::string& prefix);
+bool vec_aux_extract_seg_id(const std::string& full_name,
+                            const std::string& prefix,
+                            uint32_t* seg_id_out);
+bool vec_aux_table_exists(const std::string& full_name);
+uint32_t vec_aux_scan_max_segment(const std::string& prefix,
+                                  uint32_t probe_limit = 10000);
+dberr_t vec_aux_rename_table(trx_t* trx,
+                             const std::string& old_name,
+                             const std::string& new_name);
+dberr_t vec_aux_create_table(trx_t* trx,
+                             dict_index_t* index,
+                             const std::string& full_name);
 
 dberr_t vec_create_index_dd_tables(dict_table_t *table);
 

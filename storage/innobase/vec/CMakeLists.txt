@@ -10,6 +10,7 @@ add_library(innobase_vec STATIC
   vec_txn_buf.cc
   vec_ingest.cc
   vec_sql.cc
+  vec_tasks.cc
 )
 
 # only contain innobase and faiss headers

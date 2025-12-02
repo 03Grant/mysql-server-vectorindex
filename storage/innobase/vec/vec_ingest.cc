@@ -4,8 +4,11 @@
 #include "dict0dict.h"
 #include "trx0trx.h"
 #include "trx0roll.h"
+#include "current_thd.h"
+#include "ha_innodb.h"            // thd_to_trx
 #include "ut0dbg.h"
 #include "vec_index.h"
+#include "vec_tasks.h"
 #include <omp.h>
 
 #include <cstring>
@@ -64,7 +67,8 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
 
 
   auto* ctx = index->vec_runtime;
-  if (!ctx || !ctx->inited || ctx->indices.empty() || !ctx->indices[0]) {
+  vec_index_segment_t* seg = ctx ? ctx->mutable_segment() : nullptr;
+  if (!ctx || !ctx->inited || seg == nullptr || !seg->index) {
     ib::warn() << "VECINDEX: runtime context missing for index " << (index->name ? index->name : "(null)");
     return DB_ERROR;
   }
@@ -87,7 +91,7 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
   }
 
   // 2) 粗锁下：读取起始 id = ntotal，执行 add(k, xb)
-  IVectorIndex* flat = ctx->indices[0].get();
+  IVectorIndex* flat = seg->index.get();
   int64_t start = 0;
   std::vector<int64_t> allocated_ids(k);
   {
@@ -127,7 +131,7 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
     }
 
     dberr_t cache_err =
-        vec_insert_aux_cache(&ctx->aux_cache, clust_index, faiss_id,
+        vec_insert_aux_cache(&seg->aux_cache, clust_index, faiss_id,
                              it.pk_columns);
     if (cache_err != DB_SUCCESS) {
       ib::warn() << "VECINDEX: failed to insert aux cache entry for index "
@@ -171,6 +175,7 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
   ib::warn() << "VECINDEX: flushing vector rows for trx " << trx->id
              << " using exec_trx " << exec_trx->id;
 
+  std::vector<dict_index_t*> flushed_indexes;
   for (auto& kv : tctx->by_index) {
     last_err = vec_apply_bucket(exec_trx, kv.second);
     if (last_err != DB_SUCCESS) {
@@ -178,6 +183,7 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
       vec_trx_ctx_clear(tctx);
       break;
     }
+    flushed_indexes.push_back(kv.first);
   }
 
 
@@ -210,6 +216,35 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
 
   // 成功后清空缓冲
   vec_trx_ctx_clear(tctx);
+
+  // If exceed size, then submit tasks.
+  for (dict_index_t* idx : flushed_indexes) {
+    if (idx == nullptr) {
+      continue;
+    }
+    vec_index_ctx_t* ctx = idx->vec_runtime;
+    vec_index_segment_t* seg = ctx ? ctx->mutable_segment() : nullptr;
+    if (ctx == nullptr || seg == nullptr || seg->index == nullptr) {
+      continue;
+    }
+    const uint64_t limit = ctx->params.size;
+    if (limit == 0) {
+      continue;
+    }
+    const size_t current = seg->index->ntotal();
+    if (current >= limit) {
+      if (!vec_prepare_pending_mem_table(idx)) {
+        ib::warn() << "VECINDEX: failed to prepare pending aux table for index "
+                   << (idx->name ? idx->name : "(null)");
+        continue;
+      }
+      if (!ctx->is_rotation_pending.exchange(true)) {
+        VecTaskManager::instance().submit_task(idx);
+      }
+    }
+  }
+
+
   return DB_SUCCESS;
 }
 

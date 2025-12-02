@@ -1,4 +1,5 @@
 #include "vec_id_alloc.h"
+#include "vec_aux_tables.h"
 
 #include <algorithm>
 #include <cstring>
@@ -22,35 +23,6 @@ namespace { inline void log_info(const char* msg)  { ib::info() << msg;  }
            inline void log_warn(const char* msg)  { ib::warn() << msg; } }
 
 namespace {
-
-/** Build auxiliary table internal name for a vector index.
-@return fully qualified name like db/I_VEC_<tid>_<iid>, or empty if unavailable */
-inline std::string vec_aux_full_name(const dict_index_t *index) {
-  if (index == nullptr || index->table == nullptr ||
-      index->table->name.m_name == nullptr) {
-    return {};
-  }
-
-  const char *base = index->table->name.m_name;  // "db/table"
-  const char *slash = std::strchr(base, '/');
-  if (slash == nullptr || slash == base) {
-    return {};
-  }
-
-  std::string db(base, static_cast<size_t>(slash - base));
-  if (db.empty()) {
-    return {};
-  }
-
-  std::string full;
-  full.reserve(db.size() + 1 + 32);
-  full.append(db).push_back('/');
-  full.append("I_VEC_")
-      .append(std::to_string(static_cast<unsigned long long>(index->table->id)))
-      .append("_")
-      .append(std::to_string(static_cast<unsigned long long>(index->id)));
-  return full;
-}
 
 /** Fetch the largest value from a secondary index whose first column is an
 unsigned integer. */
@@ -180,7 +152,7 @@ dberr_t vec_aux_select_max_id(trx_t* /*trx*/, dict_index_t* index, uint64_t* out
 
   *out_max = 0;
 
-  const std::string aux_name = vec_aux_full_name(index);
+  const std::string aux_name = vec_aux_active_name(index);
   if (aux_name.empty()) {
     ib::warn() << "VECINDEX: failed to derive aux table name for index '"
                << (index->name ? index->name : "(null)") << "'";

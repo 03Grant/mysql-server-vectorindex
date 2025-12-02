@@ -145,6 +145,7 @@ struct sdi_vector_t {
 
 struct Vec_hit {
   longlong faiss_id;
+  uint32 segment{0};
   float distance;
 };
 

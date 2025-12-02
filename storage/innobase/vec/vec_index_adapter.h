@@ -1,8 +1,8 @@
 // vec_index_adapter.h
 #pragma once
 #include <cstddef>
-#include <memory>
 #include <cstdint>
+#include <memory>
 #include "vec_params.h"
 #include "univ.i" 
 #include "db0err.h"
@@ -27,7 +27,7 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t* idx, THD *thd,
 void vec_close_aux_table_for_thd(THD *thd, vec_aux_table_handle *handle);
 
 // 创建/销毁（只 new，不加向量）
-std::unique_ptr<vec_index_ctx_t> vec_create(const vec_params_t& p);
+bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p);
 
 // Drop some index in the context(maybe because of index merge), drop in_mem_index is not allowed unless allow_drop_mutable is true.
 // I don't think we need to drop in_mem_index at any time.
@@ -42,4 +42,4 @@ int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   
 int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n);
 
 int vec_search(vec_index_ctx_t& ctx, const float* q, size_t nq,
-           size_t k, float* distances, int64_t* labels);                   // 召回
+           size_t k, float* distances, int64_t* labels, uint32_t* segments);                   // 召回
