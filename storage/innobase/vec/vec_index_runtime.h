@@ -63,6 +63,8 @@ struct vec_index_ctx_t {
   bool                       build_in_progress{false};
   std::atomic<bool>          is_rotation_pending{false};
   std::atomic<bool>          needs_aux_refresh{false};  // request user THD to refresh aux cache
+  std::atomic<bool>          bootstrap_load_submitted{false};
+  std::atomic<bool>          bootstrap_loaded{false};
 
   // Precreated aux table waiting to be renamed to _MEM during rotation.
   std::string                pending_aux_name;

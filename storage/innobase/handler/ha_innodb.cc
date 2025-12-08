@@ -207,6 +207,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "storage/innobase/vec/vec_index_adapter.h"
 #include "storage/innobase/vec/vec_index_runtime.h"
 #include "storage/innobase/vec/vec_index.h"
+#include "storage/innobase/vec/vec_tasks.h"
 
 #include "sql/field.h"
 #include "sql/key.h"
@@ -7654,6 +7655,7 @@ int ha_innobase::open(const char *name, int, uint open_flags,
           ib::warn() << "Vector auxiliary table is not ready for index '"
                      << idx->name << "'";
         }
+        vec_schedule_bootstrap_load(idx);
       }
     }
   }
@@ -11715,9 +11717,12 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
       return nullptr;
     }
     if (seg->index->ntotal() > 0 && !seg->aux_cache.ready) {
-      ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready for segment "
-                 << hit.segment;
-      return nullptr;
+      if (!vec_load_aux_cache_for_segment(vec_index, ctx, seg, thd) ||
+          !seg->aux_cache.ready) {
+        ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready for segment "
+                   << hit.segment;
+        return nullptr;
+      }
     }
     return seg;
   };

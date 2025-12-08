@@ -37,6 +37,7 @@ Data dictionary interface */
 #include <sql_class.h>
 #include <sql_thd_internal_api.h>
 
+#include "vec/vec_params.h"
 #include "item.h"
 #else /* !UNIV_HOTBACKUP */
 #include <my_base.h>
@@ -902,6 +903,24 @@ bool dd_table_discard_tablespace(THD *thd, const dict_table_t *table,
 
       dd::Properties &p = dd_index->se_private_data();
       p.set(dd_index_key_strings[DD_INDEX_ROOT], index->page);
+
+      ib::warn() << "Updating vector info for index " << (index->name ? index->name : "(null)");
+      if (dict_index_is_vector(index) && index->vec_params != nullptr) {
+        const vec_params_t *v = index->vec_params;
+        p.set("vec.backend", static_cast<uint64_t>(v->backend));
+        p.set("vec.type", static_cast<uint64_t>(v->type_tag));
+        p.set("vec.metric", static_cast<uint64_t>(v->metric_tag));
+        p.set("vec.dim", static_cast<uint64_t>(v->dim));
+        p.set("vec.size", static_cast<uint64_t>(v->size));
+        p.set("vec.build_threads", static_cast<uint64_t>(v->build_threads));
+        p.set("vec.nlist", static_cast<uint64_t>(v->nlist));
+        p.set("vec.m", static_cast<uint64_t>(v->m));
+        p.set("vec.nbits", static_cast<uint64_t>(v->nbits));
+        p.set("vec.hnsw_m", static_cast<uint64_t>(v->hnsw_m));
+        p.set("vec.efc", static_cast<uint64_t>(v->efConstruction));
+        p.set("vec.version", static_cast<uint64_t>(1));
+        ib::warn() << "Vector index params updated for index " << (index->name ? index->name : "(null)");
+      }
     }
 
     /* Set new table id for dd columns */
@@ -2606,6 +2625,27 @@ static void dd_write_index(dd::Object_id dd_space_id, Index *dd_index,
   p.set(dd_index_key_strings[DD_TABLE_ID], index->table->id);
   p.set(dd_index_key_strings[DD_INDEX_ROOT], index->page);
   p.set(dd_index_key_strings[DD_INDEX_TRX_ID], index->trx_id);
+
+#ifndef UNIV_HOTBACKUP
+  if (dict_index_is_vector(index) && index->vec_params != nullptr) {
+    const vec_params_t *v = index->vec_params;
+    p.set("vec.backend", static_cast<uint64_t>(v->backend));
+    p.set("vec.type", static_cast<uint64_t>(v->type_tag));
+    p.set("vec.metric", static_cast<uint64_t>(v->metric_tag));
+    p.set("vec.dim", static_cast<uint64_t>(v->dim));
+    p.set("vec.size", static_cast<uint64_t>(v->size));
+    p.set("vec.build_threads", static_cast<uint64_t>(v->build_threads));
+    p.set("vec.nlist", static_cast<uint64_t>(v->nlist));
+    p.set("vec.m", static_cast<uint64_t>(v->m));
+    p.set("vec.nbits", static_cast<uint64_t>(v->nbits));
+    p.set("vec.hnsw_m", static_cast<uint64_t>(v->hnsw_m));
+    p.set("vec.efc", static_cast<uint64_t>(v->efConstruction));
+    p.set("vec.version", static_cast<uint64_t>(1));
+    ib::warn() << "VECINDEX: DD stored vector params for index "
+               << (index->name ? index->name : "(null)")
+               << " (id=" << index->id << ")";
+  }
+#endif /* !UNIV_HOTBACKUP */
 }
 
 template void dd_write_index<dd::Index>(dd::Object_id, dd::Index *,
@@ -5200,6 +5240,60 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
     index->space = sid;
     index->id = id;
     index->trx_id = trx_id;
+
+    /* Restore vector parameters from se_private_data if present. */
+    if (dict_index_is_vector(index) && index->vec_params == nullptr) {
+      auto get_u64 = [&se_private_data](const char *key,
+                                        uint64_t *out) -> bool {
+        return !se_private_data.get(key, out);
+      };
+
+      uint64_t ver = 0, backend = 0, type = 0, metric = 0, dim = 0;
+      uint64_t size = 0, build_threads = 0, nlist = 0, m = 0, nbits = 0;
+      uint64_t hnsw_m = 0, efc = 0;
+
+      const bool has_vec =
+          get_u64("vec.version", &ver) && ver >= 1 &&
+          get_u64("vec.backend", &backend) &&
+          get_u64("vec.type", &type) &&
+          get_u64("vec.metric", &metric) &&
+          get_u64("vec.dim", &dim);
+
+      if (has_vec) {
+        vec_params_t params{};
+        params.backend =
+            static_cast<BackendType>(static_cast<uint32_t>(backend));
+        params.type_tag = static_cast<uint8_t>(type);
+        params.metric_tag = static_cast<uint8_t>(metric);
+        params.dim = static_cast<uint32_t>(dim);
+        if (get_u64("vec.size", &size)) {
+          params.size = size;
+        }
+        if (get_u64("vec.build_threads", &build_threads)) {
+          params.build_threads = static_cast<int32_t>(build_threads);
+        }
+        if (get_u64("vec.nlist", &nlist)) {
+          params.nlist = static_cast<int32_t>(nlist);
+        }
+        if (get_u64("vec.m", &m)) {
+          params.m = static_cast<int32_t>(m);
+        }
+        if (get_u64("vec.nbits", &nbits)) {
+          params.nbits = static_cast<int32_t>(nbits);
+        }
+        if (get_u64("vec.hnsw_m", &hnsw_m)) {
+          params.hnsw_m = static_cast<int32_t>(hnsw_m);
+        }
+        if (get_u64("vec.efc", &efc)) {
+          params.efConstruction = static_cast<int32_t>(efc);
+        }
+
+        auto *vec = static_cast<vec_params_t *>(
+            mem_heap_zalloc(index->heap, sizeof(vec_params_t)));
+        *vec = params;
+        index->vec_params = vec;
+      }
+    }
 
     /** Look up the spatial reference system in the
     dictionary. Since this may cause a table open to read the

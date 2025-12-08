@@ -13,6 +13,8 @@
 struct dict_index_t;
 struct trx_t;
 struct vec_index_ctx_t;
+struct vec_index_segment_t;
+class THD;
 
 struct VecBuildTask {
   dict_index_t* index{nullptr};
@@ -58,3 +60,12 @@ bool vec_rotate_mem_index(trx_t* trx, dict_index_t* index);
 rotation. This creates the table and registers DD immediately, leaving it
 ready to be renamed to *_MEM by the background rotate task. */
 bool vec_prepare_pending_mem_table(dict_index_t* index);
+
+/* Load auxiliary PK cache for a specific immutable segment from its aux table.
+   Invoked on-demand in user threads (search path) to avoid bootstrap misses. */
+bool vec_load_aux_cache_for_segment(dict_index_t* vec_index,
+                                    vec_index_ctx_t* ctx,
+                                    vec_index_segment_t* seg, THD* thd);
+
+/* Schedule a background bootstrap load from vec metadata on startup. */
+void vec_schedule_bootstrap_load(dict_index_t* index);

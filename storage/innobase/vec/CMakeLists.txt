@@ -4,6 +4,7 @@ add_library(innobase_vec STATIC
   vec_faiss_factory.cc
   vec_hnswlib_factory.cc
   vec_index_adapter.cc
+  vec_meta.cc
   vec_builder.cc
   vec_aux_tables.cc
   vec_id_alloc.cc
