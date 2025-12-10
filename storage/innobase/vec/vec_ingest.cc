@@ -131,8 +131,9 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
     }
 
     dberr_t cache_err =
-        vec_insert_aux_cache(&seg->aux_cache, clust_index, faiss_id,
+        vec_insert_aux_cache(&seg->vid_pk_mapping, clust_index, faiss_id,
                              it.pk_columns);
+    seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
     if (cache_err != DB_SUCCESS) {
       ib::warn() << "VECINDEX: failed to insert aux cache entry for index "
                  << (index->name ? index->name : "(null)")

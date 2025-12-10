@@ -61,8 +61,8 @@ rotation. This creates the table and registers DD immediately, leaving it
 ready to be renamed to *_MEM by the background rotate task. */
 bool vec_prepare_pending_mem_table(dict_index_t* index);
 
-/* Load auxiliary PK cache for a specific immutable segment from its aux table.
-   Invoked on-demand in user threads (search path) to avoid bootstrap misses. */
+/* Load vid->PK mapping for a specific immutable segment. Prefer persisted
+   mapping files when available; fall back to scanning the aux table. */
 bool vec_load_aux_cache_for_segment(dict_index_t* vec_index,
                                     vec_index_ctx_t* ctx,
                                     vec_index_segment_t* seg, THD* thd);

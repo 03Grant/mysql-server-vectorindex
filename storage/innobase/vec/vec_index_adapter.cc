@@ -385,6 +385,7 @@ bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
   seg.index = std::move(index);
   seg.immutable = false;
   seg.aux_table_name = ctx.index_name_prefix;
+  seg.vecindex_bitmap.clear();
   ctx.segments.push_back(std::move(seg));
   ctx.inited = true;
   return true;
@@ -491,7 +492,8 @@ int vec_search(vec_index_ctx_t& ctx,
 
       // 过滤掉无效 id（Faiss 可能返回 -1 表示候选不足）
       for (size_t t = 0; t < k; ++t) {
-        if (I[t] >= 0) {
+        if (I[t] >= 0 &&
+            !seg_meta.vecindex_bitmap.is_marked(static_cast<size_t>(I[t]))) {
           cand.push_back({D[t], I[t], seg_id});
         }
       }

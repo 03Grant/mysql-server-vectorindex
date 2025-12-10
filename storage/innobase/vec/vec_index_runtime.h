@@ -15,7 +15,7 @@ struct TABLE;
 class handler;
 class MDL_ticket;
 
-struct vec_index_aux_cache_t {
+struct vid_pk_mapping_t {
   size_t key_length{0};  // length of MySQL-format PK tuple
   std::vector<std::vector<unsigned char>> pk_values;  // indexed by faiss_id
   bool ready{false};
@@ -36,11 +36,42 @@ struct vec_index_aux_cache_t {
   }
 };
 
+// Bitmap to track deleted vector IDs (VIDs) inside a segment.
+struct vecindex_bitmap_t {
+  std::vector<uint8_t> bits;
+
+  void clear() { bits.clear(); }
+
+  void ensure_size(size_t nbits) {
+    const size_t bytes = (nbits + 7) / 8;
+    if (bytes > bits.size()) {
+      bits.resize(bytes, 0);
+    }
+  }
+
+  void mark(size_t idx) {
+    const size_t byte = idx / 8;
+    const size_t bit = idx % 8;
+    ensure_size(idx + 1);
+    bits[byte] |= static_cast<uint8_t>(1u << bit);
+  }
+
+  bool is_marked(size_t idx) const {
+    const size_t byte = idx / 8;
+    const size_t bit = idx % 8;
+    if (byte >= bits.size()) {
+      return false;
+    }
+    return (bits[byte] >> bit) & 0x01;
+  }
+};
+
 // Runtime metadata for a single vector segment (mutable or immutable).
 struct vec_index_segment_t {
   std::unique_ptr<IVectorIndex> index;    // concrete vector index
   dict_table_t       *aux_dict_table{nullptr};  // cached aux dict object bound to this segment
-  vec_index_aux_cache_t aux_cache;        // PK cache aligned to faiss_ids for this segment
+  vid_pk_mapping_t    vid_pk_mapping;     // PK mapping aligned to faiss_ids for this segment
+  vecindex_bitmap_t   vecindex_bitmap;    // Deletion bitmap for this segment
   std::string         aux_table_name;     // resolved aux table name for this segment
   std::string         index_file_name;    // persisted filename (immutable segments)
   uint32_t            vecindex_id{0};

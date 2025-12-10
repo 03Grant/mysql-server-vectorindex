@@ -19,6 +19,8 @@ enum class VecSegmentState : uint8_t {
   Tombstone = 2
 };
 
+constexpr uint8_t VEC_SEG_FLAG_HAS_PK_MAPPING = 0x01;
+
 #pragma pack(push, 1)
 struct VecMetaHeader {
   uint32_t magic;
@@ -81,4 +83,20 @@ uint8_t vec_meta_metric_type(const vec_params_t& params);
 uint32_t vec_meta_checksum(const VecSegmentEntry& entry);
 void vec_meta_fill_entry(VecSegmentEntry* entry, uint64_t seg_id,
                          uint64_t count, VecSegmentState state,
-                         const std::string& file_name);
+                         const std::string& file_name,
+                         uint8_t flags = 0);
+
+inline bool vec_meta_segment_has_pk_mapping(const VecSegmentEntry& entry) {
+  return (entry.reserved[0] & VEC_SEG_FLAG_HAS_PK_MAPPING) != 0;
+}
+
+inline void vec_meta_mark_pk_mapping(VecSegmentEntry* entry, bool present) {
+  if (entry == nullptr) {
+    return;
+  }
+  if (present) {
+    entry->reserved[0] |= VEC_SEG_FLAG_HAS_PK_MAPPING;
+  } else {
+    entry->reserved[0] &= static_cast<uint8_t>(~VEC_SEG_FLAG_HAS_PK_MAPPING);
+  }
+}

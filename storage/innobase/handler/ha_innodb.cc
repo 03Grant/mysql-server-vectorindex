@@ -11716,9 +11716,9 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
       ib::warn() << "VECFETCH[c02] unknown segment id=" << hit.segment;
       return nullptr;
     }
-    if (seg->index->ntotal() > 0 && !seg->aux_cache.ready) {
+    if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
       if (!vec_load_aux_cache_for_segment(vec_index, ctx, seg, thd) ||
-          !seg->aux_cache.ready) {
+          !seg->vid_pk_mapping.ready) {
         ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready for segment "
                    << hit.segment;
         return nullptr;
@@ -11755,7 +11755,7 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
         vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
 
     if (seg == nullptr ||
-        !vec_aux_cache_bind_tuple(&seg->aux_cache,
+        !vec_aux_cache_bind_tuple(&seg->vid_pk_mapping,
                                   static_cast<uint64_t>(hit.faiss_id),
                                   clust_index, tuple)) {
       ib::warn() << "VECFETCH[c10] missing or corrupt cache entry for "

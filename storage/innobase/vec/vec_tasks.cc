@@ -2,7 +2,12 @@
 #include "vec_tasks.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <exception>
+#include <functional>
+#include <limits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <string>
@@ -37,6 +42,136 @@
 #include "data0type.h"
 
 namespace {
+
+inline void vec_pack_u32(std::string &buf, uint32_t value) {
+  buf.push_back(static_cast<char>(value & 0xFF));
+  buf.push_back(static_cast<char>((value >> 8) & 0xFF));
+  buf.push_back(static_cast<char>((value >> 16) & 0xFF));
+  buf.push_back(static_cast<char>((value >> 24) & 0xFF));
+}
+
+std::string vec_pack_pk_key(const std::vector<vec_pk_column_t> &pk_columns,
+                            ulint pk_fields) {
+  const ulint cols = std::min<ulint>(pk_fields, pk_columns.size());
+  const uint32_t num_cols = static_cast<uint32_t>(cols);
+
+  size_t total = sizeof(uint32_t);
+  for (ulint i = 0; i < cols; ++i) {
+    total += sizeof(uint32_t);
+    if (!pk_columns[i].is_null) {
+      total += pk_columns[i].data.size();
+    }
+  }
+
+  std::string packed;
+  packed.reserve(total);
+  vec_pack_u32(packed, num_cols);
+
+  for (ulint i = 0; i < cols; ++i) {
+    const auto &col = pk_columns[i];
+    if (col.is_null) {
+      vec_pack_u32(packed, std::numeric_limits<uint32_t>::max());
+      continue;
+    }
+    const uint32_t len =
+        static_cast<uint32_t>(std::min<size_t>(col.data.size(), UINT32_MAX));
+    vec_pack_u32(packed, len);
+    packed.append(reinterpret_cast<const char *>(col.data.data()),
+                  len);
+  }
+
+  return packed;
+}
+
+bool vec_extract_pk_columns(
+    TABLE *mysql_table, dict_index_t *clust_index, ulint pk_fields,
+    const std::function<Field *(size_t)> &field_resolver,
+    std::vector<vec_pk_column_t> &out) {
+  if (mysql_table == nullptr || clust_index == nullptr ||
+      mysql_table->s == nullptr) {
+    return false;
+  }
+
+  out.clear();
+  out.resize(pk_fields);
+
+  for (ulint i = 0; i < pk_fields; ++i) {
+    Field *f = field_resolver(static_cast<size_t>(i));
+    if (f == nullptr) {
+      return false;
+    }
+
+    vec_pk_column_t col{};
+    col.is_null = f->is_null();
+
+    dict_field_t *df = clust_index->get_field(static_cast<ulint>(i));
+    if (df != nullptr && df->col != nullptr) {
+      col.mtype = df->col->mtype;
+      col.prtype = df->col->prtype;
+    }
+
+    if (!col.is_null) {
+      const uchar *ptr = f->data_ptr();
+      const uint len = f->data_length();
+      if (ptr == nullptr && len != 0) {
+        return false;
+      }
+
+      dtype_t dtype;
+      dtype_set(&dtype, col.mtype, col.prtype, df->col->len);
+      dfield_t dfield;
+      dfield_set_type(&dfield, &dtype);
+      std::vector<byte> tmp(df->col->len + 16);
+      byte *end = row_mysql_store_col_in_innobase_format(
+          &dfield, tmp.data(), true, ptr, df->col->len,
+          dict_table_is_comp(clust_index->table));
+      const ulint stored_len =
+          static_cast<ulint>(end - static_cast<byte *>(tmp.data()));
+      col.data.assign(tmp.data(), tmp.data() + stored_len);
+    }
+
+    out[i] = std::move(col);
+  }
+
+  return true;
+}
+
+bool vec_extract_vector_field(TABLE *mysql_table, size_t vec_col_no,
+                              size_t dim, std::vector<float> &out) {
+  if (mysql_table == nullptr || mysql_table->field == nullptr ||
+      vec_col_no >= mysql_table->s->fields || dim == 0) {
+    return false;
+  }
+
+  Field *vf = mysql_table->field[vec_col_no];
+  if (vf == nullptr || vf->is_null()) {
+    return false;
+  }
+
+  String tmp;
+  String *data = vf->val_str(&tmp);
+  if (data == nullptr) {
+    return false;
+  }
+  const char *raw = data->ptr();
+  const size_t len = data->length();
+  const size_t expected = dim * sizeof(float);
+  if (raw == nullptr || len != expected) {
+    return false;
+  }
+
+  out.resize(dim);
+  for (size_t i = 0; i < dim; ++i) {
+    float value;
+    std::memcpy(&value, raw + i * sizeof(float), sizeof(float));
+    if (!std::isfinite(value)) {
+      return false;
+    }
+    out[i] = value;
+  }
+
+  return true;
+}
 
 std::unique_ptr<IVectorIndex> make_mutable_index(const vec_params_t &params) {
   vec_params_t mem_params = params;
@@ -99,6 +234,186 @@ bool vec_resolve_index_path(const std::string &full_name, std::string *out) {
   final_path.append(".vec");
   *out = std::move(final_path);
   ib::warn() << "VECINDEX: function::vec_resolve_index_path() Resolved index path to " << *out;
+  return true;
+}
+
+bool vec_bitmap_mark_missing(vecindex_bitmap_t* bitmap,
+                             const std::string& aux_table_name,
+                             size_t expected_count, THD* thd) {
+  ib::warn() << "VECINDEX: function::vec_bitmap_mark_missing() Marking missing entries from aux table " << aux_table_name;
+  if (bitmap == nullptr || aux_table_name.empty() || thd == nullptr) {
+    return false;
+  }
+
+  bitmap->clear();
+  if (expected_count == 0) {
+    return true;
+  }
+
+  const auto slash = aux_table_name.find('/');
+  if (slash == std::string::npos || slash == 0 || slash + 1 >= aux_table_name.size()) {
+    return false;
+  }
+  const std::string db = aux_table_name.substr(0, slash);
+  const std::string tbl = aux_table_name.substr(slash + 1);
+
+  MDL_request mdl_request;
+  MDL_REQUEST_INIT(&mdl_request, MDL_key::TABLE, db.c_str(), tbl.c_str(),
+                   MDL_SHARED_READ, MDL_EXPLICIT);
+  if (thd->mdl_context.acquire_lock(&mdl_request, 0)) {
+    ib::warn() << "VECINDEX: failed to acquire MDL for bitmap load on '"
+               << aux_table_name << "'";
+    return false;
+  }
+
+  struct MdlGuard {
+    THD* thd{nullptr};
+    MDL_request* req{nullptr};
+    ~MdlGuard() {
+      if (thd != nullptr && req != nullptr && req->ticket != nullptr) {
+        thd->mdl_context.release_lock(req->ticket);
+        req->ticket = nullptr;
+      }
+    }
+  } mdl_guard{thd, &mdl_request};
+
+  dd::cache::Dictionary_client* client = dd::get_dd_client(thd);
+  dd::cache::Dictionary_client::Auto_releaser releaser(client);
+  const dd::Table* dd_table_obj = nullptr;
+  if (client->acquire<dd::Table>(db.c_str(), tbl.c_str(), &dd_table_obj) ||
+      dd_table_obj == nullptr) {
+    ib::warn() << "VECINDEX: failed to acquire DD for bitmap load on '"
+               << aux_table_name << "'";
+    return false;
+  }
+
+  char path[FN_REFLEN + 1]{};
+  bool truncated = false;
+  size_t path_len = build_table_filename(
+      path, sizeof(path) - 1 - reg_ext_length, db.c_str(), tbl.c_str(), "", 0,
+      &truncated);
+  if (path_len == 0 || truncated) {
+    ib::warn() << "VECINDEX: failed to build path for bitmap load on '"
+               << aux_table_name << "'";
+    return false;
+  }
+
+  TABLE* mysql_table = open_table_uncached(
+      thd, path, db.c_str(), tbl.c_str(), false, true, *dd_table_obj);
+  if (mysql_table == nullptr || mysql_table->file == nullptr) {
+    ib::warn() << "VECINDEX: open_table_uncached failed for bitmap load on '"
+               << aux_table_name << "'";
+    return false;
+  }
+
+  struct TableGuard {
+    TABLE* t{nullptr};
+    ~TableGuard() {
+      if (t != nullptr) {
+        intern_close_table(t);
+        t = nullptr;
+      }
+    }
+  } table_guard{mysql_table};
+
+  trx_t* trx = thd_to_trx(thd);
+  bool allocated_trx = false;
+  if (trx == nullptr) {
+    trx = innobase_trx_allocate(thd);
+    if (trx == nullptr) {
+      ib::warn() << "VECINDEX: failed to allocate trx for bitmap load";
+      return false;
+    }
+    thd_to_trx(thd) = trx;
+    allocated_trx = true;
+  }
+  trx_start_if_not_started(trx, true, UT_LOCATION_HERE);
+
+  struct TrxDepthGuard {
+    trx_t* trx{nullptr};
+    bool entered{false};
+    ~TrxDepthGuard() {
+      if (entered && trx != nullptr) {
+        TrxInInnoDB::end_stmt(trx);
+      }
+    }
+  } depth_guard{trx, false};
+  TrxInInnoDB::begin_stmt(trx);
+  depth_guard.entered = true;
+
+  handler* h = mysql_table->file;
+  if (mysql_table->read_set != nullptr) {
+    bitmap_set_all(mysql_table->read_set);
+  }
+
+  if (h->ha_rnd_init(true)) {
+    ib::warn() << "VECINDEX: ha_rnd_init failed for bitmap load on '"
+               << aux_table_name << "'";
+    return false;
+  }
+
+  struct RndEndGuard {
+    handler* h{nullptr};
+    ~RndEndGuard() {
+      if (h != nullptr) {
+        h->ha_rnd_end();
+      }
+    }
+  } rnd_guard{h};
+
+  std::vector<uint8_t> present((expected_count + 7) / 8, 0);
+
+  while (true) {
+    int rc = h->ha_rnd_next(mysql_table->record[0]);
+    if (rc == HA_ERR_END_OF_FILE) {
+      break;
+    }
+    if (rc != 0) {
+      ib::warn() << "VECINDEX: ha_rnd_next failed for bitmap load on '"
+                 << aux_table_name << "' rc=" << rc;
+      return false;
+    }
+
+    if (mysql_table->s->fields == 0) {
+      continue;
+    }
+    Field* faiss_field = mysql_table->field[mysql_table->s->fields - 1];
+    if (faiss_field == nullptr || faiss_field->is_null()) {
+      continue;
+    }
+    const ulonglong faiss_id_ull =
+        static_cast<ulonglong>(faiss_field->val_int());
+    if (faiss_id_ull >= expected_count) {
+      continue;
+    }
+    const size_t idx = static_cast<size_t>(faiss_id_ull);
+    present[idx / 8] |= static_cast<uint8_t>(1u << (idx % 8));
+  }
+
+  bitmap->clear();
+  bitmap->ensure_size(expected_count);
+  for (size_t i = 0; i < expected_count; ++i) {
+    const size_t byte = i / 8;
+    const size_t bit = i % 8;
+    if ((present[byte] & static_cast<uint8_t>(1u << bit)) == 0) {
+      bitmap->mark(i);
+    }
+  }
+
+  h->ha_rnd_end();
+  rnd_guard.h = nullptr;
+  intern_close_table(mysql_table);
+  table_guard.t = nullptr;
+
+  if (trx != nullptr &&
+      trx->state.load(std::memory_order_relaxed) != TRX_STATE_NOT_STARTED) {
+    trx_commit_for_mysql(trx);
+  }
+  if (allocated_trx) {
+    trx_free_for_mysql(trx);
+    thd_to_trx(thd) = nullptr;
+  }
+
   return true;
 }
 
@@ -174,6 +489,7 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
   fresh.immutable = false;
   fresh.aux_dict_table =
       dd_table_open_on_name_in_mem(new_mem_name.c_str(), false);
+  fresh.vecindex_bitmap.clear();
 
   if (!ctx->segments.empty()) {
     ctx->segments.erase(ctx->segments.begin());
@@ -187,6 +503,7 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
   }
   ctx->pending_aux_name.clear();
   ctx->needs_aux_refresh.store(true);
+  lk.unlock();
   ib::warn() << "VECINDEX: function::vec_try_rotate_mem_index() Successfully rotated mem index.";
   return true;
 }
@@ -375,10 +692,24 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
   target->add(ids.size(), xb.data(), ids.data());
 
   target->save(index_path);
+  const std::string mapping_path = vec_vid_pk_mapping_path(index_path);
+  bool pk_mapping_saved = false;
+  if (!mapping_path.empty()) {
+    pk_mapping_saved =
+        vec_vid_pk_mapping_save(seg->vid_pk_mapping, mapping_path);
+    if (!pk_mapping_saved) {
+      ib::warn() << "VECINDEX: failed to persist PK mapping to '"
+                 << mapping_path << "'";
+    }
+  }
+
   seg->index_file_name = index_path;
   seg->index = std::move(target);
 
   if (meta_ready) {
+    if (pk_mapping_saved) {
+      vec_meta_mark_pk_mapping(&meta_entry, true);
+    }
     meta_entry.state = static_cast<uint8_t>(VecSegmentState::Committed);
     if (!meta_file.overwrite(meta_offset, &meta_entry)) {
       ib::warn() << "VECMETA: failed to commit meta entry for seg "
@@ -400,20 +731,6 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     return false;
   }
 
-  if (seg->aux_cache.ready) {
-    return true;
-  }
-
-  dict_index_t *clust_index = vec_index->table->first_index();
-  if (clust_index == nullptr) {
-    return false;
-  }
-
-  const size_t pk_fields = dict_index_get_n_unique(clust_index);
-  if (pk_fields == 0) {
-    return false;
-  }
-
   std::string aux_name = seg->aux_table_name;
   if (aux_name.empty()) {
     const std::string prefix =
@@ -424,6 +741,38 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
       return false;
     }
     seg->aux_table_name = aux_name;
+  }
+
+  if (seg->vid_pk_mapping.ready) {
+    return true;
+  }
+
+  const std::string mapping_path =
+      vec_vid_pk_mapping_path(seg->index_file_name);
+  if (!mapping_path.empty() &&
+      vec_vid_pk_mapping_load(mapping_path, &seg->vid_pk_mapping)) {
+    bool bitmap_ok = vec_bitmap_mark_missing(
+        &seg->vecindex_bitmap, aux_name, seg->vid_pk_mapping.size(), thd);
+    if (!bitmap_ok) {
+      ib::warn() << "VECINDEX: failed to refresh deletion bitmap from aux table '"
+                 << aux_name << "'";
+    }
+    ib::warn() << "VECINDEX: loaded PK mapping file '" << mapping_path
+               << "' rows=" << seg->vid_pk_mapping.size();
+    if (bitmap_ok) {
+      seg->vid_pk_mapping.ready = true;
+      return true;
+    }
+  }
+
+  dict_index_t *clust_index = vec_index->table->first_index();
+  if (clust_index == nullptr) {
+    return false;
+  }
+
+  const size_t pk_fields = dict_index_get_n_unique(clust_index);
+  if (pk_fields == 0) {
+    return false;
   }
 
   const auto slash = aux_name.find('/');
@@ -547,7 +896,7 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     }
   } rnd_guard{h};
 
-  seg->aux_cache.clear();
+  seg->vid_pk_mapping.clear();
 
   while (true) {
     int rc = h->ha_rnd_next(mysql_table->record[0]);
@@ -557,7 +906,7 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     if (rc != 0) {
       ib::warn() << "VECINDEX: ha_rnd_next failed for aux table '" << aux_name
                  << "' rc=" << rc;
-      seg->aux_cache.clear();
+      seg->vid_pk_mapping.clear();
       return false;
     }
 
@@ -605,7 +954,7 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     }
 
     if (!pk_ok) {
-      seg->aux_cache.clear();
+      seg->vid_pk_mapping.clear();
       return false;
     }
 
@@ -616,10 +965,10 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     const ulonglong faiss_id_ull =
         static_cast<ulonglong>(faiss_field->val_int());
     dberr_t cache_err = vec_insert_aux_cache(
-        &seg->aux_cache, clust_index, static_cast<uint64_t>(faiss_id_ull),
+        &seg->vid_pk_mapping, clust_index, static_cast<uint64_t>(faiss_id_ull),
         pk_cols);
     if (cache_err != DB_SUCCESS) {
-      seg->aux_cache.clear();
+      seg->vid_pk_mapping.clear();
       return false;
     }
   }
@@ -628,9 +977,11 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
   rnd_guard.h = nullptr;
   intern_close_table(mysql_table);
   table_guard.t = nullptr;
-  seg->aux_cache.ready = true;
+  vec_bitmap_mark_missing(&seg->vecindex_bitmap, aux_name,
+                          seg->vid_pk_mapping.size(), thd);
+  seg->vid_pk_mapping.ready = true;
   ib::warn() << "VECINDEX: loaded auxiliary PK cache for table '" << aux_name
-             << "' rows=" << seg->aux_cache.size();
+             << "' rows=" << seg->vid_pk_mapping.size();
 
   /* Clean up the background transaction so the THD can be freed safely. */
   if (trx != nullptr &&
@@ -895,6 +1246,455 @@ void VecTaskManager::process_task(VecBuildTask task) {
   clear_pending();
 }
 
+bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
+                                   THD *thd) {
+  ib::warn() << "VECMETA: attempting mutable MEM recovery for index "
+             << (index != nullptr && index->name ? index->name : "(null)");
+
+  if (index == nullptr || ctx == nullptr || thd == nullptr ||
+      index->table == nullptr) {
+    return false;
+  }
+
+  vec_index_segment_t *seg = ctx->mutable_segment();
+  if (seg == nullptr || seg->index == nullptr) {
+    return false;
+  }
+
+  if (seg->index->ntotal() != 0) {
+    ib::warn() << "VECMETA: mutable index already populated, skipping MEM "
+               << "recovery for index "
+               << (index->name ? index->name : "(null)");
+    return true;
+  }
+
+  const std::string prefix =
+      ctx->index_name_prefix.empty() ? vec_aux_prefix(index)
+                                     : ctx->index_name_prefix;
+  if (prefix.empty()) {
+    return false;
+  }
+
+  const std::string mem_name = vec_aux_mem_name(prefix);
+  if (!vec_aux_table_exists(mem_name)) {
+    ib::warn() << "VECMETA: MEM table '" << mem_name
+               << "' not found, skip mutable recovery.";
+    return true;
+  }
+
+  if (seg->aux_table_name.empty()) {
+    seg->aux_table_name = mem_name;
+  }
+
+  dict_index_t *clust_index = index->table->first_index();
+  if (clust_index == nullptr) {
+    return false;
+  }
+
+  const ulint pk_fields = dict_index_get_n_unique(clust_index);
+  if (pk_fields == 0) {
+    return false;
+  }
+
+  const dict_field_t *vec_field = index->get_field(0);
+  if (vec_field == nullptr || vec_field->col == nullptr) {
+    return false;
+  }
+
+  const size_t vec_col_no = dict_col_get_no(vec_field->col);
+  const size_t dim = ctx->params.dim;
+  if (dim == 0) {
+    return false;
+  }
+
+  auto split_name = [](const std::string &full, std::string *db,
+                       std::string *tbl) -> bool {
+    if (full.empty() || db == nullptr || tbl == nullptr) {
+      return false;
+    }
+    const auto slash = full.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= full.size()) {
+      return false;
+    }
+    *db = full.substr(0, slash);
+    *tbl = full.substr(slash + 1);
+    return !(db->empty() || tbl->empty());
+  };
+
+  std::string aux_db, aux_tbl;
+  if (!split_name(mem_name, &aux_db, &aux_tbl)) {
+    return false;
+  }
+
+  std::string base_db, base_tbl;
+  if (index->table->name.m_name == nullptr ||
+      !split_name(index->table->name.m_name, &base_db, &base_tbl)) {
+    return false;
+  }
+
+  MDL_request aux_mdl;
+  MDL_request base_mdl;
+  MDL_REQUEST_INIT(&aux_mdl, MDL_key::TABLE, aux_db.c_str(), aux_tbl.c_str(),
+                   MDL_SHARED_READ, MDL_EXPLICIT);
+  MDL_REQUEST_INIT(&base_mdl, MDL_key::TABLE, base_db.c_str(),
+                   base_tbl.c_str(), MDL_SHARED_READ, MDL_EXPLICIT);
+
+  if (thd->mdl_context.acquire_lock(&aux_mdl, 0)) {
+    ib::warn() << "VECMETA: failed to acquire MDL on MEM table '" << mem_name
+               << "'";
+    return false;
+  }
+
+  if (thd->mdl_context.acquire_lock(&base_mdl, 0)) {
+    ib::warn() << "VECMETA: failed to acquire MDL on base table '"
+               << index->table->name.m_name << "'";
+    thd->mdl_context.release_lock(aux_mdl.ticket);
+    return false;
+  }
+
+  struct MdlGuard {
+    THD *thd{nullptr};
+    MDL_request *req{nullptr};
+    ~MdlGuard() {
+      if (thd != nullptr && req != nullptr && req->ticket != nullptr) {
+        thd->mdl_context.release_lock(req->ticket);
+        req->ticket = nullptr;
+      }
+    }
+  };
+
+  MdlGuard aux_guard{thd, &aux_mdl};
+  MdlGuard base_guard{thd, &base_mdl};
+
+  dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
+  dd::cache::Dictionary_client::Auto_releaser releaser(client);
+
+  const dd::Table *dd_aux = nullptr;
+  const dd::Table *dd_base = nullptr;
+  if (client->acquire<dd::Table>(aux_db.c_str(), aux_tbl.c_str(), &dd_aux) ||
+      dd_aux == nullptr) {
+    ib::warn() << "VECMETA: failed to acquire DD for MEM table '" << mem_name
+               << "'";
+    return false;
+  }
+
+  if (client->acquire<dd::Table>(base_db.c_str(), base_tbl.c_str(), &dd_base) ||
+      dd_base == nullptr) {
+    ib::warn() << "VECMETA: failed to acquire DD for base table '"
+               << index->table->name.m_name << "'";
+    return false;
+  }
+
+  char aux_path[FN_REFLEN + 1]{};
+  char base_path[FN_REFLEN + 1]{};
+  bool aux_trunc = false;
+  bool base_trunc = false;
+  size_t aux_path_len =
+      build_table_filename(aux_path, sizeof(aux_path) - 1 - reg_ext_length,
+                           aux_db.c_str(), aux_tbl.c_str(), "", 0, &aux_trunc);
+  size_t base_path_len = build_table_filename(
+      base_path, sizeof(base_path) - 1 - reg_ext_length, base_db.c_str(),
+      base_tbl.c_str(), "", 0, &base_trunc);
+  if (aux_path_len == 0 || aux_trunc || base_path_len == 0 || base_trunc) {
+    ib::warn() << "VECMETA: failed to build table path for MEM or base table "
+               << "during recovery.";
+    return false;
+  }
+
+  TABLE *aux_table =
+      open_table_uncached(thd, aux_path, aux_db.c_str(), aux_tbl.c_str(),
+                          false, true, *dd_aux);
+  TABLE *base_table =
+      open_table_uncached(thd, base_path, base_db.c_str(), base_tbl.c_str(),
+                          false, true, *dd_base);
+
+  if (aux_table == nullptr || aux_table->file == nullptr || base_table == nullptr ||
+      base_table->file == nullptr) {
+    ib::warn() << "VECMETA: failed to open MEM or base table for recovery.";
+    if (aux_table != nullptr) {
+      intern_close_table(aux_table);
+    }
+    if (base_table != nullptr) {
+      intern_close_table(base_table);
+    }
+    return false;
+  }
+
+  struct TableGuard {
+    TABLE *t{nullptr};
+    ~TableGuard() {
+      if (t != nullptr) {
+        intern_close_table(t);
+        t = nullptr;
+      }
+    }
+  };
+
+  TableGuard aux_table_guard{aux_table};
+  TableGuard base_table_guard{base_table};
+
+  trx_t *trx = thd_to_trx(thd);
+  bool allocated_trx = false;
+  if (trx == nullptr) {
+    trx = innobase_trx_allocate(thd);
+    if (trx == nullptr) {
+      ib::warn() << "VECMETA: failed to allocate trx for MEM recovery";
+      return false;
+    }
+    thd_to_trx(thd) = trx;
+    allocated_trx = true;
+  }
+  trx_start_if_not_started(trx, true, UT_LOCATION_HERE);
+
+  struct TrxCleanupGuard {
+    THD *thd{nullptr};
+    trx_t *trx{nullptr};
+    bool owned{false};
+    bool committed{false};
+    ~TrxCleanupGuard() {
+      if (trx == nullptr) {
+        return;
+      }
+      if (!committed && owned &&
+          trx->state.load(std::memory_order_relaxed) != TRX_STATE_NOT_STARTED) {
+        trx_rollback_to_savepoint(trx, nullptr);
+      }
+      if (owned) {
+        trx_free_for_mysql(trx);
+        if (thd != nullptr) {
+          thd_to_trx(thd) = nullptr;
+        }
+      }
+    }
+  } trx_cleanup{thd, trx, allocated_trx, false};
+
+  struct TrxDepthGuard {
+    trx_t *trx{nullptr};
+    bool entered{false};
+    ~TrxDepthGuard() {
+      if (entered && trx != nullptr) {
+        TrxInInnoDB::end_stmt(trx);
+      }
+    }
+  } depth_guard{trx, false};
+  TrxInInnoDB::begin_stmt(trx);
+  depth_guard.entered = true;
+
+  handler *aux_h = aux_table->file;
+  handler *base_h = base_table->file;
+  if (aux_table->read_set != nullptr) {
+    bitmap_set_all(aux_table->read_set);
+  }
+  if (base_table->read_set != nullptr) {
+    bitmap_set_all(base_table->read_set);
+  }
+
+  if (pk_fields >= aux_table->s->fields) {
+    ib::warn() << "VECMETA: MEM table layout mismatch for '" << mem_name << "'";
+    return false;
+  }
+
+  if (aux_h->ha_rnd_init(true)) {
+    ib::warn() << "VECMETA: ha_rnd_init failed for MEM table '" << mem_name
+               << "'";
+    return false;
+  }
+
+  struct RndEndGuard {
+    handler *h{nullptr};
+    ~RndEndGuard() {
+      if (h != nullptr) {
+        h->ha_rnd_end();
+      }
+    }
+  } aux_rnd{aux_h};
+
+  struct AuxEntry {
+    std::vector<vec_pk_column_t> pk_cols;
+    uint64_t old_id{0};
+    uint64_t new_id{std::numeric_limits<uint64_t>::max()};
+  };
+
+  std::vector<AuxEntry> entries;
+  std::unordered_map<std::string, size_t> pk_to_entry;
+
+  while (true) {
+    int rc = aux_h->ha_rnd_next(aux_table->record[0]);
+    if (rc == HA_ERR_END_OF_FILE) {
+      break;
+    }
+    if (rc != 0) {
+      ib::warn() << "VECMETA: ha_rnd_next failed for MEM table '" << mem_name
+                 << "' rc=" << rc;
+      return false;
+    }
+
+    AuxEntry entry{};
+    bool pk_ok = vec_extract_pk_columns(
+        aux_table, clust_index, pk_fields,
+        [aux_table](size_t idx) {
+          return (idx < static_cast<size_t>(aux_table->s->fields))
+                     ? aux_table->field[idx]
+                     : nullptr;
+        },
+        entry.pk_cols);
+    if (!pk_ok) {
+      ib::warn() << "VECMETA: failed to decode PK from MEM row";
+      return false;
+    }
+
+    Field *faiss_field = aux_table->field[pk_fields];
+    if (faiss_field == nullptr || faiss_field->is_null()) {
+      continue;
+    }
+    entry.old_id = static_cast<uint64_t>(faiss_field->val_int());
+
+    std::string key = vec_pack_pk_key(entry.pk_cols, pk_fields);
+    if (key.empty()) {
+      continue;
+    }
+
+    if (pk_to_entry.find(key) != pk_to_entry.end()) {
+      continue;
+    }
+
+    pk_to_entry.emplace(std::move(key), entries.size());
+    entries.push_back(std::move(entry));
+  }
+
+  if (entries.empty()) {
+    ib::warn() << "VECMETA: MEM table '" << mem_name
+               << "' empty; nothing to recover.";
+    if (trx != nullptr &&
+        trx->state.load(std::memory_order_relaxed) != TRX_STATE_NOT_STARTED) {
+      trx_commit_for_mysql(trx);
+    }
+    trx_cleanup.committed = true;
+    return true;
+  }
+
+  if (base_h->ha_rnd_init(true)) {
+    ib::warn() << "VECMETA: ha_rnd_init failed for base table '"
+               << index->table->name.m_name << "'";
+    return false;
+  }
+  RndEndGuard base_rnd{base_h};
+
+  auto base_field_resolver = [&](size_t idx) -> Field * {
+    dict_field_t *df = clust_index->get_field(static_cast<ulint>(idx));
+    if (df == nullptr || df->col == nullptr) {
+      return nullptr;
+    }
+    const ulint col_no = dict_col_get_no(df->col);
+    if (col_no >= base_table->s->fields) {
+      return nullptr;
+    }
+    return base_table->field[col_no];
+  };
+
+  std::vector<float> xb;
+  std::vector<int64_t> ids;
+  xb.reserve(entries.size() * dim);
+  ids.reserve(entries.size());
+
+  while (true) {
+    int rc = base_h->ha_rnd_next(base_table->record[0]);
+    if (rc == HA_ERR_END_OF_FILE) {
+      break;
+    }
+    if (rc != 0) {
+      ib::warn() << "VECMETA: ha_rnd_next failed for base table '"
+                 << index->table->name.m_name << "' rc=" << rc;
+      return false;
+    }
+
+    std::vector<vec_pk_column_t> pk_cols;
+    if (!vec_extract_pk_columns(base_table, clust_index, pk_fields,
+                                base_field_resolver, pk_cols)) {
+      ib::warn() << "VECMETA: failed to extract PK from base row";
+      return false;
+    }
+
+    std::string key = vec_pack_pk_key(pk_cols, pk_fields);
+    auto it = pk_to_entry.find(key);
+    if (it == pk_to_entry.end()) {
+      continue;
+    }
+
+    AuxEntry &entry = entries[it->second];
+    if (entry.new_id != std::numeric_limits<uint64_t>::max()) {
+      continue;
+    }
+
+    std::vector<float> vec_values;
+    if (!vec_extract_vector_field(base_table, vec_col_no, dim, vec_values)) {
+      ib::warn() << "VECMETA: invalid vector payload during MEM recovery";
+      continue;
+    }
+
+    const uint64_t new_id = static_cast<uint64_t>(ids.size());
+    entry.new_id = new_id;
+    ids.push_back(static_cast<int64_t>(new_id));
+    xb.insert(xb.end(), vec_values.begin(), vec_values.end());
+
+    dberr_t cache_err = vec_insert_aux_cache(
+        &seg->vid_pk_mapping, clust_index, new_id, entry.pk_cols);
+    seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
+    if (cache_err != DB_SUCCESS) {
+      ib::warn() << "VECMETA: failed to insert pk cache during MEM recovery "
+                 << "for id=" << new_id;
+      return false;
+    }
+  }
+
+  if (ids.empty()) {
+    ib::warn() << "VECMETA: no matching base rows found for MEM recovery on '"
+               << index->table->name.m_name << "'";
+    if (trx != nullptr &&
+        trx->state.load(std::memory_order_relaxed) != TRX_STATE_NOT_STARTED) {
+      trx_commit_for_mysql(trx);
+    }
+    trx_cleanup.committed = true;
+    return true;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(ctx->mu);
+    seg->index->add(ids.size(), xb.data(), ids.data());
+  }
+
+  seg->vecindex_bitmap.clear();
+  seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
+  seg->vid_pk_mapping.ready = true;
+  ctx->id_alloc.next = static_cast<uint64_t>(seg->index->ntotal());
+  ctx->id_alloc.inited = true;
+
+  for (const auto &entry : entries) {
+    if (entry.new_id == std::numeric_limits<uint64_t>::max()) {
+      continue;
+    }
+    dberr_t upd_err =
+        vec_aux_update_pk_vid(trx, index, entry.pk_cols, entry.new_id);
+    if (upd_err != DB_SUCCESS) {
+      ib::warn() << "VECMETA: failed to update MEM faiss_id during recovery "
+                 << "id=" << entry.old_id << "->" << entry.new_id
+                 << " err=" << upd_err;
+      return false;
+    }
+  }
+
+  if (trx != nullptr &&
+      trx->state.load(std::memory_order_relaxed) != TRX_STATE_NOT_STARTED) {
+    trx_commit_for_mysql(trx);
+  }
+  trx_cleanup.committed = true;
+
+  ib::warn() << "VECMETA: recovered " << ids.size()
+             << " vectors into mutable MEM index for table '"
+             << index->table->name.m_name << "'";
+  return true;
+}
+
 class VecMetaLoader {
  public:
   static VecMetaLoader &instance() {
@@ -1012,13 +1812,6 @@ class VecMetaLoader {
                << (index->name ? index->name : "(null)");
     vec_index_ctx_t *ctx = index->vec_runtime;
     std::string meta_path;
-    if (!vec_meta_path_for_index(index, &meta_path)) {
-      ctx->bootstrap_loaded.store(true, std::memory_order_release);
-      ib::warn() << "VECMETA: failed to get meta path for index "
-                 << (index->name ? index->name : "(null)");
-      return;
-    }
-
     VecBgThdGuard guard;
     if (!guard.create()) {
       ctx->bootstrap_loaded.store(true, std::memory_order_release);
@@ -1028,28 +1821,33 @@ class VecMetaLoader {
 
     VecMetaHeader header{};
     std::vector<VecSegmentEntry> entries;
-    if (!vec_meta_read_all(meta_path, &header, &entries)) {
-      ctx->bootstrap_loaded.store(true, std::memory_order_release);
-      ib::warn() << "VECMETA: failed to read meta file '" << meta_path
-                 << "'";
-      return;
-    }
+    bool meta_ok = false;
+    if (vec_meta_path_for_index(index, &meta_path)) {
+      if (vec_meta_read_all(meta_path, &header, &entries)) {
+        VecMetaHeader expected = vec_meta_make_header(index, ctx->params);
+        auto header_matches = [](const VecMetaHeader &lhs,
+                                 const VecMetaHeader &rhs) {
+          return lhs.magic == rhs.magic && lhs.version == rhs.version &&
+                 lhs.index_id == rhs.index_id &&
+                 lhs.dimension == rhs.dimension &&
+                 lhs.index_type == rhs.index_type &&
+                 lhs.metric_type == rhs.metric_type;
+        };
 
-    VecMetaHeader expected = vec_meta_make_header(index, ctx->params);
-    auto header_matches = [](const VecMetaHeader &lhs,
-                             const VecMetaHeader &rhs) {
-      return lhs.magic == rhs.magic && lhs.version == rhs.version &&
-             lhs.index_id == rhs.index_id && lhs.dimension == rhs.dimension &&
-             lhs.index_type == rhs.index_type &&
-             lhs.metric_type == rhs.metric_type;
-    };
-
-    if (!header_matches(header, expected)) {
-      ib::warn() << "VECMETA: header mismatch for index "
+        if (!header_matches(header, expected)) {
+          ib::warn() << "VECMETA: header mismatch for index "
+                     << (index->name ? index->name : "(null)")
+                     << ", skip meta segments.";
+        } else {
+          meta_ok = true;
+        }
+      } else {
+        ib::warn() << "VECMETA: failed to read meta file '" << meta_path << "'";
+      }
+    } else {
+      ib::warn() << "VECMETA: no meta path available for index "
                  << (index->name ? index->name : "(null)")
-                 << ", skip bootstrap load.";
-      ctx->bootstrap_loaded.store(true, std::memory_order_release);
-      return;
+                 << "; attempting MEM recovery only.";
     }
 
     const std::string base_dir = vec_meta_dirname(meta_path);
@@ -1057,84 +1855,113 @@ class VecMetaLoader {
         ctx->index_name_prefix.empty() ? vec_aux_prefix(index)
                                        : ctx->index_name_prefix;
 
-    ib::warn() << "VECMETA: loading " << entries.size()
-               << " segments for index "
-               << (index->name ? index->name : "(null)");
+    if (meta_ok) {
+      ib::warn() << "VECMETA: loading " << entries.size()
+                 << " segments for index "
+                 << (index->name ? index->name : "(null)");
 
-    for (const auto &entry : entries) {
-      vec_index_segment_t *inserted = nullptr;
-      ib::warn() << "VECMETA: processing segment " << entry.seg_id
-                 << " with state " << static_cast<int>(entry.state)
-                 << " and file name '" << entry.file_name << "'";
-      if (entry.state != static_cast<uint8_t>(VecSegmentState::Committed)) {
-        continue;
-      }
-      const uint32_t seg_id = static_cast<uint32_t>(entry.seg_id);
+      for (const auto &entry : entries) {
+        vec_index_segment_t *inserted = nullptr;
+        ib::warn() << "VECMETA: processing segment " << entry.seg_id
+                   << " with state " << static_cast<int>(entry.state)
+                   << " and file name '" << entry.file_name << "'";
+        if (entry.state != static_cast<uint8_t>(VecSegmentState::Committed)) {
+          continue;
+        }
+        const uint32_t seg_id = static_cast<uint32_t>(entry.seg_id);
 
-      {
+        {
+          std::lock_guard<std::mutex> lk(ctx->mu);
+          const bool exists = std::any_of(
+              ctx->segments.begin(), ctx->segments.end(),
+              [seg_id](const vec_index_segment_t &s) {
+                return s.vecindex_id == seg_id && s.immutable;
+              });
+          if (exists) {
+            continue;
+          }
+        }
+
+        std::string seg_path = vec_meta_join(base_dir, entry.file_name);
+        if (seg_path.empty()) {
+          ib::warn() << "VECMETA: empty segment path for seg_id=" << seg_id;
+          continue;
+        }
+
+        auto target = ctx->params.backend == BackendType::Faiss
+                          ? vec_make_faiss_index(ctx->params)
+                          : vec_make_hnswlib_index(ctx->params);
+        if (!target) {
+          ib::warn() << "VECMETA: unable to allocate index for seg_id="
+                     << seg_id;
+          continue;
+        }
+        
+        ib::warn() << "VECMETA: loading segment " << seg_id;
+        try {
+          target->load(seg_path);
+        } catch (const std::exception &e) {
+          ib::warn() << "VECMETA: failed to load segment file '" << seg_path
+                     << "' error=" << e.what();
+          continue;
+        }
+
+        vec_index_segment_t loaded{};
+        loaded.index = std::move(target);
+        loaded.aux_table_name =
+            prefix.empty() ? std::string{} : vec_aux_segment_name(prefix, seg_id);
+        loaded.index_file_name = seg_path;
+        loaded.vecindex_id = seg_id;
+        loaded.immutable = true;
+
+        const bool expect_pk_map = vec_meta_segment_has_pk_mapping(entry);
+        const std::string map_path = vec_vid_pk_mapping_path(seg_path);
+        if (!map_path.empty()) {
+          const bool map_ok =
+              vec_vid_pk_mapping_load(map_path, &loaded.vid_pk_mapping);
+          if (map_ok) {
+            vec_bitmap_mark_missing(&loaded.vecindex_bitmap,
+                                    loaded.aux_table_name,
+                                    loaded.vid_pk_mapping.size(),
+                                    guard.thd());
+            ib::warn() << "VECMETA: restored PK mapping from '" << map_path
+                       << "' rows=" << loaded.vid_pk_mapping.size();
+            loaded.vid_pk_mapping.ready = true;
+          } else if (expect_pk_map) {
+            ib::warn() << "VECMETA: pk mapping flagged but not readable at '"
+                       << map_path << "'";
+          }
+        }
+
         std::lock_guard<std::mutex> lk(ctx->mu);
-        const bool exists = std::any_of(
+        const bool dup = std::any_of(
             ctx->segments.begin(), ctx->segments.end(),
             [seg_id](const vec_index_segment_t &s) {
               return s.vecindex_id == seg_id && s.immutable;
             });
-        if (exists) {
-          continue;
+        if (!dup) {
+          ctx->segments.push_back(std::move(loaded));
+          ctx->max_vecindex_id =
+              std::max<uint32_t>(ctx->max_vecindex_id, seg_id);
+          inserted = &ctx->segments.back();
+        }
+
+        ib::warn() << "VECMETA: loaded segment " << seg_id
+                   << " for index "
+                   << (index->name ? index->name : "(null)");
+
+        if (inserted != nullptr && guard.thd() != nullptr &&
+            !inserted->vid_pk_mapping.ready) {
+              //TODO: May need a flag to resave PK mapping to file?
+          vec_load_aux_cache_for_segment(index, ctx, inserted, guard.thd());
         }
       }
+    }
 
-      std::string seg_path = vec_meta_join(base_dir, entry.file_name);
-      if (seg_path.empty()) {
-        ib::warn() << "VECMETA: empty segment path for seg_id=" << seg_id;
-        continue;
-      }
-
-      auto target = ctx->params.backend == BackendType::Faiss
-                        ? vec_make_faiss_index(ctx->params)
-                        : vec_make_hnswlib_index(ctx->params);
-      if (!target) {
-        ib::warn() << "VECMETA: unable to allocate index for seg_id="
-                   << seg_id;
-        continue;
-      }
-      
-      ib::warn() << "VECMETA: loading segment " << seg_id;
-      try {
-        target->load(seg_path);
-      } catch (const std::exception &e) {
-        ib::warn() << "VECMETA: failed to load segment file '" << seg_path
-                   << "' error=" << e.what();
-        continue;
-      }
-
-      vec_index_segment_t loaded{};
-      loaded.index = std::move(target);
-      loaded.aux_table_name =
-          prefix.empty() ? std::string{} : vec_aux_segment_name(prefix, seg_id);
-      loaded.index_file_name = seg_path;
-      loaded.vecindex_id = seg_id;
-      loaded.immutable = true;
-
-      std::lock_guard<std::mutex> lk(ctx->mu);
-      const bool dup = std::any_of(
-          ctx->segments.begin(), ctx->segments.end(),
-          [seg_id](const vec_index_segment_t &s) {
-            return s.vecindex_id == seg_id && s.immutable;
-          });
-      if (!dup) {
-        ctx->segments.push_back(std::move(loaded));
-        ctx->max_vecindex_id =
-            std::max<uint32_t>(ctx->max_vecindex_id, seg_id);
-        inserted = &ctx->segments.back();
-      }
-
-      ib::warn() << "VECMETA: loaded segment " << seg_id
-                 << " for index "
+    if (guard.thd() != nullptr &&
+        !vec_recover_mutable_mem_index(index, ctx, guard.thd())) {
+      ib::warn() << "VECMETA: MEM recovery failed for index "
                  << (index->name ? index->name : "(null)");
-
-      if (inserted != nullptr && guard.thd() != nullptr) {
-        vec_load_aux_cache_for_segment(index, ctx, inserted, guard.thd());
-      }
     }
 
     ctx->bootstrap_loaded.store(true, std::memory_order_release);

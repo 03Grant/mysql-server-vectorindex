@@ -14,6 +14,7 @@
 struct trx_t;
 struct dict_index_t;
 struct dtuple_t;
+struct vid_pk_mapping_t;
 struct TABLE;
 struct KEY;
 class Field;
@@ -51,14 +52,21 @@ dberr_t vec_aux_create_table(trx_t* trx,
 dberr_t vec_create_index_dd_tables(dict_table_t *table);
 
 // Append pk snapshot into cache
-dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache,
+dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
                              dict_index_t *clust_index, uint64_t faiss_id,
                              const std::vector<vec_pk_column_t> &pk_columns);
 
 // Bind cached PK entry directly to a clustered-index tuple
-bool vec_aux_cache_bind_tuple(const vec_index_aux_cache_t *cache,
+bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
                               uint64_t faiss_id, dict_index_t *clust_index,
                               dtuple_t *tuple);
+
+// Persist/restore vid->PK mapping snapshots alongside immutable vector index files.
+std::string vec_vid_pk_mapping_path(const std::string& index_path);
+bool vec_vid_pk_mapping_save(const vid_pk_mapping_t& mapping,
+                             const std::string& path);
+bool vec_vid_pk_mapping_load(const std::string& path,
+                             vid_pk_mapping_t* mapping);
 
 
 struct vec_pk_column_t;

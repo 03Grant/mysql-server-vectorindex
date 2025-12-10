@@ -33,7 +33,10 @@
 #include <limits>
 #include <algorithm>
 #include <cstdlib>  // strtoull
+#include <memory>
 #include <mutex>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "fts0priv.h"         // fts_parse_sql / fts_eval_sql
 #include "pars0pars.h"        // pars_info_* helpers
@@ -701,23 +704,25 @@ dberr_t vec_aux_update_pk_vid(trx_t* trx,
   return DB_SUCCESS;
 }
 
-/** Extract only the required flags from table->flags2 for FTS Aux
-tables.
+/** Extract only the required flags from table->flags2 for VEC aux
+tables. Avoid DICT_TF2_AUX so these tables are not misclassified as
+FTS auxiliary objects (which triggers FTS-only assertions). Always
+tag the table as VECINDEX-aware instead. 
 @param[in]      flags2  Table flags2
-@return extracted flags2 for FTS aux tables */
+@return extracted flags2 for VEC aux tables */
 static inline uint32_t vec_get_table_flags2_for_aux_tables(uint32_t flags2) {
   /* Extract the file_per_table flag, temporary file flag and encryption flag
-  from the main FTS table flags2 */
+  from the main table flags2 */
   return ((flags2 & DICT_TF2_USE_FILE_PER_TABLE) |
           (flags2 & DICT_TF2_ENCRYPTION_FILE_PER_TABLE) |
-          (flags2 & DICT_TF2_TEMPORARY) | DICT_TF2_AUX);
+          (flags2 & DICT_TF2_TEMPORARY) | DICT_TF2_VECINDEX);
 }
 
-/** Create dict_table_t object for FTS Aux tables.
-@param[in]      aux_table_name  FTS Aux table name
-@param[in]      table           table object of FTS Index
-@param[in]      n_cols          number of columns for FTS Aux table
-@return table object for FTS Aux table */
+/** Create dict_table_t object for VEC Aux tables.
+@param[in]      aux_table_name  VEC Aux table name
+@param[in]      table           table object of VEC Index
+@param[in]      n_cols          number of columns for VEC Aux table
+@return table object for VEC Aux table */
 static dict_table_t *vec_create_in_mem_aux_table(const char *aux_table_name,
                                                  const dict_table_t *table,
                                                  ulint n_cols) {
@@ -863,9 +868,40 @@ static std::vector<unsigned char> vec_pack_pk_entry(
   return packed;
 }
 
+constexpr uint32_t VID_PK_MAPPING_MAGIC = 0x4D4B5056;  // "VPKM"
+constexpr uint16_t VID_PK_MAPPING_VERSION = 1;
+
+#pragma pack(push, 1)
+struct VidPkMappingHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint64_t entry_count;
+  uint32_t key_length;
+  uint8_t  reserved2[4];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(VidPkMappingHeader) == 24,
+              "VidPkMappingHeader size mismatch");
+
+inline bool vec_pk_flush(FILE *fp) {
+  if (fp == nullptr) {
+    return false;
+  }
+  if (fflush(fp) != 0) {
+    return false;
+  }
+  const int fd = fileno(fp);
+  if (fd < 0) {
+    return false;
+  }
+  return fsync(fd) == 0;
+}
+
 }  // namespace
 
-dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache,
+dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
                              dict_index_t *clust_index, uint64_t faiss_id,
                              const std::vector<vec_pk_column_t> &pk_columns) {
   if (cache == nullptr || clust_index == nullptr) {
@@ -903,7 +939,7 @@ dberr_t vec_insert_aux_cache(vec_index_aux_cache_t *cache,
   return DB_SUCCESS;
 }
 
-bool vec_aux_cache_bind_tuple(const vec_index_aux_cache_t *cache,
+bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
                               uint64_t faiss_id, dict_index_t *clust_index,
                               dtuple_t *tuple) {
   if (cache == nullptr || clust_index == nullptr || tuple == nullptr ||
@@ -965,6 +1001,152 @@ bool vec_aux_cache_bind_tuple(const vec_index_aux_cache_t *cache,
     dfield_set_null(df);
   }
 
+  return true;
+}
+
+
+std::string vec_vid_pk_mapping_path(const std::string& index_path) {
+  if (index_path.empty()) {
+    return {};
+  }
+  std::string path = index_path;
+  path.append(".pkmap");
+  return path;
+}
+
+bool vec_vid_pk_mapping_save(const vid_pk_mapping_t& mapping,
+                             const std::string& path) {
+  if (!mapping.ready || path.empty()) {
+    return false;
+  }
+
+  if (mapping.key_length > UINT32_MAX) {
+    ib::warn() << "VECINDEX: pk mapping key length too large to persist: "
+               << mapping.key_length;
+    return false;
+  }
+
+  for (const auto& entry : mapping.pk_values) {
+    if (entry.size() > UINT32_MAX) {
+      ib::warn() << "VECINDEX: pk mapping entry too large to persist ("
+                 << entry.size() << " bytes)";
+      return false;
+    }
+  }
+
+  FILE* raw = std::fopen(path.c_str(), "wb");
+  if (raw == nullptr) {
+    ib::warn() << "VECINDEX: failed to open pk mapping file '" << path << "'";
+    return false;
+  }
+  std::unique_ptr<FILE, decltype(&std::fclose)> fp(raw, &std::fclose);
+
+  VidPkMappingHeader header{};
+  header.magic = VID_PK_MAPPING_MAGIC;
+  header.version = VID_PK_MAPPING_VERSION;
+  header.entry_count = static_cast<uint64_t>(mapping.pk_values.size());
+  header.key_length = static_cast<uint32_t>(mapping.key_length);
+
+  if (std::fwrite(&header, sizeof(header), 1, fp.get()) != 1) {
+    return false;
+  }
+
+  for (const auto& entry : mapping.pk_values) {
+    const uint32_t len = static_cast<uint32_t>(entry.size());
+    if (std::fwrite(&len, sizeof(len), 1, fp.get()) != 1) {
+      return false;
+    }
+    if (len > 0 &&
+        std::fwrite(entry.data(), 1, len, fp.get()) != len) {
+      return false;
+    }
+  }
+
+  if (!vec_pk_flush(fp.get())) {
+    ib::warn() << "VECINDEX: failed to flush pk mapping file '" << path << "'";
+    return false;
+  }
+
+  return true;
+}
+
+bool vec_vid_pk_mapping_load(const std::string& path,
+                             vid_pk_mapping_t* mapping) {
+  if (mapping == nullptr || path.empty()) {
+    return false;
+  }
+
+  mapping->clear();
+
+  FILE* raw = std::fopen(path.c_str(), "rb");
+  if (raw == nullptr) {
+    return false;
+  }
+  std::unique_ptr<FILE, decltype(&std::fclose)> fp(raw, &std::fclose);
+
+  VidPkMappingHeader header{};
+  if (std::fread(&header, sizeof(header), 1, fp.get()) != 1) {
+    return false;
+  }
+
+  if (header.magic != VID_PK_MAPPING_MAGIC ||
+      header.version != VID_PK_MAPPING_VERSION) {
+    ib::warn() << "VECINDEX: pk mapping header mismatch for '" << path << "'";
+    return false;
+  }
+
+  off_t file_size = 0;
+  const int fd = fileno(fp.get());
+  if (fd >= 0) {
+    struct stat st {};
+    if (fstat(fd, &st) == 0) {
+      file_size = st.st_size;
+    }
+  }
+
+  const uint64_t entry_count = header.entry_count;
+  if (entry_count >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    ib::warn() << "VECINDEX: pk mapping entry_count too large in '" << path
+               << "'";
+    return false;
+  }
+
+  const uint64_t header_bytes = sizeof(VidPkMappingHeader);
+  if (entry_count >
+      (std::numeric_limits<uint64_t>::max() - header_bytes) /
+          sizeof(uint32_t)) {
+    ib::warn() << "VECINDEX: pk mapping entry_count overflow in '" << path
+               << "'";
+    return false;
+  }
+
+  const uint64_t min_size = header_bytes + entry_count * sizeof(uint32_t);
+  if (file_size > 0 && static_cast<uint64_t>(file_size) < min_size) {
+    ib::warn() << "VECINDEX: pk mapping file truncated '" << path << "'";
+    return false;
+  }
+
+  mapping->key_length = static_cast<size_t>(header.key_length);
+  mapping->pk_values.resize(static_cast<size_t>(entry_count));
+
+  for (size_t i = 0; i < mapping->pk_values.size(); ++i) {
+    uint32_t len = 0;
+    if (std::fread(&len, sizeof(len), 1, fp.get()) != 1) {
+      mapping->clear();
+      return false;
+    }
+    if (len == 0) {
+      continue;
+    }
+    mapping->pk_values[i].resize(len);
+    if (std::fread(mapping->pk_values[i].data(), 1, len, fp.get()) != len) {
+      mapping->clear();
+      return false;
+    }
+  }
+
+  mapping->ready = true;
   return true;
 }
 

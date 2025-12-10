@@ -257,12 +257,13 @@ uint32_t vec_meta_checksum(const VecSegmentEntry& entry) {
 
 void vec_meta_fill_entry(VecSegmentEntry* entry, uint64_t seg_id,
                          uint64_t count, VecSegmentState state,
-                         const std::string& file_name) {
+                         const std::string& file_name, uint8_t flags) {
   if (entry == nullptr) return;
   std::memset(entry, 0, sizeof(*entry));
   entry->seg_id = seg_id;
   entry->count = count;
   entry->state = static_cast<uint8_t>(state);
+  entry->reserved[0] = flags;
 
   const std::string base = vec_meta_basename(file_name);
   if (!base.empty()) {
