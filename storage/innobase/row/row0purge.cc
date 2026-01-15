@@ -670,7 +670,8 @@ static inline void row_purge_remove_multi_sec_if_poss(purge_node_t *node,
       break;
     }
 
-    if (node->index->type != DICT_FTS) {
+    if (node->index->type != DICT_FTS &&
+        !(node->index->type & DICT_VECINDEX)) {
       if (node->index->is_multi_value()) {
         row_purge_remove_multi_sec_if_poss(node, heap, false);
       } else {
@@ -724,7 +725,9 @@ static void row_purge_upd_exist_or_extern_func(IF_DEBUG(const que_thr_t *thr, )
     que_thr_t *thr = nullptr;
 #endif
 
-    if (row_upd_changes_ord_field_binary(
+    if (node->index->type != DICT_FTS &&
+        !(node->index->type & DICT_VECINDEX) &&
+        row_upd_changes_ord_field_binary(
             node->index, node->update, thr, nullptr, nullptr,
             (node->index->is_multi_value() ? &non_mv_upd : nullptr))) {
       if (node->index->is_multi_value()) {
@@ -1268,7 +1271,7 @@ bool purge_node_t::validate_pcur() {
     return (true);
   }
 
-  if (index->type == DICT_FTS) {
+  if (index->type == DICT_FTS || (index->type & DICT_VECINDEX)) {
     return (true);
   }
 

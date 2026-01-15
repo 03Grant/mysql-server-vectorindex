@@ -1413,6 +1413,7 @@ bool dd_create_fts_common_table(const dict_table_t *parent_table,
 @param[in]      file_per_table  flag whether use file per table
 @return true on success, false on failure. */
 bool dd_drop_fts_table(const char *name, bool file_per_table);
+bool dd_drop_vec_table(const char *name, bool file_per_table);
 
 /** Rename dd table & tablespace files for fts aux table
 @param[in]      table           dict table

@@ -8,6 +8,7 @@
 
 #include "dict0mem.h"
 #include "dict0dd.h"
+#include "dict0dict.h"
 #include "ut0ut.h"
 #include "my_sys.h"
 #include "mysqld.h"         // reg_ext_length
@@ -165,6 +166,16 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
     idx->vec_runtime = new_ctx.release();
   }
 
+  //TODO avoid bootstrap_load_submit in ALTER TABLE
+  if (!idx->is_committed() && idx->vec_runtime != nullptr) {
+    // New index created by DDL; no persisted data to bootstrap in this run.
+    idx->vec_runtime->bootstrap_state.store(VecBootstrapState::READY,
+                                            std::memory_order_release);
+    idx->vec_runtime->bootstrap_load_submitted.store(
+        true, std::memory_order_release);
+    idx->vec_runtime->bootstrap_loaded.store(true, std::memory_order_release);
+  }
+
   // 3) TODO: there will be more than one index pointers in the context. Handle it!
 
   return DB_SUCCESS;
@@ -196,10 +207,27 @@ dberr_t vec_open_aux_table(dict_index_t *idx) {
     dict_table_t *aux_table =
         dd_table_open_on_name_in_mem(aux_name.c_str(), false);
     if (aux_table == nullptr) {
+      THD *thd = current_thd;
+      if (thd != nullptr) {
+        MDL_ticket *mdl = nullptr;
+        aux_table = dd_table_open_on_name(thd, &mdl, aux_name.c_str(), false,
+                                          DICT_ERR_IGNORE_NONE);
+        if (mdl != nullptr) {
+          dd_mdl_release(thd, &mdl);
+        }
+      }
+    }
+    if (aux_table == nullptr) {
+      aux_table = dict_table_open_on_name(aux_name.c_str(), false, false,
+                                          DICT_ERR_IGNORE_NONE);
+    }
+    if (aux_table == nullptr) {
       ib::warn() << "VECINDEX: auxiliary table '" << aux_name
                  << "' is not available in dictionary cache";
       return DB_FAIL;
     }
+    ib::warn() << "VECREF: open aux dict table '" << aux_name
+               << "' ref=" << aux_table->get_ref_count();
     mutable_seg->aux_dict_table = aux_table;
     mutable_seg->aux_table_name = aux_name;
   } else if (mutable_seg->aux_table_name.empty()) {
@@ -392,11 +420,15 @@ bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
 }
 
 bool vec_drop_index(vec_index_ctx_t& ctx, size_t seg_idx, bool allow_drop_mutable){
+  ib::warn() << "VECINDEX: vec_drop_index enter seg_idx=" << seg_idx
+             << " allow_drop_mutable=" << allow_drop_mutable;
   std::lock_guard<std::mutex> lk(ctx.mu);
   if (seg_idx >= ctx.segments.size()) return false;
   if (seg_idx == 0 && !allow_drop_mutable) return false;
 
   auto &seg = ctx.segments[seg_idx];
+  ib::warn() << "VECINDEX: vec_drop_index mid seg_idx=" << seg_idx
+             << " aux_table=" << seg.aux_table_name;
   if (seg.aux_dict_table != nullptr) {
     dd_table_close(seg.aux_dict_table, nullptr, nullptr, false);
     seg.aux_dict_table = nullptr;

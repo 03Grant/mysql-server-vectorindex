@@ -58,6 +58,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <math.h>
 #include <my_compare.h>
 #include <mysqld.h>
+#include <my_sys.h>
 #include <stdlib.h>
 #include <strfunc.h>
 #include <time.h>
@@ -84,6 +85,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <sql_show.h>
 #include <sql_tablespace.h>
 #include <sql_thd_internal_api.h>
+#include "mysqld_error.h"
 #include "api0api.h"
 #include "api0misc.h"
 #include "arch0arch.h"
@@ -2118,6 +2120,10 @@ int convert_error_code_to_mysql(dberr_t error, uint32_t flags, THD *thd) {
     case DB_CANT_CREATE_GEOMETRY_OBJECT:
       my_error(ER_CANT_CREATE_GEOMETRY_OBJECT, MYF(0));
       return (HA_ERR_NULL_IN_SPATIAL);
+
+    case DB_VECINDEX_NOT_READY:
+      my_error(ER_INTERNAL_ERROR, MYF(0), kVecIndexLoadingMsg);
+      return (HA_ERR_GENERIC);
 
     case DB_ERROR:
     default:
@@ -11493,6 +11499,18 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
 
   // ib::warn() << "Vector index found.";
   vec_index_ctx_t *ctx = index->vec_runtime;
+  const VecBootstrapState state =
+      ctx->bootstrap_state.load(std::memory_order_acquire);
+  if (state != VecBootstrapState::READY) {
+    if (state == VecBootstrapState::NOT_STARTED ||
+        state == VecBootstrapState::FAILED) {
+      vec_schedule_bootstrap_load(index);
+    }
+    my_error(ER_INTERNAL_ERROR, MYF(0), kVecIndexLoadingMsg);
+    // add a new error indicator if needed
+    ib::warn() << "Vector index is not ready. Current state: " << static_cast<int>(state);
+    return HA_ERR_WRONG_COMMAND;
+  }
   if (!ctx->inited) {
     ib::warn() << "Vector index is not initialized.";
     return HA_ERR_WRONG_COMMAND;

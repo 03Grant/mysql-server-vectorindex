@@ -9,11 +9,17 @@
 #include "ut0ut.h"          // ib::info, ib::warn
 #include "my_sys.h"         // DEBUG_SYNC_C
 #include "my_dbug.h"        // DBUG_EXECUTE_IF / DBUG_SUICIDE
+#include "data0type.h"      // dtype_t helpers
+#include "ha_innodb.h"      // thd_to_trx
+#include "my_bitmap.h"      // bitmap_set_all
 #include "vec_index_runtime.h"
+#include "vec_meta.h"
 #include "current_thd.h"    // current_thd
 #include "sql/sql_table.h"  // mysql_rename_table
+#include "sql/sql_base.h"   // tdc_remove_table
 #include "sql/mysqld.h"     // innodb_hton
 #include "sql/dd/cache/dictionary_client.h"  // Dictionary_client::Auto_releaser
+#include "sql/key.h"        // key_copy
 #include "sql/dd/dd_schema.h"  // Schema_MDL_locker
 #include "sql/dd/dictionary.h"  // acquire_exclusive_table_mdl
 #include "sql/sql_class.h"  // THD, dd_client()
@@ -24,6 +30,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cctype>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -34,11 +41,15 @@
 #include <algorithm>
 #include <cstdlib>  // strtoull
 #include <memory>
+#include <unordered_set>
+#include <fcntl.h>  // F_WRLCK / F_UNLCK
 #include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "fts0priv.h"         // fts_parse_sql / fts_eval_sql
+#include "fts0fts.h"          // aux_name_vec_t
+#include "os0file.h"
 #include "pars0pars.h"        // pars_info_* helpers
 #include "que0que.h"         // que_graph_free
 
@@ -116,13 +127,87 @@ bool vec_aux_extract_seg_id(const std::string& full_name,
 
 bool vec_aux_table_exists(const std::string& full_name) {
   if (full_name.empty()) return false;
-  dict_table_t *t = dict_table_open_on_name(full_name.c_str(), false, false,
-                                            DICT_ERR_IGNORE_NONE);
+  THD *thd = current_thd;
+  MDL_ticket *mdl = nullptr;
+  const bool dict_locked = dict_sys_mutex_own();
+  dict_table_t *t =
+      dd_table_open_on_name_in_mem(full_name.c_str(), dict_locked);
+  if (t == nullptr && thd != nullptr && !dict_locked) {
+    t = dd_table_open_on_name(thd, &mdl, full_name.c_str(), dict_locked,
+                              DICT_ERR_IGNORE_NONE);
+  }
+  if (t == nullptr) {
+    t = dict_table_open_on_name(full_name.c_str(), dict_locked, false,
+                                DICT_ERR_IGNORE_NONE);
+  }
   if (t != nullptr) {
-    dict_table_close(t, false, false);
+    dd_table_close(t, thd, &mdl, false);
     return true;
   }
   return false;
+}
+
+bool vec_is_aux_table_name(const char* name) {
+  if (name == nullptr) {
+    return false;
+  }
+
+  const char* slash = std::strchr(name, '/');
+  if (slash == nullptr || *(slash + 1) == '\0') {
+    return false;
+  }
+
+  const char* base = slash + 1;
+  constexpr const char* prefix = "I_VEC_";
+  constexpr size_t prefix_len = 6;
+
+  if (std::strncmp(base, prefix, prefix_len) != 0) {
+    return false;
+  }
+
+  const char* p = base + prefix_len;
+  if (!std::isdigit(static_cast<unsigned char>(*p))) {
+    return false;
+  }
+  while (std::isdigit(static_cast<unsigned char>(*p))) {
+    ++p;
+  }
+  if (*p != '_') {
+    return false;
+  }
+  ++p;
+  if (!std::isdigit(static_cast<unsigned char>(*p))) {
+    return false;
+  }
+  while (std::isdigit(static_cast<unsigned char>(*p))) {
+    ++p;
+  }
+
+  if (*p == '\0') {
+    return true;
+  }
+  if (std::strcmp(p, "_MEM") == 0 || std::strcmp(p, "_NEXT") == 0) {
+    return true;
+  }
+  if (std::strncmp(p, "_SEG_", 5) == 0) {
+    p += 5;
+    if (!std::isdigit(static_cast<unsigned char>(*p))) {
+      return false;
+    }
+    while (std::isdigit(static_cast<unsigned char>(*p))) {
+      ++p;
+    }
+    return *p == '\0';
+  }
+
+  return false;
+}
+
+bool vec_dict_table_is_aux(const dict_table_t* table) {
+  if (table == nullptr || table->name.m_name == nullptr) {
+    return false;
+  }
+  return vec_is_aux_table_name(table->name.m_name);
 }
 
 uint32_t vec_aux_scan_max_segment(const std::string& prefix,
@@ -280,6 +365,13 @@ static bool vec_aux_update_dd_after_rename(const std::string& old_name,
   // Ensure DD client registries are flushed so Auto_releaser destructor
   // sees no pending uncommitted objects in non-transactional DDL path.
   client->commit_modified_objects();
+
+  // Invalidate table definition cache entries for both names so SQL layer
+  // doesn't reuse stale TABLE_SHARE objects after internal rename.
+  tdc_remove_table(thd, TDC_RT_REMOVE_UNUSED, old_db.c_str(), old_tbl.c_str(),
+                   false);
+  tdc_remove_table(thd, TDC_RT_REMOVE_UNUSED, new_db.c_str(), new_tbl.c_str(),
+                   false);
 
   if (adjust_autocommit) {
     thd->variables.option_bits = saved_options;
@@ -487,6 +579,62 @@ static dberr_t vec_aux_bind_pk_values(
   }
 
   return DB_SUCCESS;
+}
+
+static bool vec_extract_pk_from_aux(TABLE* mysql_table,
+                                    dict_index_t* clust_index,
+                                    ulint pk_fields,
+                                    std::vector<vec_pk_column_t>& out) {
+  if (mysql_table == nullptr || clust_index == nullptr ||
+      mysql_table->s == nullptr || pk_fields == 0) {
+    return false;
+  }
+
+  out.clear();
+  out.resize(pk_fields);
+
+  for (ulint i = 0; i < pk_fields; ++i) {
+    if (i >= static_cast<ulint>(mysql_table->s->fields)) {
+      return false;
+    }
+    Field* f = mysql_table->field[i];
+    if (f == nullptr) {
+      return false;
+    }
+
+    vec_pk_column_t col{};
+    col.is_null = f->is_null();
+
+    dict_field_t* df = clust_index->get_field(i);
+    if (df != nullptr && df->col != nullptr) {
+      col.mtype = df->col->mtype;
+      col.prtype = df->col->prtype;
+    }
+
+    if (!col.is_null) {
+      const uchar* ptr = f->data_ptr();
+      const uint len = f->data_length();
+      if (ptr == nullptr && len != 0) {
+        return false;
+      }
+
+      dtype_t dtype;
+      dtype_set(&dtype, col.mtype, col.prtype, df->col->len);
+      dfield_t dfield;
+      dfield_set_type(&dfield, &dtype);
+      std::vector<byte> tmp(df->col->len + 16);
+      byte* end = row_mysql_store_col_in_innobase_format(
+          &dfield, tmp.data(), true, ptr, df->col->len,
+          dict_table_is_comp(clust_index->table));
+      const ulint stored_len =
+          static_cast<ulint>(end - static_cast<byte*>(tmp.data()));
+      col.data.assign(tmp.data(), tmp.data() + stored_len);
+    }
+
+    out[i] = std::move(col);
+  }
+
+  return true;
 }
 
 dberr_t vec_aux_insert_one(
@@ -702,6 +850,658 @@ dberr_t vec_aux_update_pk_vid(trx_t* trx,
 
   que_graph_free(graph);
   return DB_SUCCESS;
+}
+
+/** Write PK columns directly into mysql_table->record[0]. */
+static bool vec_apply_pk_columns_to_record(
+    const std::vector<vec_pk_column_t>& pk_columns,
+    dict_index_t* clust_index, ulint pk_fields, const KEY* pk_info,
+    TABLE* mysql_table) {
+  if (pk_columns.empty() || mysql_table == nullptr || clust_index == nullptr ||
+      pk_info == nullptr || mysql_table->record[0] == nullptr ||
+      pk_fields == 0) {
+    ib::warn() << "vec_apply_pk_columns_to_record: invalid input"
+               << " cols=" << pk_columns.size()
+               << " pk_fields=" << pk_fields
+               << " table=" << (mysql_table ? mysql_table->s->table_name.str
+                                            : "<null>");
+    return false;
+  }
+
+  if (pk_fields != pk_info->user_defined_key_parts) {
+    ib::warn() << "vec_apply_pk_columns_to_record: pk_fields mismatch"
+               << " cols=" << pk_fields
+               << " aux_pk_parts=" << pk_info->user_defined_key_parts;
+    return false;
+  }
+
+  if (pk_columns.size() < pk_fields) {
+    ib::warn() << "vec_apply_pk_columns_to_record: pk_columns insufficient"
+               << " cols=" << pk_columns.size()
+               << " expected=" << pk_fields;
+    return false;
+  }
+
+  ib::warn() << "vec_apply_pk_columns_to_record: PK snapshot "
+             << vec_format_pk_columns_debug(pk_columns, pk_fields, 24);
+  ib::warn() << "vec_apply_pk_columns_to_record: columns -> record conversion";
+
+  const bool use_row_id = is_gen_clust_name(clust_index);
+
+  for (ulint i = 0; i < pk_fields; ++i) {
+    Field* f = pk_info->key_part[i].field;
+    if (f == nullptr) {
+      ib::warn() << "vec_apply_pk_columns_to_record: missing field"
+                 << " i=" << i
+                 << " field_null=true";
+      return false;
+    }
+
+    if (i >= pk_columns.size()) {
+      ib::warn() << "vec_apply_pk_columns_to_record: pk_columns out of range"
+                 << " i=" << i
+                 << " pk_columns_sz=" << pk_columns.size();
+      return false;
+    }
+
+    const vec_pk_column_t& col = pk_columns[i];
+
+    if (col.is_null) {
+      if (!f->is_nullable()) {
+        ib::warn() << "vec_apply_pk_columns_to_record: NULL for non-nullable col"
+                   << " i=" << i
+                   << " colname=" << (f->field_name ? f->field_name : "?");
+        return false;
+      }
+      f->set_null();
+      continue;
+    }
+
+    f->set_notnull();
+
+    if (use_row_id) {
+      if (col.data.size() != DATA_ROW_ID_LEN) {
+        ib::warn() << "vec_apply_pk_columns_to_record: row_id length mismatch"
+                   << " got=" << col.data.size()
+                   << " expect=" << DATA_ROW_ID_LEN;
+        return false;
+      }
+      const uint64_t row_id =
+          rowid6_to_u64(reinterpret_cast<const byte*>(col.data.data()));
+      if (f->store(static_cast<ulonglong>(row_id), true) != 0) {
+        ib::warn() << "vec_apply_pk_columns_to_record: store row_id failed"
+                   << " row_id=" << row_id;
+        return false;
+      }
+      continue;
+    }
+
+    dict_field_t* df = clust_index->get_field(i);
+    if (df == nullptr || df->col == nullptr) {
+      ib::warn() << "vec_apply_pk_columns_to_record: missing dict field"
+                 << " i=" << i
+                 << " df_null=" << (df == nullptr);
+      return false;
+    }
+
+    const bool is_unsigned = (df->col->prtype & DATA_UNSIGNED) != 0 ||
+                             f->is_unsigned();
+
+    switch (df->col->mtype) {
+      case DATA_INT: {
+        const size_t len = col.data.size();
+        if (len == 0 || len > sizeof(uint64_t)) {
+          ib::warn() << "vec_apply_pk_columns_to_record: DATA_INT bad length"
+                     << " len=" << len;
+          return false;
+        }
+
+        uint64_t v = 0;
+        for (size_t j = 0; j < len; ++j) {
+          unsigned char b = col.data[j];
+          if (!is_unsigned && j == 0) {
+            b ^= 0x80;
+          }
+          v = (v << 8) | static_cast<uint64_t>(b);
+        }
+
+        if (is_unsigned) {
+          if (f->store(static_cast<ulonglong>(v), true) != 0) {
+            ib::warn() << "vec_apply_pk_columns_to_record: store unsigned int failed"
+                       << " v=" << v
+                       << " len=" << len;
+            return false;
+          }
+        } else {
+          const unsigned shift =
+              static_cast<unsigned>((sizeof(uint64_t) - len) * 8);
+          const int64_t signed_v =
+              static_cast<int64_t>((static_cast<int64_t>(v << shift)) >> shift);
+          if (f->store(static_cast<longlong>(signed_v), false) != 0) {
+            ib::warn() << "vec_apply_pk_columns_to_record: store signed int failed"
+                       << " v=" << signed_v
+                       << " len=" << len;
+            return false;
+          }
+        }
+        break;
+      }
+      case DATA_VARCHAR:
+      case DATA_VARMYSQL:
+      case DATA_CHAR:
+      case DATA_BINARY:
+      case DATA_FIXBINARY: {
+        const CHARSET_INFO* cs = f->charset();
+        if (f->store(reinterpret_cast<const char*>(col.data.data()),
+                     static_cast<uint>(col.data.size()),
+                     cs != nullptr ? cs : &my_charset_bin) != 0) {
+          ib::warn() << "vec_apply_pk_columns_to_record: store string/binary failed"
+                     << " len=" << col.data.size()
+                     << " colname=" << (f->field_name ? f->field_name : "?");
+          return false;
+        }
+        break;
+      }
+      default:
+        ib::warn() << "vec_apply_pk_columns_to_record: unsupported mtype"
+                   << " i=" << i
+                   << " mtype=" << df->col->mtype;
+        return false;
+    }
+  }
+
+  return true;
+}
+
+dberr_t vec_aux_handler_update(trx_t* trx,
+                               const std::string& table_name,
+                               dict_index_t* clust_index,
+                               ulint pk_fields,
+                               const std::vector<vec_pk_column_t>& old_pk_columns,
+                               const std::vector<vec_pk_column_t>& new_pk_columns,
+                               uint64_t* out_vid) {
+  ib::warn() << "vec_aux_handler_update called.";
+  if (table_name.empty() || clust_index == nullptr || pk_fields == 0 ||
+      old_pk_columns.size() < pk_fields || new_pk_columns.size() < pk_fields) {
+    ib::warn() << "vec_aux_handler_update: invalid input parameters"
+               << " old_pk_columns=" << old_pk_columns.size()
+               << " new_pk_columns=" << new_pk_columns.size()
+               << " pk_fields=" << pk_fields;
+    return DB_RECORD_NOT_FOUND;
+  }
+
+  THD* thd = (trx != nullptr && trx->mysql_thd != nullptr)
+                 ? trx->mysql_thd
+                 : current_thd;
+  if (thd == nullptr) {
+    ib::warn() << "vec_aux_handler_update: no THD available";
+    return DB_ERROR;
+  }
+
+  const auto slash = table_name.find('/');
+  if (slash == std::string::npos || slash == 0 ||
+      slash + 1 >= table_name.size()) {
+    ib::warn() << "vec_aux_handler_update: invalid table name format";
+    return DB_RECORD_NOT_FOUND;
+  }
+  const std::string db = table_name.substr(0, slash);
+  const std::string tbl = table_name.substr(slash + 1);
+
+  if (trx != nullptr && thd_to_trx(thd) != trx) {
+    ib::warn() << "vec_aux_handler_update: aligning THD trx with caller trx";
+    thd_to_trx(thd) = trx;
+  }
+
+  ib::warn() << "vec_aux_handler_update: acquiring MDL lock for table ";
+  MDL_request mdl_request;
+  MDL_REQUEST_INIT(&mdl_request, MDL_key::TABLE, db.c_str(), tbl.c_str(),
+                   MDL_SHARED_WRITE, MDL_EXPLICIT);
+  if (thd->mdl_context.acquire_lock(&mdl_request,
+                                    thd->variables.lock_wait_timeout)) {
+    ib::warn() << "vec_aux_handler_update: MDL lock acquire failed";
+    return DB_LOCK_WAIT_TIMEOUT;
+  }
+
+  struct MdlGuard {
+    THD* thd{nullptr};
+    MDL_request* req{nullptr};
+    ~MdlGuard() {
+      if (thd != nullptr && req != nullptr && req->ticket != nullptr) {
+        thd->mdl_context.release_lock(req->ticket);
+        req->ticket = nullptr;
+      }
+    }
+  } mdl_guard{thd, &mdl_request};
+
+  dd::cache::Dictionary_client* client = dd::get_dd_client(thd);
+  dd::cache::Dictionary_client::Auto_releaser releaser(client);
+  const dd::Table* dd_table_obj = nullptr;
+  if (client->acquire<dd::Table>(db.c_str(), tbl.c_str(), &dd_table_obj) ||
+      dd_table_obj == nullptr) {
+    ib::warn() << "vec_aux_handler_update: failed to acquire DD table object";
+    return DB_ERROR;
+  }
+
+  ib::warn() << "vec_aux_handler_update: opening table for read";
+  char path[FN_REFLEN + 1]{};
+  bool truncated = false;
+  size_t path_len = build_table_filename(
+      path, sizeof(path) - 1 - reg_ext_length, db.c_str(), tbl.c_str(), "", 0,
+      &truncated);
+  if (path_len == 0 || truncated) {
+    return DB_ERROR;
+  }
+  ib::warn() << "vec_aux_handler_update: opening table uncached";
+
+  TABLE* mysql_table = open_table_uncached(
+      thd, path, db.c_str(), tbl.c_str(), false, true, *dd_table_obj);
+  if (mysql_table == nullptr || mysql_table->file == nullptr) {
+    return DB_RECORD_NOT_FOUND;
+  }
+
+  struct TableGuard {
+    TABLE* t{nullptr};
+    ~TableGuard() {
+      if (t != nullptr) {
+        intern_close_table(t);
+        t = nullptr;
+      }
+    }
+  } table_guard{mysql_table};
+
+  handler* h = mysql_table->file;
+  if (mysql_table->read_set != nullptr) {
+    bitmap_set_all(mysql_table->read_set);
+  }
+  if (mysql_table->write_set != nullptr) {
+    bitmap_set_all(mysql_table->write_set);
+  }
+
+  if (h != nullptr) {
+    ha_innobase* innodb = dynamic_cast<ha_innobase*>(h);
+    if (innodb != nullptr) {
+      innodb->init_table_handle_for_HANDLER();
+    }
+  }
+
+  trx_t* stmt_trx = thd_to_trx(thd);
+  if (stmt_trx == nullptr && trx != nullptr) {
+    thd_to_trx(thd) = trx;
+    stmt_trx = trx;
+  }
+  if (stmt_trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  ib::warn() << "vec_aux_handler_update: starting transaction if not started";
+  trx_start_if_not_started(stmt_trx, true, UT_LOCATION_HERE);
+  struct TrxDepthGuard {
+    trx_t* trx{nullptr};
+    bool entered{false};
+    ~TrxDepthGuard() {
+      if (entered && trx != nullptr) {
+        TrxInInnoDB::end_stmt(trx);
+      }
+    }
+  } depth_guard{stmt_trx, false};
+  TrxInInnoDB::begin_stmt(stmt_trx);
+  depth_guard.entered = true;
+
+  auto map_handler_err = [](int rc) -> dberr_t {
+    switch (rc) {
+      case 0:
+      case HA_ERR_RECORD_IS_THE_SAME:
+        return DB_SUCCESS;
+      case HA_ERR_LOCK_WAIT_TIMEOUT:
+        return DB_LOCK_WAIT_TIMEOUT;
+      case HA_ERR_LOCK_DEADLOCK:
+        return DB_DEADLOCK;
+      case HA_ERR_KEY_NOT_FOUND:
+      case HA_ERR_END_OF_FILE:
+        return DB_RECORD_NOT_FOUND;
+      default:
+        return DB_ERROR;
+    }
+  };
+
+  if (mysql_table->s != nullptr && mysql_table->s->rec_buff_length > 0) {
+    std::memset(mysql_table->record[0], 0, mysql_table->s->rec_buff_length);
+  }
+
+  /* Acquire engine-level table lock so InnoDB sees LOCK_IX. */
+  bool locked = false;
+  auto unlock_if_needed = [&](handler *handler_ptr) {
+    if (locked && handler_ptr != nullptr) {
+      handler_ptr->ha_external_lock(thd, F_UNLCK);
+      locked = false;
+    }
+  };
+  int lock_rc = h->ha_external_lock(thd, F_WRLCK);
+  dberr_t lock_err = map_handler_err(lock_rc);
+  if (lock_err != DB_SUCCESS) {
+    unlock_if_needed(h);
+    return lock_err;
+  }
+  locked = true;
+
+  struct LockGuard {
+    handler *h;
+    THD *thd;
+    bool &locked_ref;
+    ~LockGuard() {
+      if (locked_ref && h != nullptr) {
+        h->ha_external_lock(thd, F_UNLCK);
+        locked_ref = false;
+      }
+    }
+  } lock_guard{h, thd, locked};
+
+  if (mysql_table->s->primary_key == MAX_KEY) {
+    ib::warn() << "vec_aux_handler_update: no primary key on aux table";
+    return DB_ERROR;
+  }
+
+  KEY* pk_info = mysql_table->key_info + mysql_table->s->primary_key;
+
+  if (pk_fields != static_cast<ulint>(pk_info->user_defined_key_parts)) {
+    ib::warn() << "vec_aux_handler_update: pk_fields=" << pk_fields
+               << " aux_pk_parts=" << pk_info->user_defined_key_parts;
+    return DB_SCHEMA_MISMATCH;
+  }
+
+  ib::warn() << "vec_aux_handler_update: old pk columns -> record buffer";
+  if (!vec_apply_pk_columns_to_record(old_pk_columns, clust_index, pk_fields,
+                                      pk_info, mysql_table)) {
+    ib::warn()
+        << "vec_aux_handler_update: failed to apply old pk_columns to record";
+    return DB_SCHEMA_MISMATCH;
+  }
+
+  std::vector<uchar> key_buf(static_cast<size_t>(pk_info->key_length));
+  key_copy(key_buf.data(), mysql_table->record[0], pk_info, 0);
+
+  int rc = h->ha_index_read_idx_map(
+      mysql_table->record[0], mysql_table->s->primary_key, key_buf.data(),
+      make_prev_keypart_map(pk_info->user_defined_key_parts),
+      HA_READ_KEY_EXACT);
+  dberr_t err = map_handler_err(rc);
+  if (err != DB_SUCCESS) {
+    ib::warn() << "vec_aux_handler_update: index_read_idx_map failed rc="
+               << rc;
+    return err;
+  }
+
+  Field* faiss_field =
+      (pk_fields < static_cast<ulint>(mysql_table->s->fields))
+          ? mysql_table->field[pk_fields]
+          : nullptr;
+  if (faiss_field == nullptr || faiss_field->is_null()) {
+    return DB_RECORD_NOT_FOUND;
+  }
+
+  const uint64_t vid =
+      static_cast<uint64_t>(static_cast<ulonglong>(faiss_field->val_int()));
+
+  if (mysql_table->record[1] == nullptr ||
+      mysql_table->s == nullptr) {
+    ib::warn() << "vec_aux_handler_update: missing record[1] buffer";
+    return DB_ERROR;
+  }
+
+  std::memcpy(mysql_table->record[1], mysql_table->record[0],
+              mysql_table->s->rec_buff_length);
+
+  ib::warn() << "vec_aux_handler_update: new pk columns -> record buffer";
+  if (!vec_apply_pk_columns_to_record(new_pk_columns, clust_index, pk_fields,
+                                      pk_info, mysql_table)) {
+    ib::warn()
+        << "vec_aux_handler_update: failed to apply new pk_columns to record";
+    return DB_SCHEMA_MISMATCH;
+  }
+
+  rc = h->ha_update_row(mysql_table->record[1], mysql_table->record[0]);
+  err = map_handler_err(rc);
+  if (err == DB_SUCCESS && out_vid != nullptr) {
+    *out_vid = vid;
+  }
+
+  return err;
+}
+
+dberr_t vec_aux_handler_delete(trx_t* trx,
+                               const std::string& table_name,
+                               dict_index_t* clust_index,
+                               ulint pk_fields,
+                               const std::vector<vec_pk_column_t>& pk_columns,
+                               uint64_t* out_vid) {
+
+  ib::warn() << "vec_aux_handler_delete called.";
+  if (table_name.empty() || clust_index == nullptr || pk_fields == 0 ||
+      pk_columns.empty()) {
+    ib::warn() << "vec_aux_handler_delete: invalid input parameters"
+               << " pk_columns=" << pk_columns.size()
+               << " dump=" << vec_format_pk_columns_debug(pk_columns, pk_fields);
+    return DB_RECORD_NOT_FOUND;
+  }
+
+  THD* thd = (trx != nullptr && trx->mysql_thd != nullptr)
+                 ? trx->mysql_thd
+                 : current_thd;
+  if (thd == nullptr) {
+    ib::warn() << "vec_aux_handler_delete: no THD available";
+    return DB_ERROR;
+  }
+
+  const auto slash = table_name.find('/');
+  if (slash == std::string::npos || slash == 0 || slash + 1 >= table_name.size()) {
+    ib::warn() << "vec_aux_handler_delete: invalid table name format";
+    return DB_RECORD_NOT_FOUND;
+  }
+  const std::string db = table_name.substr(0, slash);
+  const std::string tbl = table_name.substr(slash + 1);
+
+  if (trx != nullptr && thd_to_trx(thd) != trx) {
+    ib::warn() << "vec_aux_handler_delete: aligning THD trx with caller trx";
+    thd_to_trx(thd) = trx;
+  }
+
+  ib::warn() << "vec_aux_handler_delete: acquiring MDL lock for table ";
+  MDL_request mdl_request;
+  MDL_REQUEST_INIT(&mdl_request, MDL_key::TABLE, db.c_str(), tbl.c_str(),
+                   MDL_SHARED_WRITE, MDL_EXPLICIT);
+  if (thd->mdl_context.acquire_lock(&mdl_request,
+                                    thd->variables.lock_wait_timeout)) {
+    ib::warn() << "vec_aux_handler_delete: MDL lock acquire failed";                                  
+    return DB_LOCK_WAIT_TIMEOUT;
+  }
+
+  struct MdlGuard {
+    THD* thd{nullptr};
+    MDL_request* req{nullptr};
+    ~MdlGuard() {
+      if (thd != nullptr && req != nullptr && req->ticket != nullptr) {
+        thd->mdl_context.release_lock(req->ticket);
+        req->ticket = nullptr;
+      }
+    }
+  } mdl_guard{thd, &mdl_request};
+
+  dd::cache::Dictionary_client* client = dd::get_dd_client(thd);
+  dd::cache::Dictionary_client::Auto_releaser releaser(client);
+  const dd::Table* dd_table_obj = nullptr;
+  if (client->acquire<dd::Table>(db.c_str(), tbl.c_str(), &dd_table_obj) ||
+      dd_table_obj == nullptr) {
+    ib::warn() << "vec_aux_handler_delete: failed to acquire DD table object";
+    return DB_ERROR;
+  }
+
+  ib::warn() << "vec_aux_handler_delete: opening table for read";
+  char path[FN_REFLEN + 1]{};
+  bool truncated = false;
+  size_t path_len = build_table_filename(
+      path, sizeof(path) - 1 - reg_ext_length, db.c_str(), tbl.c_str(), "", 0,
+      &truncated);
+  if (path_len == 0 || truncated) {
+    return DB_ERROR;
+  }
+  ib::warn() << "vec_aux_handler_delete: opening table uncached";
+
+  TABLE* mysql_table = open_table_uncached(
+      thd, path, db.c_str(), tbl.c_str(), false, true, *dd_table_obj);
+  if (mysql_table == nullptr || mysql_table->file == nullptr) {
+    return DB_RECORD_NOT_FOUND;
+  }
+
+  struct TableGuard {
+    TABLE* t{nullptr};
+    ~TableGuard() {
+      if (t != nullptr) {
+        intern_close_table(t);
+        t = nullptr;
+      }
+    }
+  } table_guard{mysql_table};
+
+  handler* h = mysql_table->file;
+  if (mysql_table->read_set != nullptr) {
+    bitmap_set_all(mysql_table->read_set);
+  }
+  if (mysql_table->write_set != nullptr) {
+    bitmap_set_all(mysql_table->write_set);
+  }
+
+  if (h != nullptr) {
+    ha_innobase* innodb = dynamic_cast<ha_innobase*>(h);
+    if (innodb != nullptr) {
+      innodb->init_table_handle_for_HANDLER();
+    }
+  }
+
+  trx_t* stmt_trx = thd_to_trx(thd);
+  if (stmt_trx == nullptr && trx != nullptr) {
+    thd_to_trx(thd) = trx;
+    stmt_trx = trx;
+  }
+  if (stmt_trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  ib::warn() << "vec_aux_handler_delete: starting transaction if not started";
+  trx_start_if_not_started(stmt_trx, true, UT_LOCATION_HERE);
+  struct TrxDepthGuard {
+    trx_t* trx{nullptr};
+    bool entered{false};
+    ~TrxDepthGuard() {
+      if (entered && trx != nullptr) {
+        TrxInInnoDB::end_stmt(trx);
+      }
+    }
+  } depth_guard{stmt_trx, false};
+  TrxInInnoDB::begin_stmt(stmt_trx);
+  depth_guard.entered = true;
+
+  auto map_handler_err = [](int rc) -> dberr_t {
+    switch (rc) {
+      case 0:
+        return DB_SUCCESS;
+      case HA_ERR_LOCK_WAIT_TIMEOUT:
+        return DB_LOCK_WAIT_TIMEOUT;
+      case HA_ERR_LOCK_DEADLOCK:
+        return DB_DEADLOCK;
+      case HA_ERR_KEY_NOT_FOUND:
+      case HA_ERR_END_OF_FILE:
+        return DB_RECORD_NOT_FOUND;
+      default:
+        return DB_ERROR;
+    }
+  };
+
+  if (mysql_table->s != nullptr && mysql_table->s->rec_buff_length > 0) {
+    std::memset(mysql_table->record[0], 0, mysql_table->s->rec_buff_length);
+  }
+
+  /* Acquire engine-level table lock so InnoDB sees LOCK_IX. */
+  bool locked = false;
+  auto unlock_if_needed = [&](handler *handler_ptr) {
+    if (locked && handler_ptr != nullptr) {
+      handler_ptr->ha_external_lock(thd, F_UNLCK);
+      locked = false;
+    }
+  };
+  int lock_rc = h->ha_external_lock(thd, F_WRLCK);
+  dberr_t lock_err = map_handler_err(lock_rc);
+  if (lock_err != DB_SUCCESS) {
+    unlock_if_needed(h);
+    return lock_err;
+  }
+  locked = true;
+
+  struct LockGuard {
+    handler *h;
+    THD *thd;
+    bool &locked_ref;
+    ~LockGuard() {
+      if (locked_ref && h != nullptr) {
+        h->ha_external_lock(thd, F_UNLCK);
+        locked_ref = false;
+      }
+    }
+  } lock_guard{h, thd, locked};
+
+  if (mysql_table->s->primary_key == MAX_KEY) {
+    ib::warn() << "vec_aux_handler_delete: no primary key on aux table";
+    return DB_ERROR;
+  }
+
+  KEY* pk_info = mysql_table->key_info + mysql_table->s->primary_key;
+
+  /* Make sure the provided PK columns match the aux table PK layout. */
+  if (pk_fields != static_cast<ulint>(pk_info->user_defined_key_parts)) {
+    ib::warn() << "vec_aux_handler_delete: pk_fields=" << pk_fields
+               << " aux_pk_parts=" << pk_info->user_defined_key_parts
+               << " dump=" << vec_format_pk_columns_debug(pk_columns, pk_fields);
+    return DB_SCHEMA_MISMATCH;
+  }
+
+  ib::warn() << "vec_aux_handler_delete: pk columns -> record buffer";
+  if (!vec_apply_pk_columns_to_record(pk_columns, clust_index, pk_fields,
+                                      pk_info, mysql_table)) {
+    ib::warn() << "vec_aux_handler_delete: failed to apply pk_columns to record";
+    return DB_SCHEMA_MISMATCH;
+  }
+
+  std::vector<uchar> key_buf(static_cast<size_t>(pk_info->key_length));
+  key_copy(key_buf.data(), mysql_table->record[0], pk_info, 0);
+
+  int rc = h->ha_index_read_idx_map(
+      mysql_table->record[0], mysql_table->s->primary_key, key_buf.data(),
+      make_prev_keypart_map(pk_info->user_defined_key_parts),
+      HA_READ_KEY_EXACT);
+  dberr_t err = map_handler_err(rc);
+  if (err != DB_SUCCESS) {
+    ib::warn() << "vec_aux_handler_delete: index_read_idx_map failed rc="
+               << rc;
+    return err;
+  }
+
+  Field* faiss_field =
+      (pk_fields < static_cast<ulint>(mysql_table->s->fields))
+          ? mysql_table->field[pk_fields]
+          : nullptr;
+  if (faiss_field == nullptr || faiss_field->is_null()) {
+    return DB_RECORD_NOT_FOUND;
+  }
+
+  const uint64_t vid =
+      static_cast<uint64_t>(static_cast<ulonglong>(faiss_field->val_int()));
+
+  rc = h->ha_delete_row(mysql_table->record[0]);
+  err = map_handler_err(rc);
+  if (err == DB_SUCCESS && out_vid != nullptr) {
+    *out_vid = vid;
+  }
+
+  return err;
 }
 
 /** Extract only the required flags from table->flags2 for VEC aux
@@ -935,6 +1735,17 @@ dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
   }
   cache->pk_values[target] = std::move(packed);
 
+#if 0
+  // mem_diff remap disabled while MEM recovery assigns contiguous faiss_id.
+  if (cache->is_mem_diff) {
+    if (target >= cache->mem_diff.size()) {
+      cache->mem_diff.resize(target + 1, -1);
+    }
+    cache->mem_diff[target] =
+        static_cast<int64_t>(faiss_id) - static_cast<int64_t>(target);
+  }
+#endif
+
   cache->ready = true;
   return DB_SUCCESS;
 }
@@ -952,7 +1763,29 @@ bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
     return false;
   }
 
-  const size_t idx = static_cast<size_t>(faiss_id);
+  size_t idx = static_cast<size_t>(faiss_id);
+#if 0
+  // mem_diff remap disabled while MEM recovery assigns contiguous faiss_id.
+  if (cache->is_mem_diff) {
+    if (faiss_id >
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      return false;
+    }
+    if (idx >= cache->mem_diff.size()) {
+      ib::warn() << "VECINDEX: vec_aux_cache_bind_tuple faiss_id out of mem_diff bounds: " << faiss_id;
+      return false;
+    }
+    const int64_t diff = cache->mem_diff[idx];
+    if (diff < 0) {
+      return false;
+    }
+    const int64_t idx64 = static_cast<int64_t>(faiss_id) - diff;
+    if (idx64 < 0) {
+      return false;
+    }
+    idx = static_cast<size_t>(idx64);
+  }
+#endif
   if (idx >= cache->pk_values.size()) {
     return false;
   }
@@ -1148,6 +1981,398 @@ bool vec_vid_pk_mapping_load(const std::string& path,
 
   mapping->ready = true;
   return true;
+}
+
+static std::string vec_aux_next_name(const std::string& prefix) {
+  std::string name = prefix;
+  name.append("_NEXT");
+  return name;
+}
+
+static void vec_append_unique(std::vector<std::string>* out,
+                              const std::string& value) {
+  if (out == nullptr || value.empty()) {
+    return;
+  }
+  if (std::find(out->begin(), out->end(), value) != out->end()) {
+    return;
+  }
+  out->push_back(value);
+}
+
+bool vec_collect_drop_resources(dict_table_t* table,
+                                vec_aux_drop_resources_t* out) {
+  if (table == nullptr || out == nullptr) {
+    return false;
+  }
+
+  out->clear();
+
+  if (!dict_table_has_vec_index(table)) {
+    return true;
+  }
+
+  for (dict_index_t* index = table->first_index(); index != nullptr;
+       index = index->next()) {
+    if (!dict_index_is_vector(index)) {
+      continue;
+    }
+
+    vec_aux_drop_index_info info{};
+    info.table_id = static_cast<uint64_t>(table->id);
+    info.index_id = static_cast<uint64_t>(index->id);
+    if (index->name != nullptr) {
+      info.index_name = index->name;
+    }
+
+    info.prefix = vec_aux_prefix(index);
+    if (!info.prefix.empty()) {
+      info.mem_name = vec_aux_mem_name(info.prefix);
+      info.next_name = vec_aux_next_name(info.prefix);
+    }else{
+      ib::warn() << "VECINDEX: vec_collect_drop_resources: empty aux prefix for index "
+                 << (index->name ? index->name : "(null)") << " on table "
+                 << (table->name.m_name ? table->name.m_name : "(null)");
+      return false;
+    }
+
+    std::string meta_path;
+    if (vec_meta_path_for_index(index, &meta_path)) {
+      info.meta_path = meta_path;
+    }
+
+    if (!info.meta_path.empty()) {
+      VecMetaHeader header{};
+      std::vector<VecSegmentEntry> entries;
+      if (vec_meta_read_all(info.meta_path, &header, &entries)) {
+        const std::string base_dir = vec_meta_dirname(info.meta_path);
+        for (const auto& entry : entries) {
+          if (!info.prefix.empty() && entry.seg_id > 0) {
+            std::string seg_name = vec_aux_segment_name(
+                info.prefix, static_cast<uint32_t>(entry.seg_id));
+            vec_append_unique(&info.seg_names, seg_name);
+          }
+          if (entry.file_name[0] != '\0') {
+            std::string seg_path = vec_meta_join(base_dir, entry.file_name);
+            vec_append_unique(&info.segment_files, seg_path);
+            std::string pkmap_path = vec_vid_pk_mapping_path(seg_path);
+            vec_append_unique(&info.pkmap_files, pkmap_path);
+          }
+        }
+      }
+    }else{
+      ib::warn() << "VECINDEX: vec_collect_drop_resources: failed to read meta for index "
+                 << (index->name ? index->name : "(null)") << " on table "
+                 << (table->name.m_name ? table->name.m_name : "(null)");
+    }
+
+    if ((info.seg_names.empty() || info.segment_files.empty()) &&
+        index->vec_runtime != nullptr) {
+      vec_index_ctx_t* ctx = index->vec_runtime;
+      std::lock_guard<std::mutex> lk(ctx->mu);
+      for (const auto& seg : ctx->segments) {
+        if (!seg.immutable || seg.vecindex_id == 0) {
+          continue;
+        }
+        std::string seg_name = seg.aux_table_name;
+        if (seg_name.empty() && !info.prefix.empty()) {
+          seg_name = vec_aux_segment_name(info.prefix, seg.vecindex_id);
+        }
+        vec_append_unique(&info.seg_names, seg_name);
+        if (!seg.index_file_name.empty()) {
+          vec_append_unique(&info.segment_files, seg.index_file_name);
+          std::string pkmap_path =
+              vec_vid_pk_mapping_path(seg.index_file_name);
+          vec_append_unique(&info.pkmap_files, pkmap_path);
+        }
+      }
+    }
+
+    if (info.seg_names.empty() && !info.prefix.empty()) {
+      const uint32_t max_id = vec_aux_scan_max_segment(info.prefix);
+      for (uint32_t seg_id = 1; seg_id <= max_id; ++seg_id) {
+        std::string seg_name = vec_aux_segment_name(info.prefix, seg_id);
+        if (vec_aux_table_exists(seg_name)) {
+          vec_append_unique(&info.seg_names, seg_name);
+        }
+      }
+    }
+
+    out->indexes.push_back(std::move(info));
+  }
+
+  return true;
+}
+
+dberr_t vec_lock_all_aux_tables(THD* thd,
+                                const vec_aux_drop_resources_t* resources) {
+  if (thd == nullptr || resources == nullptr) {
+    return DB_ERROR;
+  }
+
+  std::unordered_set<std::string> names;
+  for (const auto& info : resources->indexes) {
+    if (!info.mem_name.empty()) {
+      names.insert(info.mem_name);
+    }
+    if (!info.next_name.empty()) {
+      names.insert(info.next_name);
+    }
+    for (const auto& seg_name : info.seg_names) {
+      if (!seg_name.empty()) {
+        names.insert(seg_name);
+      }
+    }
+  }
+
+  for (const auto& full_name : names) {
+    if (full_name.empty() || !vec_is_aux_table_name(full_name.c_str())) {
+      continue;
+    }
+    std::string db_name;
+    std::string table_name;
+    dict_name::get_table(full_name.c_str(), db_name, table_name);
+    if (db_name.empty() || table_name.empty()) {
+      return DB_ERROR;
+    }
+
+    MDL_ticket* mdl_ticket = nullptr;
+    if (dd::acquire_exclusive_table_mdl(thd, db_name.c_str(),
+                                        table_name.c_str(), false,
+                                        &mdl_ticket)) {
+      return DB_ERROR;
+    }
+  }
+
+  return DB_SUCCESS;
+}
+
+static void vec_close_aux_dict_tables(vec_index_ctx_t* ctx) {
+  if (ctx == nullptr) {
+    return;
+  }
+
+  auto close_table = [](dict_table_t*& table) {
+    if (table != nullptr) {
+      const char* name =
+          table->name.m_name != nullptr ? table->name.m_name : "(null)";
+      ib::warn() << "VECREF: before close aux dict table '" << name
+                 << "' ref=" << table->get_ref_count();
+      const bool dict_locked = dict_sys_mutex_own();
+      dd_table_close(table, nullptr, nullptr, dict_locked);
+
+      ib::warn() << "VECREF: after close aux dict table '" << name
+                 << "' ref=" << table->get_ref_count();
+      table = nullptr;
+    }
+  };
+
+  std::lock_guard<std::mutex> lk(ctx->mu);
+  for (auto& seg : ctx->segments) {
+    close_table(seg.aux_dict_table);
+  }
+  close_table(ctx->staging_segment.aux_dict_table);
+  close_table(ctx->pending_aux_dict);
+}
+
+static void vec_close_aux_for_table(dict_table_t* table) {
+  ib::warn() << "VECINDEX: vec_close_aux_for_table called for table";
+             
+  if (table == nullptr) {
+    ib::warn() << "VECINDEX: vec_close_aux_for_table called with null table";
+    return;
+  }
+
+  for (dict_index_t* index = table->first_index(); index != nullptr;
+       index = index->next()) {
+    if (!dict_index_is_vector(index) || index->vec_runtime == nullptr) {
+      continue;
+    }
+    ib::warn() << "VECINDEX: vec_close_aux_for_table closing aux dict tables";
+    vec_close_aux_dict_tables(index->vec_runtime);
+  }
+}
+
+static void vec_aux_push_name(aux_name_vec_t* aux_vec,
+                              const std::string& name) {
+  if (aux_vec == nullptr || name.empty()) {
+    return;
+  }
+  aux_vec->aux_name.push_back(mem_strdup(name.c_str()));
+}
+
+static void vec_aux_drop_files_for_index(const vec_aux_drop_index_info& info) {
+  auto drop_one = [](const std::string& path) {
+    if (path.empty()) {
+      return;
+    }
+    bool existed = false;
+    if (!os_file_delete_if_exists(innodb_data_file_key, path.c_str(), &existed) &&
+        existed) {
+      ib::warn() << "VECINDEX: failed to delete file '" << path << "'";
+    }
+  };
+
+  for (const auto& seg_path : info.segment_files) {
+    drop_one(seg_path);
+  }
+  for (const auto& pkmap_path : info.pkmap_files) {
+    drop_one(pkmap_path);
+  }
+  if (!info.meta_path.empty()) {
+    drop_one(info.meta_path);
+  }
+}
+
+dberr_t vec_drop_ancillary_tables(trx_t* trx, dict_table_t* table,
+                                  aux_name_vec_t* aux_vec,
+                                  const vec_aux_drop_resources_t* resources) {
+  const char* table_name = "(null)";
+  if (table != nullptr && table->name.m_name != nullptr) {
+    table_name = table->name.m_name;
+  }
+  ib::warn() << "VECINDEX: vec_drop_ancillary_tables enter table '"
+             << table_name << "'";
+  if (trx == nullptr || table == nullptr) {
+    ib::warn() << "VECINDEX: vec_drop_ancillary_tables called with null trx/table";
+    return DB_ERROR;
+  }
+  if (aux_vec != nullptr) {
+    vec_free_aux_names(aux_vec);
+  }
+  const bool has_vec = dict_table_has_vec_index(table);
+  const bool is_aux = vec_dict_table_is_aux(table);
+  if (!has_vec || is_aux) {
+    ib::warn() << "VECINDEX: vec_drop_ancillary_tables skipping table '"
+               << (table->name.m_name ? table->name.m_name : "(null)")
+               << "' has_vec=" << has_vec << " is_aux=" << is_aux;
+    return DB_SUCCESS;
+  }
+
+  vec_close_aux_for_table(table);
+
+  vec_aux_drop_resources_t local;
+  const vec_aux_drop_resources_t* src = resources;
+  if (src == nullptr) {
+    ib::warn() << "VECINDEX: vec_drop_ancillary_tables collecting resources for table '"
+               << (table->name.m_name ? table->name.m_name : "(null)") << "'";
+    if (!vec_collect_drop_resources(table, &local)) {
+      ib::warn() << "VECINDEX: vec_drop_ancillary_tables failed to collect resources for table '"
+                 << (table->name.m_name ? table->name.m_name : "(null)") << "'";
+      return DB_ERROR;
+    }
+    src = &local;
+  }
+
+  ib::warn() << "VECINDEX: vec_drop_ancillary_tables begin table '"
+             << (table->name.m_name ? table->name.m_name : "(null)")
+             << "' indexes=" << src->indexes.size();
+  for (const auto& info : src->indexes) {
+    ib::warn() << "VECINDEX: drop plan index_id=" << info.index_id
+               << " mem=" << info.mem_name << " next=" << info.next_name
+               << " segs=" << info.seg_names.size()
+               << " files=" << info.segment_files.size()
+               << " pkmap=" << info.pkmap_files.size()
+               << " meta=" << info.meta_path;
+  }
+
+  ib::warn() << "VECINDEX: vec_drop_ancillary_tables mid: dropping aux tables for table '"
+             << table_name << "'";
+  for (const auto& info : src->indexes) {
+    if (!info.mem_name.empty()) {
+      dberr_t err = row_drop_table_for_mysql(info.mem_name.c_str(), trx, false,
+                                             nullptr);
+      if (err != DB_SUCCESS) {
+        ib::warn() << "VECINDEX: failed to drop aux table '"
+                   << info.mem_name << "' err=" << err;
+        return err;
+      }
+      vec_aux_push_name(aux_vec, info.mem_name);
+    }
+    if (!info.next_name.empty()) {
+      dberr_t err = row_drop_table_for_mysql(info.next_name.c_str(), trx, false,
+                                             nullptr);
+      if (err != DB_SUCCESS) {
+        ib::warn() << "VECINDEX: failed to drop aux table '"
+                   << info.next_name << "' err=" << err;
+        return err;
+      }
+      vec_aux_push_name(aux_vec, info.next_name);
+    }
+    for (const auto& seg_name : info.seg_names) {
+      if (seg_name.empty()) {
+        continue;
+      }
+      dberr_t err = row_drop_table_for_mysql(seg_name.c_str(), trx, false,
+                                             nullptr);
+      if (err != DB_SUCCESS) {
+        ib::warn() << "VECINDEX: failed to drop aux table '"
+                   << seg_name << "' err=" << err;
+        return err;
+      }
+      vec_aux_push_name(aux_vec, seg_name);
+    }
+  }
+
+  ib::warn() << "VECINDEX: vec_drop_ancillary_tables completed for table '"
+             << (table->name.m_name ? table->name.m_name : "(null)") << "'";
+  return DB_SUCCESS;
+}
+
+bool vec_drop_dd_tables(const aux_name_vec_t* aux_vec, bool file_per_table) {
+  const size_t aux_count =
+      (aux_vec != nullptr) ? aux_vec->aux_name.size() : 0;
+  ib::warn() << "VECINDEX: vec_drop_dd_tables enter count=" << aux_count
+             << " file_per_table=" << file_per_table;
+  if (aux_vec == nullptr || aux_vec->aux_name.empty()) {
+    return true;
+  }
+
+  ib::warn() << "VECINDEX: vec_drop_dd_tables begin count="
+             << aux_vec->aux_name.size()
+             << " file_per_table=" << file_per_table;
+  ib::warn() << "VECINDEX: vec_drop_dd_tables mid: dropping DD entries";
+  bool ok = true;
+  for (const auto& name : aux_vec->aux_name) {
+    if (!dd_drop_vec_table(name, file_per_table)) {
+      ib::warn() << "VECINDEX: dd_drop_vec_table failed for '" << name << "'";
+      ok = false;
+    }
+  }
+  if (!ok) {
+    ib::warn() << "VECINDEX: vec_drop_dd_tables completed with errors";
+  } else {
+    ib::warn() << "VECINDEX: vec_drop_dd_tables completed";
+  }
+  return ok;
+}
+
+void vec_free_aux_names(aux_name_vec_t* aux_vec) {
+  if (aux_vec == nullptr || aux_vec->aux_name.empty()) {
+    return;
+  }
+  while (!aux_vec->aux_name.empty()) {
+    char* name = aux_vec->aux_name.back();
+    ut::free(name);
+    aux_vec->aux_name.pop_back();
+  }
+}
+
+void vec_drop_index_files(const vec_aux_drop_resources_t* resources) {
+  const size_t index_count =
+      (resources != nullptr) ? resources->indexes.size() : 0;
+  ib::warn() << "VECINDEX: vec_drop_index_files enter indexes=" << index_count;
+  if (resources == nullptr || resources->indexes.empty()) {
+    return;
+  }
+
+  ib::warn() << "VECINDEX: vec_drop_index_files begin indexes="
+             << resources->indexes.size();
+  ib::warn() << "VECINDEX: vec_drop_index_files mid: deleting files";
+  for (const auto& info : resources->indexes) {
+    vec_aux_drop_files_for_index(info);
+  }
+  ib::warn() << "VECINDEX: vec_drop_index_files completed";
 }
 
 

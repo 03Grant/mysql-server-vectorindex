@@ -40,47 +40,32 @@
 #include "vec_params.h"
 #include "row0mysql.h"
 #include "data0type.h"
+#include "vec_txn_buf.h"
 
 namespace {
 
-inline void vec_pack_u32(std::string &buf, uint32_t value) {
-  buf.push_back(static_cast<char>(value & 0xFF));
-  buf.push_back(static_cast<char>((value >> 8) & 0xFF));
-  buf.push_back(static_cast<char>((value >> 16) & 0xFF));
-  buf.push_back(static_cast<char>((value >> 24) & 0xFF));
+static bool vec_should_skip_task(const dict_index_t* index) {
+  if (index == nullptr || index->table == nullptr) {
+    return false;
+  }
+  if (index->table->to_be_dropped) {
+    return true;
+  }
+  return vec_dict_table_is_aux(index->table);
 }
 
-std::string vec_pack_pk_key(const std::vector<vec_pk_column_t> &pk_columns,
-                            ulint pk_fields) {
-  const ulint cols = std::min<ulint>(pk_fields, pk_columns.size());
-  const uint32_t num_cols = static_cast<uint32_t>(cols);
-
-  size_t total = sizeof(uint32_t);
-  for (ulint i = 0; i < cols; ++i) {
-    total += sizeof(uint32_t);
-    if (!pk_columns[i].is_null) {
-      total += pk_columns[i].data.size();
+static dict_index_t* vec_find_index_by_id(dict_table_t* table,
+                                          space_index_t index_id) {
+  if (table == nullptr) {
+    return nullptr;
+  }
+  for (dict_index_t* index = table->first_index(); index != nullptr;
+       index = index->next()) {
+    if (index->id == index_id) {
+      return index;
     }
   }
-
-  std::string packed;
-  packed.reserve(total);
-  vec_pack_u32(packed, num_cols);
-
-  for (ulint i = 0; i < cols; ++i) {
-    const auto &col = pk_columns[i];
-    if (col.is_null) {
-      vec_pack_u32(packed, std::numeric_limits<uint32_t>::max());
-      continue;
-    }
-    const uint32_t len =
-        static_cast<uint32_t>(std::min<size_t>(col.data.size(), UINT32_MAX));
-    vec_pack_u32(packed, len);
-    packed.append(reinterpret_cast<const char *>(col.data.data()),
-                  len);
-  }
-
-  return packed;
+  return nullptr;
 }
 
 bool vec_extract_pk_columns(
@@ -489,6 +474,13 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
   fresh.immutable = false;
   fresh.aux_dict_table =
       dd_table_open_on_name_in_mem(new_mem_name.c_str(), false);
+  if (fresh.aux_dict_table != nullptr) {
+    ib::warn() << "VECREF: open fresh aux dict table '" << new_mem_name
+               << "' ref=" << fresh.aux_dict_table->get_ref_count();
+  } else {
+    ib::warn() << "VECREF: failed to open fresh aux dict table '"
+               << new_mem_name << "'";
+  }
   fresh.vecindex_bitmap.clear();
 
   if (!ctx->segments.empty()) {
@@ -498,6 +490,12 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
   ctx->segments.push_back(std::move(staging));
   ctx->max_vecindex_id = std::max(ctx->max_vecindex_id, seg_id);
   if (ctx->pending_aux_dict != nullptr) {
+    const char* pending_name =
+        ctx->pending_aux_dict->name.m_name != nullptr
+            ? ctx->pending_aux_dict->name.m_name
+            : "(null)";
+    ib::warn() << "VECREF: close pending aux dict table '" << pending_name
+               << "' ref=" << ctx->pending_aux_dict->get_ref_count();
     dd_table_close(ctx->pending_aux_dict, nullptr, nullptr, false);
     ctx->pending_aux_dict = nullptr;
   }
@@ -600,39 +598,15 @@ class VecBgThdGuard {
   THD *prev_thd_{nullptr};
 };
 
-bool vec_rotate_mem_index_bg(dict_index_t *index, vec_index_ctx_t *ctx) {
-  ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Rotating mem index in bg.";
-  if (index == nullptr || ctx == nullptr) {
-    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Invalid arguments.";
-    return false;
-  }
-
-  VecBgThdGuard guard;
-  if (!guard.create()) {
-    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to create background thread.";
-    return false;
-  }
-  if (!guard.start_trx()) {
-    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to start transaction.";
-    return false;
-  }
-
-  bool rotated = vec_try_rotate_mem_index(guard.trx(), index, ctx);
-  if (rotated) {
-    rotated = guard.commit();
-  } else {
-    guard.rollback();
-  }
-  ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Rotation "
-             << (rotated ? "succeeded." : "failed.");
-  return rotated;
-}
-
 void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
                        vec_index_segment_t *seg) {
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Building index segment in bg.";
   if (index == nullptr || ctx == nullptr || seg == nullptr) {
     ib::warn() << "VECINDEX: function::vec_bg_build_task() Invalid arguments.";
+    return;
+  }
+  if (vec_should_skip_task(index)) {
+    ib::warn() << "VECINDEX: function::vec_bg_build_task() Skip build for dropping/aux table.";
     return;
   }
   ctx->build_in_progress = true;
@@ -690,7 +664,7 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
 
   target->train(ids.size(), xb.data());
   target->add(ids.size(), xb.data(), ids.data());
-
+  
   target->save(index_path);
   const std::string mapping_path = vec_vid_pk_mapping_path(index_path);
   bool pk_mapping_saved = false;
@@ -719,6 +693,76 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
 
   clear_build_flag();
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Finished building index segment.";
+}
+
+bool vec_rotate_mem_index_bg(table_id_t table_id, space_index_t index_id) {
+  ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Rotating mem index in bg.";
+  VecBgThdGuard guard;
+  if (!guard.create()) {
+    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to create background thread.";
+    return false;
+  }
+  if (!guard.start_trx()) {
+    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to start transaction.";
+    return false;
+  }
+
+  MDL_ticket* mdl = nullptr;
+  dict_table_t* table =
+      dd_table_open_on_id(table_id, guard.thd(), &mdl, false, true);
+  if (table == nullptr) {
+    guard.rollback();
+    return false;
+  }
+
+  dict_index_t* index = vec_find_index_by_id(table, index_id);
+  if (index == nullptr || index->vec_runtime == nullptr) {
+    dd_table_close(table, guard.thd(), &mdl, false);
+    guard.rollback();
+    return false;
+  }
+
+  vec_index_ctx_t* ctx = index->vec_runtime;
+  struct PendingGuard {
+    vec_index_ctx_t* ctx{nullptr};
+    ~PendingGuard() {
+      if (ctx != nullptr) {
+        ctx->is_rotation_pending.store(false);
+      }
+    }
+  } pending_guard{ctx};
+
+  if (vec_should_skip_task(index)) {
+    dd_table_close(table, guard.thd(), &mdl, false);
+    guard.rollback();
+    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Skip rotation for dropping/aux table.";
+    return false;
+  }
+
+  bool rotated = vec_try_rotate_mem_index(guard.trx(), index, ctx);
+  if (rotated) {
+    rotated = guard.commit();
+  } else {
+    guard.rollback();
+  }
+
+  if (rotated) {
+    vec_index_segment_t* staging_seg = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(ctx->mu);
+      if (!ctx->segments.empty()) {
+        staging_seg = &ctx->segments.back();
+      }
+    }
+    if (staging_seg != nullptr && staging_seg->immutable) {
+      vec_bg_build_task(index, ctx, staging_seg);
+    }
+  }
+
+  dd_table_close(table, guard.thd(), &mdl, false);
+  ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Rotation "
+             << (rotated ? "succeeded." : "failed.");
+  return rotated;
 }
 
 }  // namespace
@@ -1091,6 +1135,10 @@ bool vec_prepare_pending_mem_table(dict_index_t *index) {
     hold = dd_table_open_on_name(thd, nullptr, pending_name.c_str(), false,
                                  DICT_ERR_IGNORE_NONE);
   }
+  if (hold != nullptr) {
+    ib::warn() << "VECREF: hold pending aux dict table '" << pending_name
+               << "' ref=" << hold->get_ref_count();
+  }
 
   lk.lock();
   ctx->pending_aux_name = pending_name;
@@ -1155,7 +1203,7 @@ void VecTaskManager::stop() {
 }
 
 void VecTaskManager::submit_task(dict_index_t *index) {
-  if (index == nullptr) {
+  if (index == nullptr || index->table == nullptr) {
     return;
   }
   ensure_started();
@@ -1166,7 +1214,7 @@ void VecTaskManager::submit_task(dict_index_t *index) {
     if (pending_index_ids.find(key) != pending_index_ids.end()) {
       return;
     }
-    tasks.push({index});
+    tasks.push({index->table->id, index->id});
     pending_index_ids.insert(key);
   }
   ib::warn() << "VECINDEX: function::VecTaskManager::submit_task() Task submitted for index ID ";
@@ -1204,9 +1252,7 @@ void VecTaskManager::worker_loop() {
 
       task = tasks.front();
       tasks.pop();
-      if (task.index != nullptr) {
-        pending_index_ids.erase(static_cast<uint64_t>(task.index->id));
-      }
+      pending_index_ids.erase(static_cast<uint64_t>(task.index_id));
     }
 
     process_task(task);
@@ -1214,36 +1260,10 @@ void VecTaskManager::worker_loop() {
 }
 
 void VecTaskManager::process_task(VecBuildTask task) {
-  dict_index_t *index = task.index;
-  if (index == nullptr || index->vec_runtime == nullptr) {
+  if (task.table_id == 0 || task.index_id == 0) {
     return;
   }
-
-  vec_index_ctx_t *ctx = index->vec_runtime;
-  auto clear_pending = [ctx]() {
-    if (ctx != nullptr) {
-      ctx->is_rotation_pending.store(false);
-    }
-  };
-
-  if (!vec_rotate_mem_index_bg(index, ctx)) {
-    clear_pending();
-    return;
-  }
-
-  vec_index_segment_t *staging_seg = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(ctx->mu);
-    if (!ctx->segments.empty()) {
-      staging_seg = &ctx->segments.back();
-    }
-  }
-
-  if (staging_seg != nullptr && staging_seg->immutable) {
-    vec_bg_build_task(index, ctx, staging_seg);
-  }
-
-  clear_pending();
+  vec_rotate_mem_index_bg(task.table_id, task.index_id);
 }
 
 bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
@@ -1669,6 +1689,53 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
   ctx->id_alloc.next = static_cast<uint64_t>(seg->index->ntotal());
   ctx->id_alloc.inited = true;
 
+  // MEM recovery rebuilds contiguous faiss_id, so disable mem_diff remap.
+  seg->vid_pk_mapping.is_mem_diff = false;
+  seg->vid_pk_mapping.mem_diff.clear();
+#if 0
+  // Align mem index if there are deletions making the mapping inconsistent.
+  {
+    const uint64_t invalid_id = std::numeric_limits<uint64_t>::max();
+    uint64_t max_old_id = 0;
+    bool have_old_id = false;
+    for (const auto &entry : entries) {
+      if (entry.new_id == invalid_id) {
+        continue;
+      }
+      max_old_id = std::max(max_old_id, entry.old_id);
+      have_old_id = true;
+    }
+    const uint64_t mapping_size =
+        static_cast<uint64_t>(seg->vid_pk_mapping.size());
+    if (have_old_id && max_old_id >= mapping_size) {
+      if (max_old_id >=
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        /* Avoid oversized allocations; skip mem_diff in this case. */
+      } else {
+        ib::warn()<< "VECMETA: aligning mem index for table '"
+                   << index->table->name.m_name << "' old_id_max="
+                   << max_old_id << " mapping_size=" << mapping_size;
+        seg->vid_pk_mapping.is_mem_diff = true;
+        seg->vid_pk_mapping.mem_diff.assign(
+            static_cast<size_t>(max_old_id + 1), -1);
+      }
+      for (const auto &entry : entries) {
+        if (entry.new_id == invalid_id) {
+          continue;
+        }
+        if (!seg->vid_pk_mapping.is_mem_diff ||
+            entry.old_id >= seg->vid_pk_mapping.mem_diff.size()) {
+          continue;
+        }
+        const int64_t diff =
+            static_cast<int64_t>(entry.old_id) -
+            static_cast<int64_t>(entry.new_id);
+        seg->vid_pk_mapping.mem_diff[entry.old_id] = diff;
+      }
+    }
+  }
+#endif
+
   for (const auto &entry : entries) {
     if (entry.new_id == std::numeric_limits<uint64_t>::max()) {
       continue;
@@ -1798,23 +1865,35 @@ class VecMetaLoader {
     ib::warn() << "VECMETA: starting bootstrap load for index "
                << (index->name ? index->name : "(null)");
 
-    if (index == nullptr || index->vec_runtime == nullptr ||
-        index->vec_params == nullptr) {
-      if (index != nullptr && index->vec_runtime != nullptr) {
-        index->vec_runtime->bootstrap_loaded.store(
-            true, std::memory_order_release);
+    vec_index_ctx_t *ctx = index != nullptr ? index->vec_runtime : nullptr;
+    auto mark_ready = [ctx]() {
+      if (ctx != nullptr) {
+        ctx->bootstrap_state.store(VecBootstrapState::READY,
+                                   std::memory_order_release);
+        ctx->bootstrap_loaded.store(true, std::memory_order_release);
       }
+    };
+    auto mark_failed = [ctx]() {
+      if (ctx != nullptr) {
+        ctx->bootstrap_state.store(VecBootstrapState::FAILED,
+                                   std::memory_order_release);
+        ctx->bootstrap_loaded.store(false, std::memory_order_release);
+        ctx->bootstrap_load_submitted.store(false, std::memory_order_release);
+      }
+    };
+
+    if (index == nullptr || ctx == nullptr || index->vec_params == nullptr) {
+      mark_failed();
       ib::warn() << "VECMETA: invalid index for bootstrap load.";
       return;
     }
 
     ib::warn() << "VECMETA: processing bootstrap load for index "
                << (index->name ? index->name : "(null)");
-    vec_index_ctx_t *ctx = index->vec_runtime;
     std::string meta_path;
     VecBgThdGuard guard;
     if (!guard.create()) {
-      ctx->bootstrap_loaded.store(true, std::memory_order_release);
+      mark_failed();
       ib::warn() << "VECMETA: failed to create THD for aux cache preload";
       return;
     }
@@ -1822,8 +1901,12 @@ class VecMetaLoader {
     VecMetaHeader header{};
     std::vector<VecSegmentEntry> entries;
     bool meta_ok = false;
+    bool meta_expected = false;
     if (vec_meta_path_for_index(index, &meta_path)) {
-      if (vec_meta_read_all(meta_path, &header, &entries)) {
+      meta_expected = true;
+      if (my_access(meta_path.c_str(), F_OK) != 0) {
+        meta_expected = false;
+      } else if (vec_meta_read_all(meta_path, &header, &entries)) {
         VecMetaHeader expected = vec_meta_make_header(index, ctx->params);
         auto header_matches = [](const VecMetaHeader &lhs,
                                  const VecMetaHeader &rhs) {
@@ -1835,6 +1918,7 @@ class VecMetaLoader {
         };
 
         if (!header_matches(header, expected)) {
+          meta_expected = true;
           ib::warn() << "VECMETA: header mismatch for index "
                      << (index->name ? index->name : "(null)")
                      << ", skip meta segments.";
@@ -1848,6 +1932,11 @@ class VecMetaLoader {
       ib::warn() << "VECMETA: no meta path available for index "
                  << (index->name ? index->name : "(null)")
                  << "; attempting MEM recovery only.";
+    }
+
+    bool ok = true;
+    if (meta_expected && !meta_ok) {
+      ok = false;
     }
 
     const std::string base_dir = vec_meta_dirname(meta_path);
@@ -1901,6 +1990,7 @@ class VecMetaLoader {
         try {
           target->load(seg_path);
         } catch (const std::exception &e) {
+          ok = false;
           ib::warn() << "VECMETA: failed to load segment file '" << seg_path
                      << "' error=" << e.what();
           continue;
@@ -1953,7 +2043,9 @@ class VecMetaLoader {
         if (inserted != nullptr && guard.thd() != nullptr &&
             !inserted->vid_pk_mapping.ready) {
               //TODO: May need a flag to resave PK mapping to file?
-          vec_load_aux_cache_for_segment(index, ctx, inserted, guard.thd());
+          if (!vec_load_aux_cache_for_segment(index, ctx, inserted, guard.thd())) {
+            ok = false;
+          }
         }
       }
     }
@@ -1962,9 +2054,17 @@ class VecMetaLoader {
         !vec_recover_mutable_mem_index(index, ctx, guard.thd())) {
       ib::warn() << "VECMETA: MEM recovery failed for index "
                  << (index->name ? index->name : "(null)");
+      ok = false;
+    }
+    if (guard.thd() == nullptr) {
+      ok = false;
     }
 
-    ctx->bootstrap_loaded.store(true, std::memory_order_release);
+    if (ok) {
+      mark_ready();
+    } else {
+      mark_failed();
+    }
   }
 
   std::queue<dict_index_t *> tasks;
@@ -1976,5 +2076,27 @@ class VecMetaLoader {
 };
 
 void vec_schedule_bootstrap_load(dict_index_t *index) {
+  if (index == nullptr || index->vec_runtime == nullptr) {
+    return;
+  }
+  vec_index_ctx_t *ctx = index->vec_runtime;
+  VecBootstrapState state =
+      ctx->bootstrap_state.load(std::memory_order_acquire);
+  if (state == VecBootstrapState::READY ||
+      state == VecBootstrapState::LOADING) {
+    return;
+  }
+
+  if (state == VecBootstrapState::FAILED) {
+    ctx->bootstrap_load_submitted.store(false, std::memory_order_release);
+  }
+
+  VecBootstrapState expected = state;
+  if (!ctx->bootstrap_state.compare_exchange_strong(
+          expected, VecBootstrapState::LOADING,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return;
+  }
+  ctx->bootstrap_loaded.store(false, std::memory_order_release);
   VecMetaLoader::instance().schedule(index);
 }

@@ -64,12 +64,17 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0ext.h"
 #include "row0ins.h"
 #include "row0log.h"
+#include "storage/innobase/vec/vec_txn_buf.h"
+#include "ut0log.h"
 #ifndef UNIV_HOTBACKUP
 #include "row0row.h"
 #include "row0sel.h"
 #include "trx0rec.h"
 #endif /* !UNIV_HOTBACKUP */
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <vector>
 #include "lob0lob.h"
 #ifndef UNIV_HOTBACKUP
 #include "dict0dd.h"
@@ -1677,6 +1682,9 @@ bool row_upd_changes_some_index_ord_field_binary(
   return false;
 }
 
+static void vec_preserve_update_pk(upd_node_t *node);
+static void vec_preserve_update_vec(upd_node_t *node);
+
 /** Checks if an FTS Doc ID column is affected by an UPDATE.
  @return whether the Doc ID column is changed */
 bool row_upd_changes_doc_id(dict_table_t *table,    /*!< in: table */
@@ -1961,6 +1969,8 @@ void row_upd_store_row(upd_node_t *node, THD *thd, TABLE *mysql_table) {
     node->upd_row = dtuple_copy(node->row, node->heap);
     row_upd_replace(node->upd_row, &node->upd_ext, clust_index, node->update,
                     node->heap);
+    vec_preserve_update_pk(node);
+    vec_preserve_update_vec(node);
   }
 
   if (UNIV_LIKELY_NULL(heap)) {
@@ -2965,6 +2975,233 @@ func_exit:
 
 /** Delete marks a clustered index record.
  @return DB_SUCCESS if operation successfully completed, else error code */
+
+static inline ulint vec_pk_field_count(const dict_index_t *clust_index) {
+  if (clust_index == nullptr) {
+    return 0;
+  }
+  if (clust_index->name != nullptr &&
+      std::strcmp(clust_index->name, "GEN_CLUST_INDEX") == 0) {
+    return 1;
+  }
+  return clust_index->n_uniq;
+}
+
+static void vec_preserve_delete_pk(upd_node_t *node) {
+  if (node == nullptr) {
+    ib::warn() << "node is nullptr";
+    return;
+  }
+
+  node->vec_delete_pk_columns.clear();
+  node->vec_delete_pk_fields = 0;
+
+  dict_table_t *table = node->table;
+  if (!node->is_delete || table == nullptr || !dict_table_has_vec_index(table)) {
+    
+    ib::warn() << "node is not delete or no table or no vec index : detail:";
+    if(!node->is_delete) {
+      ib::warn() << "node is not delete";
+    }
+    if(table == nullptr) {
+      ib::warn() << "no table";
+    }
+    if(!dict_table_has_vec_index(table)) {
+      ib::warn() << "no vec index";
+    }
+    return;
+  }
+
+  dict_index_t *clust_index = table->first_index();
+  const ulint pk_fields = vec_pk_field_count(clust_index);
+  node->vec_delete_pk_fields = pk_fields;
+
+  if (clust_index == nullptr || pk_fields == 0 || node->row == nullptr) {
+    ib::warn() << "vec_preserve_delete_pk: skip capture clust_index="
+               << (clust_index != nullptr) << " pk_fields=" << pk_fields
+               << " row=" << (node->row != nullptr);
+    return;
+  }
+
+  std::vector<vec_pk_column_t> snapshot;
+  const bool ok = vec_capture_pk_columns(table, node->row, snapshot) &&
+                  snapshot.size() >= pk_fields;
+  if (ok) {
+    node->vec_delete_pk_columns.swap(snapshot);
+    ib::warn() << "vec_preserve_delete_pk: captured pk_fields=" << pk_fields
+               << " dump="
+               << vec_format_pk_columns_debug(node->vec_delete_pk_columns,
+                                               pk_fields, 32);
+  } else {
+    ib::warn() << "vec_preserve_delete_pk: capture failed pk_fields="
+               << pk_fields;
+  }
+}
+
+static void vec_preserve_update_pk(upd_node_t *node) {
+  if (node == nullptr) {
+    ib::warn() << "vec_preserve_update_pk: node is nullptr";
+    return;
+  }
+
+  node->vec_update_old_pk_columns.clear();
+  node->vec_update_new_pk_columns.clear();
+  node->vec_update_pk_fields = 0;
+
+  if (node->is_delete) {
+    return;
+  }
+
+  dict_table_t *table = node->table;
+  if (table == nullptr || !dict_table_has_vec_index(table) ||
+      node->update == nullptr) {
+    return;
+  }
+
+  dict_index_t *clust_index = table->first_index();
+  const ulint pk_fields = vec_pk_field_count(clust_index);
+  if (clust_index == nullptr || pk_fields == 0) {
+    return;
+  }
+
+  if (node->row == nullptr || node->upd_row == nullptr) {
+    ib::warn() << "vec_preserve_update_pk: missing row/upd_row";
+    return;
+  }
+
+  std::vector<vec_pk_column_t> old_snapshot;
+  std::vector<vec_pk_column_t> new_snapshot;
+  const bool ok_old =
+      vec_capture_pk_columns(table, node->row, old_snapshot) &&
+      old_snapshot.size() >= pk_fields;
+  const bool ok_new =
+      vec_capture_pk_columns(table, node->upd_row, new_snapshot) &&
+      new_snapshot.size() >= pk_fields;
+
+  if (ok_old && ok_new) {
+    node->vec_update_old_pk_columns.swap(old_snapshot);
+    node->vec_update_new_pk_columns.swap(new_snapshot);
+    node->vec_update_pk_fields = pk_fields;
+    ib::warn() << "vec_preserve_update_pk: captured pk_fields=" << pk_fields
+               << " old="
+               << vec_format_pk_columns_debug(node->vec_update_old_pk_columns,
+                                              pk_fields, 32)
+               << " new="
+               << vec_format_pk_columns_debug(node->vec_update_new_pk_columns,
+                                              pk_fields, 32);
+  } else {
+    ib::warn() << "vec_preserve_update_pk: capture failed pk_fields="
+               << pk_fields;
+  }
+}
+
+static bool vec_extract_vector_from_field(const dfield_t *field, unsigned dim,
+                                          std::vector<float> &out) {
+  if (field == nullptr || dim == 0 || dfield_is_null(field)) {
+    return false;
+  }
+
+  const size_t expect_bytes = static_cast<size_t>(dim) * sizeof(float);
+  const ulint raw_len = dfield_get_len(field);
+  const unsigned char *raw =
+      static_cast<const unsigned char *>(dfield_get_data(field));
+
+  if (raw == nullptr || raw_len != expect_bytes) {
+    return false;
+  }
+
+  out.resize(dim);
+  for (unsigned i = 0; i < dim; ++i) {
+    const float value = float4get(raw + i * sizeof(float));
+    if (!std::isfinite(value)) {
+      return false;
+    }
+    out[i] = value;
+  }
+
+  return true;
+}
+
+static void vec_preserve_update_vec(upd_node_t *node) {
+  if (node == nullptr) {
+    ib::warn() << "vec_preserve_update_vec: node is nullptr";
+    return;
+  }
+
+  node->vec_update_vecs.clear();
+  node->vec_update_vec_capture_failed = false;
+
+  if (node->is_delete) {
+    return;
+  }
+
+  dict_table_t *table = node->table;
+  if (table == nullptr || !dict_table_has_vec_index(table)) {
+    return;
+  }
+
+  if (node->upd_row == nullptr) {
+    ib::warn() << "vec_preserve_update_vec: missing upd_row";
+    node->vec_update_vec_capture_failed = true;
+    return;
+  }
+
+  for (dict_index_t *vec_index = UT_LIST_GET_FIRST(table->indexes);
+       vec_index != nullptr;
+       vec_index = UT_LIST_GET_NEXT(indexes, vec_index)) {
+    if (vec_index->vec_params == nullptr) {
+      continue;
+    }
+
+    const vec_params_t *params = vec_index->vec_params;
+    const unsigned dim = params != nullptr ? params->dim : 0;
+    if (dim == 0) {
+      ib::warn() << "vec_preserve_update_vec: index '"
+                 << (vec_index->name ? vec_index->name : "(null)")
+                 << "' reports zero dimension during update";
+      node->vec_update_vec_capture_failed = true;
+      continue;
+    }
+
+    const dict_field_t *vec_field = vec_index->get_field(0);
+    if (vec_field == nullptr || vec_field->col == nullptr) {
+      ib::warn() << "vec_preserve_update_vec: index '"
+                 << (vec_index->name ? vec_index->name : "(null)")
+                 << "' has invalid metadata for vector column";
+      node->vec_update_vec_capture_failed = true;
+      continue;
+    }
+
+    const dfield_t *vec_value = nullptr;
+    if (vec_field->col->is_virtual()) {
+      const dict_v_col_t *vcol =
+          reinterpret_cast<const dict_v_col_t *>(vec_field->col);
+      vec_value = dtuple_get_nth_v_field(node->upd_row, vcol->v_pos);
+    } else {
+      const ulint col_no = dict_col_get_no(vec_field->col);
+      if (col_no >= dtuple_get_n_fields(node->upd_row)) {
+        ib::warn() << "vec_preserve_update_vec: index '"
+                   << (vec_index->name ? vec_index->name : "(null)")
+                   << "' column position " << col_no
+                   << " is out of range for the updated row";
+        node->vec_update_vec_capture_failed = true;
+        continue;
+      }
+      vec_value = dtuple_get_nth_field(node->upd_row, col_no);
+    }
+
+    std::vector<float> vec_values;
+    if (!vec_extract_vector_from_field(vec_value, dim, vec_values)) {
+      ib::warn() << "vec_preserve_update_vec: invalid vector payload for index '"
+                 << (vec_index->name ? vec_index->name : "(null)") << "'";
+      node->vec_update_vec_capture_failed = true;
+      continue;
+    }
+
+    node->vec_update_vecs.push_back({vec_index, std::move(vec_values)});
+  }
+}
+
 [[nodiscard]] static dberr_t row_upd_del_mark_clust_rec(
     ulint flags,         /*!< in: undo logging and locking flags */
     upd_node_t *node,    /*!< in: row update node */
@@ -2993,6 +3230,7 @@ func_exit:
 
   row_upd_store_row(node, thr_get_trx(thr)->mysql_thd,
                     thr->prebuilt ? thr->prebuilt->m_mysql_table : nullptr);
+  vec_preserve_delete_pk(node);
 
   /* Mark the clustered index record deleted; we do not have to check
   locks, because we assume that we have an x-lock on the record */
@@ -3239,7 +3477,8 @@ static dberr_t row_upd(upd_node_t *node, /*!< in: row update node */
       break;
     }
 
-    if (node->index->type != DICT_FTS) {
+    if (node->index->type != DICT_FTS &&
+        !(node->index->type & DICT_VECINDEX)) {
       err = row_upd_sec_step(node, thr);
 
       if (err != DB_SUCCESS) {

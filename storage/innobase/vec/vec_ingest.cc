@@ -12,6 +12,8 @@
 #include <omp.h>
 
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -46,6 +48,28 @@ class ScopedVecThreads {
   bool changed_{false};
 #endif
 };
+
+constexpr size_t kVecRollbackHexPreviewBytes = 32;
+
+const char* vec_index_name(const dict_index_t* index) {
+  return (index != nullptr && index->name != nullptr) ? index->name : "(null)";
+}
+
+std::string vec_hex_preview(const std::string& bytes, size_t max_bytes) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  const size_t limit = bytes.size() < max_bytes ? bytes.size() : max_bytes;
+  std::string out;
+  out.reserve(limit * 2 + (bytes.size() > limit ? 3 : 0));
+  for (size_t i = 0; i < limit; ++i) {
+    const unsigned char ch = static_cast<unsigned char>(bytes[i]);
+    out.push_back(kHex[ch >> 4]);
+    out.push_back(kHex[ch & 0x0f]);
+  }
+  if (bytes.size() > limit) {
+    out.append("...");
+  }
+  return out;
+}
 
 } // namespace
 
@@ -176,8 +200,14 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
   ib::warn() << "VECINDEX: flushing vector rows for trx " << trx->id
              << " using exec_trx " << exec_trx->id;
 
+  std::unordered_map<dict_index_t*, vec_trx_bucket_t> buckets;
+  {
+    std::lock_guard<std::mutex> lk(tctx->mu);
+    buckets = tctx->by_index;
+  }
+
   std::vector<dict_index_t*> flushed_indexes;
-  for (auto& kv : tctx->by_index) {
+  for (auto& kv : buckets) {
     last_err = vec_apply_bucket(exec_trx, kv.second);
     if (last_err != DB_SUCCESS) {
       ib::warn() << "VECINDEX: vec_apply_bucket failed with error " << last_err;
@@ -251,7 +281,124 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
 
 // 回滚路径
 void vec_on_trx_rollback(trx_t* trx) {
-  auto* tctx = vec_get_or_create_trx_ctx(trx);
-  if (!tctx) return;
+  auto* tctx = vec_lookup_trx_ctx(trx);
+  ib::warn() << "VECINDEX_Rollback: vec_on_trx_rollback called for trx " << trx->id;
+  if (tctx == nullptr) {
+    ib::warn() << "VECINDEX_Rollback: no vec_trx_ctx_t for trx " << trx->id;
+    return;
+  }
+
+  std::vector<vec_bitmap_undo_entry_t> undo_entries;
+  std::vector<vec_update_undo_entry_t> update_entries;
+  std::unordered_map<dict_index_t*, std::vector<std::string>> insert_keys;
+  std::unordered_map<dict_index_t*, std::vector<std::string>> delete_keys;
+  {
+    std::lock_guard<std::mutex> lk(tctx->mu);
+    undo_entries = tctx->bitmap_changes;
+    update_entries = tctx->update_changes;
+    for (const auto& kv : tctx->by_index) {
+      if (kv.second.items.empty()) {
+        continue;
+      }
+      auto& keys = insert_keys[kv.first];
+      keys.reserve(kv.second.items.size());
+      for (const auto& item : kv.second.items) {
+        keys.push_back(item.pk_key);
+      }
+    }
+    for (const auto& kv : tctx->deleted_pks_in_trx) {
+      if (kv.second.empty()) {
+        continue;
+      }
+      auto& keys = delete_keys[kv.first];
+      keys.reserve(kv.second.size());
+      for (const auto& key : kv.second) {
+        keys.push_back(key);
+      }
+    }
+  }
+
+  for (const auto& kv : insert_keys) {
+    const auto* index = kv.first;
+    const auto& keys = kv.second;
+    if (keys.empty()) {
+      continue;
+    }
+    ib::warn() << "VEC_ROLLBACK_INSERT: index=" << vec_index_name(index)
+               << " count=" << keys.size();
+    for (const auto& key : keys) {
+      ib::warn() << "VEC_ROLLBACK_INSERT: index=" << vec_index_name(index)
+                 << " pk_key_bytes=" << key.size()
+                 << " pk_key_hex=" << vec_hex_preview(key, kVecRollbackHexPreviewBytes);
+    }
+  }
+
+  for (const auto& kv : delete_keys) {
+    const auto* index = kv.first;
+    const auto& keys = kv.second;
+    if (keys.empty()) {
+      continue;
+    }
+    ib::warn() << "VEC_ROLLBACK_DELETE: index=" << vec_index_name(index)
+               << " count=" << keys.size();
+    for (const auto& key : keys) {
+      ib::warn() << "VEC_ROLLBACK_DELETE: index=" << vec_index_name(index)
+                 << " pk_key_bytes=" << key.size()
+                 << " pk_key_hex=" << vec_hex_preview(key, kVecRollbackHexPreviewBytes);
+    }
+  }
+
+  for (const auto& entry : update_entries) {
+    ib::warn() << "VEC_ROLLBACK_UPDATE: index=" << vec_index_name(entry.index)
+               << " old_pk_bytes=" << entry.old_pk_key.size()
+               << " old_pk_hex="
+               << vec_hex_preview(entry.old_pk_key, kVecRollbackHexPreviewBytes)
+               << " new_pk_bytes=" << entry.new_pk_key.size()
+               << " new_pk_hex="
+               << vec_hex_preview(entry.new_pk_key, kVecRollbackHexPreviewBytes)
+               << " in_bucket=" << (entry.in_bucket ? 1 : 0);
+  }
+
+  for (auto it = undo_entries.rbegin(); it != undo_entries.rend(); ++it) {
+    vec_index_ctx_t* vec_ctx = it->ctx;
+    if (vec_ctx == nullptr) {
+      continue;
+    }
+
+    std::lock_guard<std::mutex> idx_lock(vec_ctx->mu);
+    vec_index_segment_t* seg = nullptr;
+    for (auto& s : vec_ctx->segments) {
+      if (s.vecindex_id == it->segment_id) {
+        seg = &s;
+        break;
+      }
+    }
+    if (seg == nullptr) {
+      seg = vec_ctx->mutable_segment();
+      if (seg != nullptr && seg->vecindex_id != it->segment_id &&
+          it->segment_id != 0) {
+        seg = nullptr;
+      }
+    }
+
+    if (seg != nullptr) {
+      ib::warn() << "VEC_ROLLBACK_DELETE: bitmap restore index="
+                 << vec_index_name(it->index)
+                 << " seg_id=" << it->segment_id
+                 << " vid=" << it->vid
+                 << " old_val=" << it->old_val;
+      seg->vecindex_bitmap.set(static_cast<size_t>(it->vid), it->old_val);
+    }else{
+      // TODO deal with the case where the segment is not found
+      
+      ib::warn() << "VEC_ROLLBACK_DELETE: bitmap restore skipped index="
+                 << vec_index_name(it->index)
+                 << " seg_id=" << it->segment_id
+                 << " vid=" << it->vid
+                 << " old_val=" << it->old_val;
+    }
+
+  }
+
   vec_trx_ctx_clear(tctx); // 没有改 Faiss/表，自然丢弃
 }

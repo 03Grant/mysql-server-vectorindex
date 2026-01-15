@@ -120,6 +120,10 @@ static void trx_rollback_to_savepoint_low(
   }
 
   if (savept == nullptr) {
+    if (vec_trx_has_work(trx)) {
+      vec_on_trx_rollback(trx);
+    }
+
     trx_rollback_finish(trx);
     MONITOR_INC(MONITOR_TRX_ROLLBACK);
   } else {

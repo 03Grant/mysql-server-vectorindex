@@ -227,6 +227,8 @@ enum dberr_t {
   /** Column update or read failed because the types mismatch */
   DB_DATA_MISMATCH = 2000,
   /* Too many nested sub expression in full-text search string */
-  DB_FTS_TOO_MANY_NESTED_EXP
+  DB_FTS_TOO_MANY_NESTED_EXP,
+  /** Vector index bootstrap/load is not ready. */
+  DB_VECINDEX_NOT_READY
 };
 #endif

@@ -82,6 +82,14 @@ Data dictionary interface */
 #include "univ.i"  // Using OS_PATH_SEPARATOR
 #endif             /* !UNIV_HOTBACKUP */
 
+static inline const char *dd_vec_aux_name(const dict_table_t *table) {
+  const char *name =
+      (table != nullptr && table->name.m_name != nullptr) ? table->name.m_name
+                                                          : nullptr;
+  return (name != nullptr && strstr(name, "/I_VEC_") != nullptr) ? name
+                                                                 : nullptr;
+}
+
 const char *DD_instant_col_val_coder::encode(const byte *stream, size_t in_len,
                                              size_t *out_len) {
   cleanup();
@@ -859,6 +867,12 @@ reopen:
 
   ut_ad(dict_locked == dict_sys_mutex_own());
 
+  if (const char *aux_name = dd_vec_aux_name(ib_table)) {
+    ib::warn() << "VECREF: dd_table_open_on_id '" << aux_name
+               << "' ref=" << ib_table->get_ref_count()
+               << " table_id=" << table_id;
+  }
+
   return ib_table;
 }
 
@@ -979,6 +993,10 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
 
   if (table != nullptr) {
     table->acquire();
+    if (const char *aux_name = dd_vec_aux_name(table)) {
+      ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
+                 << "' ref=" << table->get_ref_count();
+    }
     return table;
   }
 
@@ -1021,6 +1039,10 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
 
   if (table != nullptr) {
     table->acquire_with_lock();
+    if (const char *aux_name = dd_vec_aux_name(table)) {
+      ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
+                 << "' ref=" << table->get_ref_count();
+    }
     if (!dict_locked) {
       dict_sys_mutex_exit();
     }
@@ -1096,6 +1118,11 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
 
   if (dict_locked) {
     dict_sys_mutex_enter();
+  }
+
+  if (const char *aux_name = dd_vec_aux_name(table)) {
+    ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
+               << "' ref=" << table->get_ref_count();
   }
 
   return table;
@@ -2994,6 +3021,10 @@ template const dict_index_t *dd_find_index<dd::Partition_index>(
     ut_ad(!table->is_intrinsic());
     type = DICT_FTS;
     n_uniq = 0;
+  } else if ((key.flags & HA_VECINDEX) ||
+             (dd_index->type() == dd::Index::IT_VECINDEX) ||
+             (dd_index->algorithm() == dd::Index::IA_VECINDEX)) {
+    type = DICT_VECINDEX;
   } else if (key_num == form->primary_key) {
     ut_ad(key.flags & HA_NOSAME);
     ut_ad(n_uniq > 0);
@@ -3087,6 +3118,10 @@ template const dict_index_t *dd_find_index<dd::Partition_index>(
       fts_cache_index_cache_create(table, index);
       rw_lock_x_unlock(&table->fts->cache->init_lock);
     }
+  }
+
+  if (index->type & DICT_VECINDEX) {
+    DICT_TF2_FLAG_SET(table, DICT_TF2_VECINDEX);
   }
 
   if (strcmp(index->name, FTS_DOC_ID_INDEX_NAME) == 0) {
@@ -5232,6 +5267,9 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
     if (root == FIL_NULL && !(index->type & DICT_FTS) &&
         !dict_table_is_discarded(m_table)) {
       index->type |= DICT_VECINDEX;
+      if (!dict_table_has_vec_index(m_table)) {
+        DICT_TF2_FLAG_SET(m_table, DICT_TF2_VECINDEX);
+      }
     }
     ut_ad(index->type & DICT_FTS || index->type & DICT_VECINDEX ||
           root != FIL_NULL || dict_table_is_discarded(m_table));
@@ -6463,7 +6501,7 @@ static bool dd_get_or_assign_fts_tablespace_id(const dict_table_t *parent_table,
 @param[in]      table           dict table instance */
 void dd_set_vec_table_options(dd::Table *dd_table, const dict_table_t *table) {
   dd_table->set_engine(innobase_hton_name);
-  //dd_table->set_hidden(dd::Abstract_table::HT_HIDDEN_SE);
+  // dd_table->set_hidden(dd::Abstract_table::HT_HIDDEN_SE);
   dd_table->set_collation_id(my_charset_bin.number);
 
   dd::Table::enum_row_format row_format = dd::Table::RF_DYNAMIC;
@@ -6888,6 +6926,58 @@ bool dd_drop_fts_table(const char *name, bool file_per_table) {
      * table is file-per-table. In this case we obviously don't want to
      * drop the tablespace.
      */
+    if (dd_space_id != dict_sys_t::s_dd_sys_space_id) {
+      bool error = dd_drop_tablespace(client, dd_space_id);
+      ut_a(!error);
+    }
+  }
+
+  if (client->drop(dd_table)) {
+    return false;
+  }
+
+  return true;
+}
+
+/** Drop dd table & tablespace for vec aux table
+@param[in]      name            table name
+@param[in]      file_per_table  flag whether use file per table
+@return true on success, false on failure. */
+bool dd_drop_vec_table(const char *name, bool file_per_table) {
+  std::string db_name;
+  std::string table_name;
+
+  dict_name::get_table(name, db_name, table_name);
+
+  THD *thd = current_thd;
+  dd::Schema_MDL_locker mdl_locker(thd);
+  dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
+  dd::cache::Dictionary_client::Auto_releaser releaser(client);
+
+  MDL_ticket *mdl_ticket = nullptr;
+  if (dd::acquire_exclusive_table_mdl(thd, db_name.c_str(), table_name.c_str(),
+                                      false, &mdl_ticket)) {
+    ib::warn()<<"Failed to acquire MDL lock for dropping table "
+             << db_name << "." << table_name;
+    return false;
+  }
+
+  const dd::Table *dd_table = nullptr;
+  if (client->acquire<dd::Table>(db_name.c_str(), table_name.c_str(),
+                                 &dd_table)) {
+    ib::warn()<<"Failed to acquire DD table object for dropping table "
+             << db_name << "." << table_name;
+    return false;
+  }
+
+  if (dd_table == nullptr) {
+    ib::warn() << "DD drop: table not found, treat as already dropped: "
+               << db_name << "." << table_name;
+    return true;
+  }
+
+  if (file_per_table) {
+    dd::Object_id dd_space_id = (*dd_table->indexes().begin())->tablespace_id();
     if (dd_space_id != dict_sys_t::s_dd_sys_space_id) {
       bool error = dd_drop_tablespace(client, dd_space_id);
       ut_a(!error);

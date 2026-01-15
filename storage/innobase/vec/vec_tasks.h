@@ -17,7 +17,8 @@ struct vec_index_segment_t;
 class THD;
 
 struct VecBuildTask {
-  dict_index_t* index{nullptr};
+  table_id_t table_id{0};
+  space_index_t index_id{0};
 };
 
 class VecTaskManager {

@@ -1934,6 +1934,10 @@ loading the index definition */
       DICT_TF2_FLAG_SET(table, DICT_TF2_FTS);
     }
 
+    if (index->type & DICT_VECINDEX && !dict_table_has_vec_index(table)) {
+      DICT_TF2_FLAG_SET(table, DICT_TF2_VECINDEX);
+    }
+
     /* We check for unsupported types first, so that the
     subsequent checks are relevant for the supported types. */
     if (index->type & ~(DICT_CLUSTERED | DICT_UNIQUE | DICT_CORRUPT | DICT_FTS |

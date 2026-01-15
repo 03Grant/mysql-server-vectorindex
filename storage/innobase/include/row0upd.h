@@ -35,6 +35,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #define row0upd_h
 
 #include <stack>
+#include <vector>
 #include "btr0types.h"
 #include "data0data.h"
 #include "dict0types.h"
@@ -43,6 +44,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "table.h"
 #include "trx0types.h"
 #include "univ.i"
+#include "storage/innobase/vec/vec_txn_buf.h"
 
 #include "btr0pcur.h"
 #ifndef UNIV_HOTBACKUP
@@ -707,9 +709,34 @@ inline std::ostream &operator<<(std::ostream &out, const Binary_diff_vector &) {
 }
 #endif /* UNIV_DEBUG */
 
+inline bool vec_update_changes_pk_fields(const upd_t *update,
+                                         ulint pk_fields) {
+  if (update == nullptr || pk_fields == 0) {
+    return false;
+  }
+
+  const ulint n_fields = upd_get_n_fields(update);
+  for (ulint i = 0; i < n_fields; ++i) {
+    const upd_field_t *upd_field = upd_get_nth_field(update, i);
+    if (upd_field == nullptr || upd_fld_is_virtual_col(upd_field)) {
+      continue;
+    }
+    if (upd_field->field_no < pk_fields) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 #ifndef UNIV_HOTBACKUP
 /* Update node structure which also implements the delete operation
 of a row */
+
+struct vec_update_entry_t {
+  dict_index_t *index{nullptr};
+  std::vector<float> vec;
+};
 
 struct upd_node_t {
   que_common_t common; /*!< node type: QUE_NODE_UPDATE */
@@ -767,6 +794,15 @@ struct upd_node_t {
                        to NULL after a successful update */
   row_ext_t *ext;      /*!< NULL, or prefixes of the externally
                        stored columns in the old row */
+  /* Cached PK snapshot for vector-index delete path (outlives heap). */
+  std::vector<vec_pk_column_t> vec_delete_pk_columns;
+  ulint vec_delete_pk_fields{0};
+  /* Cached PK snapshots for vector-index update path (outlives heap). */
+  std::vector<vec_pk_column_t> vec_update_old_pk_columns;
+  std::vector<vec_pk_column_t> vec_update_new_pk_columns;
+  ulint vec_update_pk_fields{0};
+  std::vector<vec_update_entry_t> vec_update_vecs;
+  bool vec_update_vec_capture_failed{false};
   dtuple_t *upd_row;   /* NULL, or a copy of the updated row */
   row_ext_t *upd_ext;  /* NULL, or prefixes of the externally
                        stored columns in upd_row */
