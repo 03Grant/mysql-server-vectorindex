@@ -12,6 +12,7 @@
 #include <omp.h>
 
 #include <cstring>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -91,8 +92,15 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
 
 
   auto* ctx = index->vec_runtime;
-  vec_index_segment_t* seg = ctx ? ctx->mutable_segment() : nullptr;
-  if (!ctx || !ctx->inited || seg == nullptr || !seg->index) {
+  if (!ctx || !ctx->inited) {
+    ib::warn() << "VECINDEX: runtime context missing for index "
+               << (index->name ? index->name : "(null)");
+    return DB_ERROR;
+  }
+
+  std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+  vec_index_segment_t* seg = ctx->mutable_segment();
+  if (seg == nullptr || !seg->index) {
     ib::warn() << "VECINDEX: runtime context missing for index " << (index->name ? index->name : "(null)");
     return DB_ERROR;
   }
@@ -120,7 +128,7 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
   std::vector<int64_t> allocated_ids(k);
   {
     ScopedVecThreads guard(index->vec_params);
-    std::lock_guard<std::mutex> g(ctx->mu);
+    std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
     start = static_cast<int64_t>(flat->ntotal()); // 现有向量数
     for (size_t i = 0; i < k; ++i) {
       allocated_ids[i] = start + static_cast<int64_t>(i);
@@ -154,10 +162,14 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
       return last_err;
     }
 
-    dberr_t cache_err =
-        vec_insert_aux_cache(&seg->vid_pk_mapping, clust_index, faiss_id,
-                             it.pk_columns);
-    seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
+    // TODO write cache first, reduce lock time.
+    dberr_t cache_err = DB_SUCCESS;
+    {
+      std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+      cache_err = vec_insert_aux_cache(&seg->vid_pk_mapping, clust_index,
+                                       faiss_id, it.pk_columns);
+      seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
+    }
     if (cache_err != DB_SUCCESS) {
       ib::warn() << "VECINDEX: failed to insert aux cache entry for index "
                  << (index->name ? index->name : "(null)")
@@ -365,7 +377,7 @@ void vec_on_trx_rollback(trx_t* trx) {
       continue;
     }
 
-    std::lock_guard<std::mutex> idx_lock(vec_ctx->mu);
+    std::lock_guard<std::shared_mutex> idx_lock(vec_ctx->mu);
     vec_index_segment_t* seg = nullptr;
     for (auto& s : vec_ctx->segments) {
       if (s.vecindex_id == it->segment_id) {

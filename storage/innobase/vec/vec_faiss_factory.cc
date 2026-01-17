@@ -47,14 +47,33 @@ class FaissVectorIndex : public IVectorIndex {
   }
 
   void search(size_t nq, const float* xq, size_t k,
-              int64_t* out_ids, float* out_distances) const override {
+              int64_t* out_ids, float* out_distances,
+              const VecRuntimeSearchParams* params) const override {
     if (!index_) return;
+    const faiss::SearchParameters* search_params = nullptr;
+    faiss::SearchParametersIVF ivf_params;
+    faiss::SearchParametersHNSW hnsw_params;
+
+    if (params != nullptr) {
+      if (params->nprobe.has_value()) {
+        if (dynamic_cast<faiss::IndexIVF*>(index_.get()) != nullptr) {
+          ivf_params.nprobe = *params->nprobe;
+          search_params = &ivf_params;
+        }
+      }
+      if (params->ef_search.has_value()) {
+        if (dynamic_cast<faiss::IndexHNSW*>(index_.get()) != nullptr) {
+          hnsw_params.efSearch = *params->ef_search;
+          search_params = &hnsw_params;
+        }
+      }
+    }
     if constexpr (std::is_same_v<faiss::idx_t, int64_t>) {
       index_->search(nq, xq, k, out_distances,
-                     reinterpret_cast<faiss::idx_t*>(out_ids));
+                     reinterpret_cast<faiss::idx_t*>(out_ids), search_params);
     } else {
       std::vector<faiss::idx_t> tmp_ids(nq * k);
-      index_->search(nq, xq, k, out_distances, tmp_ids.data());
+      index_->search(nq, xq, k, out_distances, tmp_ids.data(), search_params);
       for (size_t i = 0; i < nq * k; ++i) {
         out_ids[i] = static_cast<int64_t>(tmp_ids[i]);
       }

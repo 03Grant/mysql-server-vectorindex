@@ -867,11 +867,11 @@ reopen:
 
   ut_ad(dict_locked == dict_sys_mutex_own());
 
-  if (const char *aux_name = dd_vec_aux_name(ib_table)) {
-    ib::warn() << "VECREF: dd_table_open_on_id '" << aux_name
-               << "' ref=" << ib_table->get_ref_count()
-               << " table_id=" << table_id;
-  }
+  // if (const char *aux_name = dd_vec_aux_name(ib_table)) {
+  //   ib::warn() << "VECREF: dd_table_open_on_id '" << aux_name
+  //              << "' ref=" << ib_table->get_ref_count()
+  //              << " table_id=" << table_id;
+  // }
 
   return ib_table;
 }
@@ -993,10 +993,10 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
 
   if (table != nullptr) {
     table->acquire();
-    if (const char *aux_name = dd_vec_aux_name(table)) {
-      ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
-                 << "' ref=" << table->get_ref_count();
-    }
+    // if (const char *aux_name = dd_vec_aux_name(table)) {
+    //   ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
+    //              << "' ref=" << table->get_ref_count();
+    // }
     return table;
   }
 
@@ -1039,10 +1039,10 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
 
   if (table != nullptr) {
     table->acquire_with_lock();
-    if (const char *aux_name = dd_vec_aux_name(table)) {
-      ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
-                 << "' ref=" << table->get_ref_count();
-    }
+    // if (const char *aux_name = dd_vec_aux_name(table)) {
+    //   ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
+    //              << "' ref=" << table->get_ref_count();
+    // }
     if (!dict_locked) {
       dict_sys_mutex_exit();
     }
@@ -1120,10 +1120,10 @@ dict_table_t *dd_table_open_on_name(THD *thd, MDL_ticket **mdl,
     dict_sys_mutex_enter();
   }
 
-  if (const char *aux_name = dd_vec_aux_name(table)) {
-    ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
-               << "' ref=" << table->get_ref_count();
-  }
+  // if (const char *aux_name = dd_vec_aux_name(table)) {
+  //   ib::warn() << "VECREF: dd_table_open_on_name '" << aux_name
+  //              << "' ref=" << table->get_ref_count();
+  // }
 
   return table;
 }

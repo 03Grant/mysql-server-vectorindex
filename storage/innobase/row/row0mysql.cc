@@ -43,6 +43,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <new>
 #include <vector>
 #include <mutex>
+#include <shared_mutex>
 #include <limits>
 #include <utility>
 
@@ -2126,7 +2127,7 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
     };
     std::vector<SegInfo> candidates;
     {
-      std::lock_guard<std::mutex> lock(ctx->mu);
+      std::shared_lock<std::shared_mutex> lock(ctx->mu);
       const std::string prefix =
           ctx->index_name_prefix.empty() ? vec_aux_prefix(vec_index)
                                          : ctx->index_name_prefix;
@@ -2177,10 +2178,11 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
     }
 
     {
-      std::lock_guard<std::mutex> lock(ctx->mu);
+      std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
       ib::warn() << "VEC Del: vec_index mark bitmap.";
       vec_index_segment_t *seg = vec_find_segment(ctx, target_seg_id);
       if (seg != nullptr) {
+        std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
         const bool old_val =
             seg->vecindex_bitmap.is_marked(static_cast<size_t>(target_vid));
         seg->vecindex_bitmap.set(static_cast<size_t>(target_vid), true);
@@ -2480,7 +2482,7 @@ static dberr_t row_vecindex_update(row_prebuilt_t *prebuilt) {
 
     std::string aux_name;
     if (ctx != nullptr) {
-      std::lock_guard<std::mutex> lock(ctx->mu);
+      std::shared_lock<std::shared_mutex> lock(ctx->mu);
       const std::string prefix =
           ctx->index_name_prefix.empty() ? vec_aux_prefix(vec_index)
                                          : ctx->index_name_prefix;

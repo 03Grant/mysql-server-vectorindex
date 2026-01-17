@@ -25,6 +25,7 @@
 #include <string>
 #include <algorithm>
 #include <limits>
+#include <shared_mutex>
 
 struct dict_index_t;
 
@@ -226,8 +227,8 @@ dberr_t vec_open_aux_table(dict_index_t *idx) {
                  << "' is not available in dictionary cache";
       return DB_FAIL;
     }
-    ib::warn() << "VECREF: open aux dict table '" << aux_name
-               << "' ref=" << aux_table->get_ref_count();
+    // ib::warn() << "VECREF: open aux dict table '" << aux_name
+    //            << "' ref=" << aux_table->get_ref_count();
     mutable_seg->aux_dict_table = aux_table;
     mutable_seg->aux_table_name = aux_name;
   } else if (mutable_seg->aux_table_name.empty()) {
@@ -422,7 +423,7 @@ bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
 bool vec_drop_index(vec_index_ctx_t& ctx, size_t seg_idx, bool allow_drop_mutable){
   ib::warn() << "VECINDEX: vec_drop_index enter seg_idx=" << seg_idx
              << " allow_drop_mutable=" << allow_drop_mutable;
-  std::lock_guard<std::mutex> lk(ctx.mu);
+  std::lock_guard<std::shared_mutex> lk(ctx.mu);
   if (seg_idx >= ctx.segments.size()) return false;
   if (seg_idx == 0 && !allow_drop_mutable) return false;
 
@@ -462,7 +463,7 @@ void vec_destroy(vec_index_ctx_t* ctx) {
 }
 
 int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n) {
-  std::lock_guard<std::mutex> lk(ctx.mu);
+  std::lock_guard<std::shared_mutex> lk(ctx.mu);
   vec_index_segment_t *seg = ctx.mutable_segment();
   if (!ctx.inited || seg == nullptr || !seg->index) return -1;
   // 假设 dim 匹配，由你在外面保证；FAISS 可能会抛异常，后续你可以做 try/catch
@@ -471,7 +472,7 @@ int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n) {
 }
 
 int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n){
-  std::lock_guard<std::mutex> lk(ctx.mu);
+  std::lock_guard<std::shared_mutex> lk(ctx.mu);
   vec_index_segment_t *seg = ctx.mutable_segment();
   if (!ctx.inited || seg == nullptr || !seg->index) return -1;
 
@@ -486,9 +487,10 @@ static inline bool is_min_better(const vec_params_t& params) {
 
 int vec_search(vec_index_ctx_t& ctx,
                const float* q, size_t nq, size_t k,
-               float* D_out, int64_t* I_out, uint32_t* S_out)
+               float* D_out, int64_t* I_out, uint32_t* S_out,
+               const VecRuntimeSearchParams* params)
 {
-  std::lock_guard<std::mutex> lk(ctx.mu);
+  std::shared_lock<std::shared_mutex> ctx_lock(ctx.mu);
   if (!ctx.inited || ctx.segments.empty()) return -1;
 
   const bool prefer_small = is_min_better(ctx.params);
@@ -513,6 +515,7 @@ int vec_search(vec_index_ctx_t& ctx,
       auto& seg_meta = ctx.segments[s];
       auto* seg = seg_meta.index.get();
       if (!seg) continue;
+      std::shared_lock<std::shared_mutex> seg_lock(*seg_meta.rw_lock);
       const uint32_t seg_id =
           seg_meta.vecindex_id != 0 ? seg_meta.vecindex_id
                                     : static_cast<uint32_t>(s);
@@ -520,7 +523,7 @@ int vec_search(vec_index_ctx_t& ctx,
       std::vector<float>  D(k);
       std::vector<int64_t> I(k);
 
-      seg->search(1, qvec, k, I.data(), D.data());
+      seg->search(1, qvec, k, I.data(), D.data(), params);
 
       // 过滤掉无效 id（Faiss 可能返回 -1 表示候选不足）
       for (size_t t = 0; t < k; ++t) {

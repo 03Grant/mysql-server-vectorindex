@@ -9,6 +9,7 @@
 
 struct vec_index_ctx_t;
 struct dict_index_t;
+struct VecRuntimeSearchParams;
 class THD;
 struct TABLE;
 class handler;
@@ -42,4 +43,5 @@ int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   
 int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n);
 
 int vec_search(vec_index_ctx_t& ctx, const float* q, size_t nq,
-           size_t k, float* distances, int64_t* labels, uint32_t* segments);                   // 召回
+           size_t k, float* distances, int64_t* labels, uint32_t* segments,
+           const VecRuntimeSearchParams* params = nullptr);                   // 召回

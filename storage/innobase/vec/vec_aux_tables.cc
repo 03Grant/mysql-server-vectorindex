@@ -239,7 +239,8 @@ static std::string vec_aux_suffix_from_full(const std::string& full_name) {
 std::string vec_aux_active_name(const dict_index_t* index) {
   if (index != nullptr && index->vec_runtime != nullptr) {
     vec_index_ctx_t* ctx = index->vec_runtime;
-    std::lock_guard<std::mutex> lk(ctx->mu);
+    // unique lock?
+    std::shared_lock<std::shared_mutex> lk(ctx->mu);
     if (auto* seg = ctx->mutable_segment(); seg != nullptr) {
       if (!seg->aux_table_name.empty()) {
         return seg->aux_table_name;
@@ -1561,7 +1562,7 @@ static dberr_t vec_create_one_index_dd_tables(const dict_index_t* index)
   // Should receive name in parameter?
   std::string full_name;
   if (index->vec_runtime != nullptr) {
-    std::lock_guard<std::mutex> lk(index->vec_runtime->mu);
+    std::lock_guard<std::shared_mutex> lk(index->vec_runtime->mu);
     if (!index->vec_runtime->pending_aux_name.empty()) {
       full_name = index->vec_runtime->pending_aux_name;
     }
@@ -2069,7 +2070,7 @@ bool vec_collect_drop_resources(dict_table_t* table,
     if ((info.seg_names.empty() || info.segment_files.empty()) &&
         index->vec_runtime != nullptr) {
       vec_index_ctx_t* ctx = index->vec_runtime;
-      std::lock_guard<std::mutex> lk(ctx->mu);
+      std::lock_guard<std::shared_mutex> lk(ctx->mu);
       for (const auto& seg : ctx->segments) {
         if (!seg.immutable || seg.vecindex_id == 0) {
           continue;
@@ -2156,18 +2157,18 @@ static void vec_close_aux_dict_tables(vec_index_ctx_t* ctx) {
     if (table != nullptr) {
       const char* name =
           table->name.m_name != nullptr ? table->name.m_name : "(null)";
-      ib::warn() << "VECREF: before close aux dict table '" << name
-                 << "' ref=" << table->get_ref_count();
+      // ib::warn() << "VECREF: before close aux dict table '" << name
+      //            << "' ref=" << table->get_ref_count();
       const bool dict_locked = dict_sys_mutex_own();
       dd_table_close(table, nullptr, nullptr, dict_locked);
 
-      ib::warn() << "VECREF: after close aux dict table '" << name
-                 << "' ref=" << table->get_ref_count();
+      // ib::warn() << "VECREF: after close aux dict table '" << name
+      //            << "' ref=" << table->get_ref_count();
       table = nullptr;
     }
   };
 
-  std::lock_guard<std::mutex> lk(ctx->mu);
+  std::lock_guard<std::shared_mutex> lk(ctx->mu);
   for (auto& seg : ctx->segments) {
     close_table(seg.aux_dict_table);
   }

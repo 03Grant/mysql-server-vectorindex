@@ -411,7 +411,7 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
   }
 
   ib::warn() << "VECINDEX: function::vec_try_rotate_mem_index() 2 Trying to rotate mem index.";
-  std::unique_lock<std::mutex> lk(ctx->mu);
+  std::unique_lock<std::shared_mutex> lk(ctx->mu);
   vec_index_segment_t *mutable_seg = ctx->mutable_segment();
   if (mutable_seg == nullptr || mutable_seg->index == nullptr) {
     ib::warn() << "VECINDEX: function::vec_try_rotate_mem_index() No mutable segment found.";
@@ -474,13 +474,13 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
   fresh.immutable = false;
   fresh.aux_dict_table =
       dd_table_open_on_name_in_mem(new_mem_name.c_str(), false);
-  if (fresh.aux_dict_table != nullptr) {
-    ib::warn() << "VECREF: open fresh aux dict table '" << new_mem_name
-               << "' ref=" << fresh.aux_dict_table->get_ref_count();
-  } else {
-    ib::warn() << "VECREF: failed to open fresh aux dict table '"
-               << new_mem_name << "'";
-  }
+  // if (fresh.aux_dict_table != nullptr) {
+  //   ib::warn() << "VECREF: open fresh aux dict table '" << new_mem_name
+  //              << "' ref=" << fresh.aux_dict_table->get_ref_count();
+  // } else {
+  //   ib::warn() << "VECREF: failed to open fresh aux dict table '"
+  //              << new_mem_name << "'";
+  // }
   fresh.vecindex_bitmap.clear();
 
   if (!ctx->segments.empty()) {
@@ -494,8 +494,8 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
         ctx->pending_aux_dict->name.m_name != nullptr
             ? ctx->pending_aux_dict->name.m_name
             : "(null)";
-    ib::warn() << "VECREF: close pending aux dict table '" << pending_name
-               << "' ref=" << ctx->pending_aux_dict->get_ref_count();
+    // ib::warn() << "VECREF: close pending aux dict table '" << pending_name
+    //            << "' ref=" << ctx->pending_aux_dict->get_ref_count();
     dd_table_close(ctx->pending_aux_dict, nullptr, nullptr, false);
     ctx->pending_aux_dict = nullptr;
   }
@@ -749,7 +749,7 @@ bool vec_rotate_mem_index_bg(table_id_t table_id, space_index_t index_id) {
   if (rotated) {
     vec_index_segment_t* staging_seg = nullptr;
     {
-      std::lock_guard<std::mutex> lk(ctx->mu);
+      std::lock_guard<std::shared_mutex> lk(ctx->mu);
       if (!ctx->segments.empty()) {
         staging_seg = &ctx->segments.back();
       }
@@ -1058,7 +1058,7 @@ bool vec_prepare_pending_mem_table(dict_index_t *index) {
 
   vec_index_ctx_t *ctx = index->vec_runtime;
 
-  std::unique_lock<std::mutex> lk(ctx->mu);
+  std::unique_lock<std::shared_mutex> lk(ctx->mu);
 
   const std::string prefix =
       ctx->index_name_prefix.empty() ? vec_aux_prefix(index)
@@ -1135,10 +1135,10 @@ bool vec_prepare_pending_mem_table(dict_index_t *index) {
     hold = dd_table_open_on_name(thd, nullptr, pending_name.c_str(), false,
                                  DICT_ERR_IGNORE_NONE);
   }
-  if (hold != nullptr) {
-    ib::warn() << "VECREF: hold pending aux dict table '" << pending_name
-               << "' ref=" << hold->get_ref_count();
-  }
+  // if (hold != nullptr) {
+  //   ib::warn() << "VECREF: hold pending aux dict table '" << pending_name
+  //              << "' ref=" << hold->get_ref_count();
+  // }
 
   lk.lock();
   ctx->pending_aux_name = pending_name;
@@ -1679,7 +1679,7 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
   }
 
   {
-    std::lock_guard<std::mutex> lk(ctx->mu);
+    std::lock_guard<std::shared_mutex> lk(ctx->mu);
     seg->index->add(ids.size(), xb.data(), ids.data());
   }
 
@@ -1960,7 +1960,7 @@ class VecMetaLoader {
         const uint32_t seg_id = static_cast<uint32_t>(entry.seg_id);
 
         {
-          std::lock_guard<std::mutex> lk(ctx->mu);
+          std::lock_guard<std::shared_mutex> lk(ctx->mu);
           const bool exists = std::any_of(
               ctx->segments.begin(), ctx->segments.end(),
               [seg_id](const vec_index_segment_t &s) {
@@ -2023,7 +2023,7 @@ class VecMetaLoader {
           }
         }
 
-        std::lock_guard<std::mutex> lk(ctx->mu);
+        std::lock_guard<std::shared_mutex> lk(ctx->mu);
         const bool dup = std::any_of(
             ctx->segments.begin(), ctx->segments.end(),
             [seg_id](const vec_index_segment_t &s) {

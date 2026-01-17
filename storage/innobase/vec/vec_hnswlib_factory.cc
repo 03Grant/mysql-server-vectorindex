@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <omp.h>
 #include <vector>
 
@@ -19,6 +20,73 @@ std::unique_ptr<hnswlib::SpaceInterface<float>> make_space(const vec_params_t& p
     default:
       return std::make_unique<hnswlib::L2Space>(p.dim);
   }
+}
+
+static std::priority_queue<std::pair<float, hnswlib::labeltype>>
+hnsw_search_with_ef(const hnswlib::HierarchicalNSW<float>* index,
+                    const float* query_data, size_t k, size_t ef_search,
+                    hnswlib::BaseFilterFunctor* isIdAllowed = nullptr) {
+  std::priority_queue<std::pair<float, hnswlib::labeltype>> result;
+  if (index == nullptr ||
+      index->cur_element_count.load(std::memory_order_relaxed) == 0) {
+    return result;
+  }
+
+  hnswlib::tableint currObj = index->enterpoint_node_;
+  float curdist =
+      index->fstdistfunc_(query_data,
+                          index->getDataByInternalId(index->enterpoint_node_),
+                          index->dist_func_param_);
+
+  for (int level = index->maxlevel_; level > 0; --level) {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      unsigned int *data =
+          reinterpret_cast<unsigned int*>(index->get_linklist(currObj, level));
+      int size = index->getListCount(data);
+      index->metric_hops++;
+      index->metric_distance_computations += size;
+
+      hnswlib::tableint *datal =
+          reinterpret_cast<hnswlib::tableint*>(data + 1);
+      for (int i = 0; i < size; ++i) {
+        hnswlib::tableint cand = datal[i];
+        if (cand > index->max_elements_) {
+          throw std::runtime_error("cand error");
+        }
+        float d = index->fstdistfunc_(
+            query_data, index->getDataByInternalId(cand),
+            index->dist_func_param_);
+
+        if (d < curdist) {
+          curdist = d;
+          currObj = cand;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  const size_t ef = std::max(ef_search, k);
+  const bool bare_bone_search =
+      (index->num_deleted_.load(std::memory_order_relaxed) == 0) &&
+      (isIdAllowed == nullptr);
+  auto top_candidates = bare_bone_search
+                            ? index->searchBaseLayerST<true>(
+                                  currObj, query_data, ef, isIdAllowed)
+                            : index->searchBaseLayerST<false>(
+                                  currObj, query_data, ef, isIdAllowed);
+
+  while (top_candidates.size() > k) {
+    top_candidates.pop();
+  }
+  while (!top_candidates.empty()) {
+    std::pair<float, hnswlib::tableint> rez = top_candidates.top();
+    top_candidates.pop();
+    result.emplace(rez.first, index->getExternalLabel(rez.second));
+  }
+  return result;
 }
 
 class HnswlibVectorIndex : public IVectorIndex {
@@ -65,11 +133,18 @@ class HnswlibVectorIndex : public IVectorIndex {
   }
 
   void search(size_t nq, const float* xq, size_t k,
-              int64_t* out_ids, float* out_distances) const override {
+              int64_t* out_ids, float* out_distances,
+              const VecRuntimeSearchParams* params) const override {
     if (!index_ready()) return;
 
     const bool prefer_small = !(params_.metric_tag == VEC_M_IP ||
                                 params_.metric_tag == VEC_M_COSINE);
+    const size_t ef_search =
+        (params != nullptr && params->ef_search.has_value() &&
+         params->ef_search.value() > 0)
+            ? static_cast<size_t>(params->ef_search.value())
+            : 0;
+    const bool use_custom_ef = (kind_ == IndexKind::Hnsw && ef_search > 0);
 
     for (size_t qi = 0; qi < nq; ++qi) {
       float* Dq = out_distances + qi * k;
@@ -82,7 +157,11 @@ class HnswlibVectorIndex : public IVectorIndex {
         Iq[t] = -1;
       }
 
-      auto result = active_index()->searchKnn(xq + qi * params_.dim, k);
+      auto result = use_custom_ef
+                        ? hnsw_search_with_ef(
+                              hnsw_index_.get(), xq + qi * params_.dim, k,
+                              ef_search)
+                        : active_index()->searchKnn(xq + qi * params_.dim, k);
       size_t pos = result.size();
       while (!result.empty() && pos > 0) {
         auto [dist, label] = result.top();

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 #include "vec_id_alloc.h"
@@ -100,6 +101,8 @@ struct vecindex_bitmap_t {
 
 // Runtime metadata for a single vector segment (mutable or immutable).
 struct vec_index_segment_t {
+  std::shared_ptr<std::shared_mutex> rw_lock{
+      std::make_shared<std::shared_mutex>()};
   std::unique_ptr<IVectorIndex> index;    // concrete vector index
   dict_table_t       *aux_dict_table{nullptr};  // cached aux dict object bound to this segment
   vid_pk_mapping_t    vid_pk_mapping;     // PK mapping aligned to faiss_ids for this segment
@@ -111,7 +114,7 @@ struct vec_index_segment_t {
 };
 
 struct vec_index_ctx_t {
-  std::mutex                mu;
+  std::shared_mutex         mu;
   // runtime handler, include one in_mem_index (segments[0]) and several immutable indexes.
   std::vector<vec_index_segment_t> segments;
   vec_id_allocator_t        id_alloc;       // monotonic id allocator for Faiss IDs

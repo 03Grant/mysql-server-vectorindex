@@ -23,7 +23,8 @@ public:
   virtual void add(size_t n, const float* xb, const int64_t* ids) = 0;
 
   virtual void search(size_t nq, const float* xq, size_t k,
-                      int64_t* out_ids, float* out_distances) const = 0;
+                      int64_t* out_ids, float* out_distances,
+                      const VecRuntimeSearchParams* params) const = 0;
 
   virtual void save(const std::string& path) const = 0;
   virtual void load(const std::string& path) = 0;

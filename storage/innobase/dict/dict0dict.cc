@@ -507,10 +507,10 @@ void dict_table_close(dict_table_t *table, bool dict_locked, bool try_drop) {
                 << " try_drop=" << try_drop << " table_ptr=" << table;
   }
   ut_a(table->get_ref_count() > 0);
-  if (const char *aux_name = dict_vec_aux_name(table)) {
-    ib::warn() << "VECREF: dict_table_close '" << aux_name
-               << "' ref=" << table->get_ref_count();
-  }
+  // if (const char *aux_name = dict_vec_aux_name(table)) {
+  //   ib::warn() << "VECREF: dict_table_close '" << aux_name
+  //              << "' ref=" << table->get_ref_count();
+  // }
 
 #ifndef UNIV_HOTBACKUP
 #ifdef UNIV_DEBUG
@@ -1134,10 +1134,10 @@ dict_table_t *dict_table_open_on_name(
 
   ut_ad(dict_lru_validate());
 
-  if (const char *aux_name = dict_vec_aux_name(table)) {
-    ib::warn() << "VECREF: dict_table_open_on_name '" << aux_name
-               << "' ref=" << table->get_ref_count();
-  }
+  // if (const char *aux_name = dict_vec_aux_name(table)) {
+  //   ib::warn() << "VECREF: dict_table_open_on_name '" << aux_name
+  //              << "' ref=" << table->get_ref_count();
+  // }
 
   if (!dict_locked) {
     dict_table_try_drop_aborted_and_mutex_exit(table, try_drop);

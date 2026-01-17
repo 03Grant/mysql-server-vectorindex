@@ -11456,22 +11456,6 @@ bool parse_vec_search_options(const uchar *options, size_t options_len,
   return true;
 }
 
-void apply_vec_search_runtime_options(vec_index_ctx_t *ctx,
-                                      const VecSearchOptions &opts) {
-  if (ctx == nullptr) {
-    return;
-  }
-
-  std::lock_guard<std::mutex> guard(ctx->mu);
-  VecRuntimeSearchParams params;
-  if (opts.has_nprobe) params.nprobe = opts.nprobe;
-  if (opts.has_ef_search) params.ef_search = opts.ef_search;
-
-  for (auto &seg : ctx->segments) {
-    if (seg.index) seg.index->set_search_params(params);
-  }
-}
-
 }  // namespace
 
 int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
@@ -11545,7 +11529,16 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
   //            << ", nprobe=" << parsed_options.nprobe
   //            << ", efSearch=" << parsed_options.ef_search;
 
-  apply_vec_search_runtime_options(ctx, parsed_options);
+  VecRuntimeSearchParams runtime_params{};
+  const VecRuntimeSearchParams *runtime_ptr = nullptr;
+  if (parsed_options.has_nprobe) {
+    runtime_params.nprobe = parsed_options.nprobe;
+    runtime_ptr = &runtime_params;
+  }
+  if (parsed_options.has_ef_search) {
+    runtime_params.ef_search = parsed_options.ef_search;
+    runtime_ptr = &runtime_params;
+  }
 
   std::vector<float> distances(top_k);
   std::vector<int64_t> labels(top_k);
@@ -11554,7 +11547,7 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
   const float *query_vec = reinterpret_cast<const float *>(query);
   const int search_error =
       vec_search(*ctx, query_vec, 1, top_k, distances.data(), labels.data(),
-                 segments.data());
+                 segments.data(), runtime_ptr);
   if (search_error != 0) {
     ib::warn() << "Vector search failed with error code: " << search_error;
     return HA_ERR_INTERNAL_ERROR;
