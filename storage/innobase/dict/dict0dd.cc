@@ -7267,33 +7267,7 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
 
   vec_dd_add_index_elements(dd_pk, aux_pk, dd_cols);
 
-  // 4) 添加二级索引：u_faiss_id(faiss_id)（允许重复 -1 占位）
-  {
-    dd::Index* uk = dd_table->add_index();
-    uk->set_name("u_faiss_id");
-    uk->set_algorithm(dd::Index::IA_BTREE);
-    uk->set_algorithm_explicit(false);
-    uk->set_visible(true);
-    uk->set_type(dd::Index::IT_MULTIPLE);
-    uk->set_ordinal_position(2);
-   uk->set_generated(false);
-    uk->set_engine(dd_table->engine());
-    uk->options().set("flags", 0);
-
-    const dict_index_t *aux_unique =
-        dict_table_get_index_on_name(table, "u_faiss_id", true);
-    if (aux_unique == nullptr) {
-      aux_unique =
-          dict_table_get_index_on_name(table, "u_faiss_id", false);
-    }
-    if (aux_unique == nullptr) {
-      ib::warn() << "VECINDEX: missing u_faiss_id index on aux table "
-                 << table->name.m_name;
-      return false;
-    }
-
-    vec_dd_add_index_elements(uk, aux_unique, dd_cols);
-  }
+  // 4) u_faiss_id secondary index disabled.
 
   // 5) 确定/分配 dd_space_id（强烈建议复用 FTS helper：它涵盖各种空间情况）
   dd::Object_id dd_space_id = dd::INVALID_OBJECT_ID;

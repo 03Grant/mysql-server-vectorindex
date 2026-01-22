@@ -66,6 +66,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <algorithm>
 #include <iomanip>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 
 #include <sql_table.h>
@@ -11633,6 +11634,7 @@ static vec_index_segment_t *vec_find_segment(vec_index_ctx_t *ctx,
   if (ctx == nullptr) {
     return nullptr;
   }
+  std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
 
   for (auto &seg : ctx->segments) {
     if (seg.vecindex_id == segment_id) {
@@ -11760,15 +11762,26 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   dtuple_set_n_fields(tuple, clust_field_count);
   dtuple_set_n_fields_cmp(tuple, pk_field_count);
 
+  std::vector<unsigned char> pk_entry_copy;
   for (size_t i = 0; i < batch.size(); ++i) {
     const Vec_hit &hit = batch[i];
     vec_index_segment_t *seg =
         vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
 
-    if (seg == nullptr ||
-        !vec_aux_cache_bind_tuple(&seg->vid_pk_mapping,
-                                  static_cast<uint64_t>(hit.faiss_id),
-                                  clust_index, tuple)) {
+    bool bound = false;
+    {
+      std::shared_lock<std::shared_mutex> seg_lock;
+      if (seg != nullptr && seg->rw_lock) {
+        seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
+      }
+      if (seg != nullptr) {
+        bound = vec_aux_cache_bind_tuple_copy(&seg->vid_pk_mapping,
+                                              static_cast<uint64_t>(hit.faiss_id),
+                                              clust_index, tuple,
+                                              &pk_entry_copy);
+      }
+    }
+    if (!bound) {
       ib::warn() << "VECFETCH[c10] missing or corrupt cache entry for "
                  << "segment=" << hit.segment
                  << " faiss_id=" << hit.faiss_id;

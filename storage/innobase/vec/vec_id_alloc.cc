@@ -145,12 +145,16 @@ dberr_t vec_id_allocator_t::reserve(uint64_t k, uint64_t* start) {
 
 // ==================== 需要你打通的钩子（占位） ====================
 
-dberr_t vec_aux_select_max_id(trx_t* /*trx*/, dict_index_t* index, uint64_t* out_max, bool* empty) {
+dberr_t vec_aux_select_max_id(trx_t* /*trx*/, dict_index_t* index, uint64_t* out_max,
+                              bool* empty) {
   if (out_max == nullptr || index == nullptr || index->table == nullptr) {
     return DB_ERROR;
   }
 
   *out_max = 0;
+  if (empty != nullptr) {
+    *empty = true;
+  }
 
   const std::string aux_name = vec_aux_active_name(index);
   if (aux_name.empty()) {
@@ -169,10 +173,10 @@ dberr_t vec_aux_select_max_id(trx_t* /*trx*/, dict_index_t* index, uint64_t* out
   dict_index_t *faiss_uidx =
       dict_table_get_index_on_name(aux_table, "u_faiss_id");
   if (faiss_uidx == nullptr) {
-    ib::warn() << "VECINDEX: aux table '" << aux_name
-               << "' missing unique index u_faiss_id";
+    ib::warn() << "VECINDEX: u_faiss_id disabled; skip MAX(faiss_id) lookup for '"
+               << aux_name << "'";
     dict_table_close(aux_table, false, false);
-    return DB_ERROR;
+    return DB_SUCCESS;
   }
 
   uint64_t max_id = 0;
@@ -180,12 +184,11 @@ dberr_t vec_aux_select_max_id(trx_t* /*trx*/, dict_index_t* index, uint64_t* out
 
   dict_table_close(aux_table, false, false);
 
-  if (!found) {
-    *out_max = 0;
-    *empty = true;
-    return DB_SUCCESS;
+  if (found) {
+    *out_max = max_id;
+    if (empty != nullptr) {
+      *empty = false;
+    }
   }
-
-  *out_max = max_id;
   return DB_SUCCESS;
 }

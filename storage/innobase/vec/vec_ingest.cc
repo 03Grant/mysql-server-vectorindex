@@ -87,10 +87,6 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
     return DB_ERROR;
   }
 
-
-  // ib::warn() << "Step 1 vec_apply_bucket. ";
-
-
   auto* ctx = index->vec_runtime;
   if (!ctx || !ctx->inited) {
     ib::warn() << "VECINDEX: runtime context missing for index "
@@ -134,11 +130,33 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
       allocated_ids[i] = start + static_cast<int64_t>(i);
     }
     flat->add(k, xb.data(), allocated_ids.data()); // 内部分配 id: start..start+k-1
+    // Move cache here 1/20/2026
+    // To reduce times of acquire locks.
+
+    for(size_t i = 0; i < k; ++i){
+      const uint64_t faiss_id = static_cast<uint64_t>(allocated_ids[i]);
+      const vec_item_t& it = bucket.items[i];
+      // TODO write cache first, reduce lock time.
+      dberr_t cache_err = DB_SUCCESS;
+      
+        //std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+      cache_err = vec_insert_aux_cache(&seg->vid_pk_mapping, clust_index,
+                                      faiss_id, it.pk_columns);
+      seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
+      
+      if (cache_err != DB_SUCCESS) {
+        ib::warn() << "VECINDEX: failed to insert aux cache entry for index "
+                  << (index->name ? index->name : "(null)")
+                  << " faiss_id=" << faiss_id;
+        return cache_err;
+      }
+    }
+    seg->vid_pk_mapping.ready = true;
   }
   // ib::warn() << "Step 2 vec_apply_bucket. ";
 
-  // 3) 锁外写辅助表：把主键快照与 start+i 写入辅助表（与事务同生死）
-
+  // 3) 把主键快照与 start+i 写入辅助表
+  // 1/20/2026 改在锁内写辅助表
   vec_aux_mode_t aux_mode = bucket.aux_mode;
   if (aux_mode == vec_aux_mode_t::UNKNOWN) {
     aux_mode = vec_aux_mode_t::DIRECT_INSERT;
@@ -161,23 +179,7 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
                  << " error=" << last_err;
       return last_err;
     }
-
-    // TODO write cache first, reduce lock time.
-    dberr_t cache_err = DB_SUCCESS;
-    {
-      std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
-      cache_err = vec_insert_aux_cache(&seg->vid_pk_mapping, clust_index,
-                                       faiss_id, it.pk_columns);
-      seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
-    }
-    if (cache_err != DB_SUCCESS) {
-      ib::warn() << "VECINDEX: failed to insert aux cache entry for index "
-                 << (index->name ? index->name : "(null)")
-                 << " faiss_id=" << faiss_id;
-      return cache_err;
-    }
   }
-
   return DB_SUCCESS;
 }
 
@@ -232,7 +234,7 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
 
   DEBUG_SYNC_C("vec_aux_before_aux_commit");
   DBUG_EXECUTE_IF("crash_vec_aux_before_aux_commit", DBUG_SUICIDE(););
-
+  ib::warn() << "TEST_VEC_CONCUR: Trx_commit called!";
 
   if (owns_exec_trx) {
     if (last_err == DB_SUCCESS) {

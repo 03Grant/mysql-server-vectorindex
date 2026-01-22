@@ -1,5 +1,6 @@
 #include <sys/types.h>
 
+#include "db0err.h"
 #include "dict0dd.h"
 #include "dict0dict.h"
 #include "pars0pars.h"
@@ -9,9 +10,27 @@
 #include "vec_aux_tables.h"
 
 #include <algorithm>
+#include <chrono>
 #include <string>
+#include <thread>
 #include "current_thd.h"
 
+namespace {
+
+constexpr int kVecSqlLockWaitRetries = 2;
+constexpr std::chrono::milliseconds kVecSqlRetryBase{50};
+constexpr std::chrono::milliseconds kVecSqlRetryMax{500};
+
+std::chrono::milliseconds vec_lock_wait_backoff(int retry_index) {
+  const int shift = std::min(retry_index, 4);
+  auto sleep = kVecSqlRetryBase * (1 << shift);
+  if (sleep > kVecSqlRetryMax) {
+    sleep = kVecSqlRetryMax;
+  }
+  return sleep;
+}
+
+} // namespace
 
 /** Preamble to all SQL statements. */
 static const char *vec_sql_begin = "PROCEDURE P() IS\n";
@@ -58,12 +77,31 @@ dberr_t vec_eval_sql(trx_t* trx, que_t* graph) {
   ut_ad(graph != nullptr);
   ut_ad(trx != nullptr);               // 调用方负责提供事务
 
-  graph->trx = trx;                    // 用哪个事务执行
-  graph->fork_type = QUE_FORK_MYSQL_INTERFACE;
+  if (trx->error_state != DB_SUCCESS &&
+      trx->error_state != DB_LOCK_WAIT_TIMEOUT) {
+    return trx->error_state;
+  }
 
-  que_thr_t* thr = que_fork_start_command(graph);
-  ut_a(thr);                           // 入口线程必须建好
+  dberr_t err = DB_SUCCESS;
+  for (int retry = 0; retry <= kVecSqlLockWaitRetries; ++retry) {
+    if (retry > 0) {
+      std::this_thread::sleep_for(vec_lock_wait_backoff(retry - 1));
+    }
 
-  que_run_threads(thr);                // 同步执行直至完成/报错
-  return trx->error_state;             // 成败看事务的 error_state
+    trx->error_state = DB_SUCCESS;
+
+    graph->trx = trx;                  // 用哪个事务执行
+    graph->fork_type = QUE_FORK_MYSQL_INTERFACE;
+
+    que_thr_t* thr = que_fork_start_command(graph);
+    ut_a(thr);                         // 入口线程必须建好
+
+    que_run_threads(thr);              // 同步执行直至完成/报错
+    err = trx->error_state;
+    if (err != DB_LOCK_WAIT_TIMEOUT) {
+      break;
+    }
+  }
+
+  return err;                          // 成败看事务的 error_state
 }

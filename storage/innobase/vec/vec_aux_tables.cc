@@ -129,7 +129,11 @@ bool vec_aux_table_exists(const std::string& full_name) {
   if (full_name.empty()) return false;
   THD *thd = current_thd;
   MDL_ticket *mdl = nullptr;
+  #ifdef UNIV_DEBUG
   const bool dict_locked = dict_sys_mutex_own();
+#else
+  const bool dict_locked = false;
+#endif
   dict_table_t *t =
       dd_table_open_on_name_in_mem(full_name.c_str(), dict_locked);
   if (t == nullptr && thd != nullptr && !dict_locked) {
@@ -1637,6 +1641,59 @@ inline bool vec_cache_read_u32(const unsigned char *&p, size_t &remain,
   return true;
 }
 
+static bool vec_bind_tuple_from_entry(const unsigned char *data, size_t len,
+                                      dict_index_t *clust_index,
+                                      dtuple_t *tuple) {
+  if (data == nullptr || clust_index == nullptr || tuple == nullptr) {
+    return false;
+  }
+
+  const unsigned char *p = data;
+  size_t remain = len;
+
+  uint32_t num_cols = 0;
+  if (!vec_cache_read_u32(p, remain, num_cols)) {
+    return false;
+  }
+
+  const ulint expected = dict_index_get_n_unique(clust_index);
+  const ulint total_fields = clust_index->n_fields;
+  if (num_cols != expected) {
+    return false;
+  }
+
+  dtuple_set_n_fields(tuple, total_fields);
+  dtuple_set_n_fields_cmp(tuple, expected);
+
+  for (uint32_t i = 0; i < num_cols; ++i) {
+    uint32_t len_field = 0;
+    if (!vec_cache_read_u32(p, remain, len_field)) {
+      return false;
+    }
+
+    dfield_t *df = dtuple_get_nth_field(tuple, i);
+    if (len_field == std::numeric_limits<uint32_t>::max()) {
+      dfield_set_null(df);
+      continue;
+    }
+
+    if (remain < len_field) {
+      return false;
+    }
+
+    dfield_set_data(df, const_cast<unsigned char *>(p), len_field);
+    p += len_field;
+    remain -= len_field;
+  }
+
+  for (ulint i = num_cols; i < total_fields; ++i) {
+    dfield_t *df = dtuple_get_nth_field(tuple, i);
+    dfield_set_null(df);
+  }
+
+  return true;
+}
+
 static std::vector<unsigned char> vec_pack_pk_entry(
     const std::vector<vec_pk_column_t> &pk_columns, ulint pk_fields) {
   std::vector<unsigned char> packed;
@@ -1735,19 +1792,8 @@ dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
     cache->pk_values.resize(target + 1);
   }
   cache->pk_values[target] = std::move(packed);
-
-#if 0
-  // mem_diff remap disabled while MEM recovery assigns contiguous faiss_id.
-  if (cache->is_mem_diff) {
-    if (target >= cache->mem_diff.size()) {
-      cache->mem_diff.resize(target + 1, -1);
-    }
-    cache->mem_diff[target] =
-        static_cast<int64_t>(faiss_id) - static_cast<int64_t>(target);
-  }
-#endif
-
   cache->ready = true;
+
   return DB_SUCCESS;
 }
 
@@ -1765,77 +1811,38 @@ bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
   }
 
   size_t idx = static_cast<size_t>(faiss_id);
-#if 0
-  // mem_diff remap disabled while MEM recovery assigns contiguous faiss_id.
-  if (cache->is_mem_diff) {
-    if (faiss_id >
-        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-      return false;
-    }
-    if (idx >= cache->mem_diff.size()) {
-      ib::warn() << "VECINDEX: vec_aux_cache_bind_tuple faiss_id out of mem_diff bounds: " << faiss_id;
-      return false;
-    }
-    const int64_t diff = cache->mem_diff[idx];
-    if (diff < 0) {
-      return false;
-    }
-    const int64_t idx64 = static_cast<int64_t>(faiss_id) - diff;
-    if (idx64 < 0) {
-      return false;
-    }
-    idx = static_cast<size_t>(idx64);
-  }
-#endif
   if (idx >= cache->pk_values.size()) {
     return false;
   }
 
   const std::vector<unsigned char> &entry = cache->pk_values[idx];
-  const unsigned char *p = entry.data();
-  size_t remain = entry.size();
+  return vec_bind_tuple_from_entry(entry.data(), entry.size(), clust_index,
+                                   tuple);
+}
 
-  uint32_t num_cols = 0;
-  if (!vec_cache_read_u32(p, remain, num_cols)) {
+bool vec_aux_cache_bind_tuple_copy(const vid_pk_mapping_t *cache,
+                                   uint64_t faiss_id,
+                                   dict_index_t *clust_index, dtuple_t *tuple,
+                                   std::vector<unsigned char> *entry_copy) {
+  if (entry_copy == nullptr || cache == nullptr || clust_index == nullptr ||
+      tuple == nullptr || !cache->ready) {
     return false;
   }
 
-  const ulint expected = dict_index_get_n_unique(clust_index);
-  const ulint total_fields = clust_index->n_fields;
-  if (num_cols != expected) {
+  if (faiss_id >
+      static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
     return false;
   }
 
-  dtuple_set_n_fields(tuple, total_fields);
-  dtuple_set_n_fields_cmp(tuple, expected);
-
-  for (uint32_t i = 0; i < num_cols; ++i) {
-    uint32_t len = 0;
-    if (!vec_cache_read_u32(p, remain, len)) {
-      return false;
-    }
-
-    dfield_t *df = dtuple_get_nth_field(tuple, i);
-    if (len == std::numeric_limits<uint32_t>::max()) {
-      dfield_set_null(df);
-      continue;
-    }
-
-    if (remain < len) {
-      return false;
-    }
-
-    dfield_set_data(df, const_cast<unsigned char *>(p), len);
-    p += len;
-    remain -= len;
+  size_t idx = static_cast<size_t>(faiss_id);
+  if (idx >= cache->pk_values.size()) {
+    return false;
   }
 
-  for (ulint i = num_cols; i < total_fields; ++i) {
-    dfield_t *df = dtuple_get_nth_field(tuple, i);
-    dfield_set_null(df);
-  }
-
-  return true;
+  const std::vector<unsigned char> &entry = cache->pk_values[idx];
+  entry_copy->assign(entry.begin(), entry.end());
+  return vec_bind_tuple_from_entry(entry_copy->data(), entry_copy->size(),
+                                   clust_index, tuple);
 }
 
 
@@ -2159,7 +2166,11 @@ static void vec_close_aux_dict_tables(vec_index_ctx_t* ctx) {
           table->name.m_name != nullptr ? table->name.m_name : "(null)";
       // ib::warn() << "VECREF: before close aux dict table '" << name
       //            << "' ref=" << table->get_ref_count();
+#ifdef UNIV_DEBUG
       const bool dict_locked = dict_sys_mutex_own();
+#else
+      const bool dict_locked = false;
+#endif
       dd_table_close(table, nullptr, nullptr, dict_locked);
 
       // ib::warn() << "VECREF: after close aux dict table '" << name
@@ -2404,7 +2415,7 @@ dberr_t vec_create_index_dd_tables(dict_table_t *table) {
 /** 按“基表聚簇索引复制列定义”的规则创建一张 VEC 附属表。
     - 显式主键：逐列复制 mtype/prtype/len/列名，作为 PRIMARY KEY 列集
     - 无显式主键（GEN_CLUST_INDEX）：使用 row_id BIGINT UNSIGNED 作为 PRIMARY KEY
-    - 额外加一列：faiss_id BIGINT UNSIGNED UNIQUE
+    - 额外加一列：faiss_id BIGINT UNSIGNED
     - 表的 flags 继承自基表（行格式/压缩策略一致）
   @return 成功返回新表指针；失败返回 nullptr（并设置 trx->error_state） */
 static dict_table_t* vec_create_one_index_table_pk_compatible(
@@ -2559,28 +2570,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     }
   }
 
-  // 8) 建二级索引：u_faiss_id(faiss_id)
-  {
-    dict_index_t* uk = dict_mem_index_create(
-        full_name.c_str(),
-        "u_faiss_id",
-        new_table->space,
-        0,
-        1);
-    uk->add_field("faiss_id", 0, true);
-
-    trx_dict_op_t saved = trx_get_dict_operation(trx);
-    err = row_create_index_for_mysql(uk, trx, nullptr, nullptr);
-    trx->dict_operation = saved;
-
-    if (err != DB_SUCCESS) {
-      ib::warn() << "VECINDEX: create unique index u_faiss_id on " << full_name
-                 << " failed, err=" << (int)err;
-      trx->error_state = err;
-      mem_heap_free(heap);
-      return nullptr;
-    }
-  }
+  // 8) u_faiss_id secondary index disabled (faiss_id is non-indexed).
   
   mem_heap_free(heap);
   return new_table;

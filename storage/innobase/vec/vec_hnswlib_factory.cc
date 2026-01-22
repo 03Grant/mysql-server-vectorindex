@@ -157,11 +157,16 @@ class HnswlibVectorIndex : public IVectorIndex {
         Iq[t] = -1;
       }
 
+      const size_t count = current_count();
+      if (count == 0) {
+        continue;
+      }
+      const size_t k_use = std::min(k, count);
       auto result = use_custom_ef
                         ? hnsw_search_with_ef(
-                              hnsw_index_.get(), xq + qi * params_.dim, k,
+                              hnsw_index_.get(), xq + qi * params_.dim, k_use,
                               ef_search)
-                        : active_index()->searchKnn(xq + qi * params_.dim, k);
+                        : active_index()->searchKnn(xq + qi * params_.dim, k_use);
       size_t pos = result.size();
       while (!result.empty() && pos > 0) {
         auto [dist, label] = result.top();

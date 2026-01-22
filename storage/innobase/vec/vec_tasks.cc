@@ -7,6 +7,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <shared_mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -617,10 +618,16 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
   std::vector<float> xb;
   std::vector<int64_t> ids;
   const size_t dim = ctx->params.dim;
-  if (dim == 0 || !vec_dump_segment(seg, dim, xb, ids)) {
-    clear_build_flag();
-    ib::warn() << "VECINDEX: function::vec_bg_build_task() Failed to dump segment data.";
-    return;
+  {
+    std::shared_lock<std::shared_mutex> seg_lock;
+    if (seg->rw_lock) {
+      seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
+    }
+    if (dim == 0 || !vec_dump_segment(seg, dim, xb, ids)) {
+      clear_build_flag();
+      ib::warn() << "VECINDEX: function::vec_bg_build_task() Failed to dump segment data.";
+      return;
+    }
   }
 
   std::string index_path;
@@ -677,8 +684,14 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
     }
   }
 
-  seg->index_file_name = index_path;
-  seg->index = std::move(target);
+  {
+    std::unique_lock<std::shared_mutex> seg_lock;
+    if (seg->rw_lock) {
+      seg_lock = std::unique_lock<std::shared_mutex>(*seg->rw_lock);
+    }
+    seg->index_file_name = index_path;
+    seg->index = std::move(target);
+  }
 
   if (meta_ready) {
     if (pk_mapping_saved) {
@@ -775,6 +788,11 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     return false;
   }
 
+  if (seg->vid_pk_mapping.ready) {
+    // Usually this way
+    return true;
+  }
+
   std::string aux_name = seg->aux_table_name;
   if (aux_name.empty()) {
     const std::string prefix =
@@ -787,9 +805,6 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     seg->aux_table_name = aux_name;
   }
 
-  if (seg->vid_pk_mapping.ready) {
-    return true;
-  }
 
   const std::string mapping_path =
       vec_vid_pk_mapping_path(seg->index_file_name);

@@ -97,6 +97,10 @@ dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
 bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
                               uint64_t faiss_id, dict_index_t *clust_index,
                               dtuple_t *tuple);
+bool vec_aux_cache_bind_tuple_copy(const vid_pk_mapping_t *cache,
+                                   uint64_t faiss_id,
+                                   dict_index_t *clust_index, dtuple_t *tuple,
+                                   std::vector<unsigned char> *entry_copy);
 
 // Persist/restore vid->PK mapping snapshots alongside immutable vector index files.
 std::string vec_vid_pk_mapping_path(const std::string& index_path);
