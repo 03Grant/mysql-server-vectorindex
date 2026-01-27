@@ -2146,7 +2146,37 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
     bool found = false;
     ib::warn() << "VEC Del: Delete vec_index loop.";
     for (const auto &seg_info : candidates) {
+      uint64_t cache_vid = 0;
+      bool cache_hit = false;
+      {
+        std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+        vec_index_segment_t *seg = vec_find_segment(ctx, seg_info.id);
+        if (seg != nullptr && seg->vid_pk_mapping.ready) {
+          std::shared_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+          auto it = seg->vid_pk_mapping.pk_to_vid.find(pk_key);
+          if (it != seg->vid_pk_mapping.pk_to_vid.end()) {
+            cache_vid = it->second;
+            cache_hit = true;
+          }
+        }
+      }
+
       uint64_t vid = 0;
+      if (cache_hit) {
+        ib::warn() << "VEC Del: pk cache hit in segment " << seg_info.id;
+        dberr_t del_err = vec_aux_handler_delete(
+            trx, seg_info.aux_name, clust_index, pk_fields, pk_columns, &vid);
+        if (del_err == DB_SUCCESS || del_err == DB_RECORD_NOT_FOUND) {
+          target_seg_id = seg_info.id;
+          target_vid = cache_vid;
+          found = true;
+        } else if (del_err == DB_DEADLOCK ||
+                   del_err == DB_LOCK_WAIT_TIMEOUT) {
+          return del_err;
+        }
+        break;
+      }
+
       ib::warn() << "VEC Del: Delete vec_index segment " << seg_info.aux_name;
       dberr_t del_err = vec_aux_handler_delete(
           trx, seg_info.aux_name, clust_index, pk_fields, pk_columns, &vid);

@@ -513,9 +513,9 @@ int vec_search(vec_index_ctx_t& ctx,
 
     for (size_t s = 0; s < nseg; ++s) {
       auto& seg_meta = ctx.segments[s];
+      std::shared_lock<std::shared_mutex> seg_lock(*seg_meta.rw_lock);
       auto* seg = seg_meta.index.get();
       if (!seg) continue;
-      std::shared_lock<std::shared_mutex> seg_lock(*seg_meta.rw_lock);
       const uint32_t seg_id =
           seg_meta.vecindex_id != 0 ? seg_meta.vecindex_id
                                     : static_cast<uint32_t>(s);

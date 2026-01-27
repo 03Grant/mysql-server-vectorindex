@@ -168,8 +168,10 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
 
     dberr_t last_err = DB_SUCCESS;
     if (aux_mode == vec_aux_mode_t::PREINSERT_NULL) {
-      last_err = vec_aux_update_pk_vid(exec_trx, index, it.pk_columns, faiss_id);
+      // Aux already has sentinel faiss_id for MEM; defer update until rotate.
+      continue;
     } else {
+      // No need add faiss_id
       last_err = vec_aux_insert_one(exec_trx, index, it.pk_columns, faiss_id);
     }
     if (last_err != DB_SUCCESS) {

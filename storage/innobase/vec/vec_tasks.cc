@@ -403,6 +403,256 @@ bool vec_bitmap_mark_missing(vecindex_bitmap_t* bitmap,
   return true;
 }
 
+static dberr_t vec_backfill_aux_faiss_id(trx_t* trx, dict_index_t* index,
+                                         vec_index_segment_t* seg, THD* thd) {
+  if (index == nullptr || seg == nullptr || index->table == nullptr ||
+      thd == nullptr) {
+    return DB_ERROR;
+  }
+
+  if (!seg->vid_pk_mapping.ready || seg->vid_pk_mapping.pk_to_vid.empty()) {
+    return DB_SUCCESS;
+  }
+
+  std::string aux_name = seg->aux_table_name;
+  if (aux_name.empty()) {
+    vec_index_ctx_t* ctx = index->vec_runtime;
+    const std::string prefix =
+        (ctx != nullptr && !ctx->index_name_prefix.empty())
+            ? ctx->index_name_prefix
+            : vec_aux_prefix(index);
+    if (prefix.empty()) {
+      return DB_ERROR;
+    }
+    aux_name = seg->immutable ? vec_aux_segment_name(prefix, seg->vecindex_id)
+                              : vec_aux_mem_name(prefix);
+  }
+
+  const auto slash = aux_name.find('/');
+  if (slash == std::string::npos || slash == 0 || slash + 1 >= aux_name.size()) {
+    return DB_ERROR;
+  }
+  const std::string db = aux_name.substr(0, slash);
+  const std::string tbl = aux_name.substr(slash + 1);
+
+  MDL_request mdl_request;
+  MDL_REQUEST_INIT(&mdl_request, MDL_key::TABLE, db.c_str(), tbl.c_str(),
+                   MDL_SHARED_WRITE, MDL_EXPLICIT);
+  if (thd->mdl_context.acquire_lock(&mdl_request,
+                                    thd->variables.lock_wait_timeout)) {
+    ib::warn() << "VECINDEX: failed to acquire MDL for aux backfill on '"
+               << aux_name << "'";
+    return DB_LOCK_WAIT_TIMEOUT;
+  }
+
+  struct MdlGuard {
+    THD* thd{nullptr};
+    MDL_request* req{nullptr};
+    ~MdlGuard() {
+      if (thd != nullptr && req != nullptr && req->ticket != nullptr) {
+        thd->mdl_context.release_lock(req->ticket);
+        req->ticket = nullptr;
+      }
+    }
+  } mdl_guard{thd, &mdl_request};
+
+  dd::cache::Dictionary_client* client = dd::get_dd_client(thd);
+  dd::cache::Dictionary_client::Auto_releaser releaser(client);
+  const dd::Table* dd_table_obj = nullptr;
+  if (client->acquire<dd::Table>(db.c_str(), tbl.c_str(), &dd_table_obj) ||
+      dd_table_obj == nullptr) {
+    ib::warn() << "VECINDEX: failed to acquire DD for aux backfill on '"
+               << aux_name << "'";
+    return DB_ERROR;
+  }
+
+  char path[FN_REFLEN + 1]{};
+  bool truncated = false;
+  size_t path_len = build_table_filename(
+      path, sizeof(path) - 1 - reg_ext_length, db.c_str(), tbl.c_str(), "", 0,
+      &truncated);
+  if (path_len == 0 || truncated) {
+    return DB_ERROR;
+  }
+
+  TABLE* mysql_table = open_table_uncached(
+      thd, path, db.c_str(), tbl.c_str(), false, true, *dd_table_obj);
+  if (mysql_table == nullptr || mysql_table->file == nullptr) {
+    return DB_ERROR;
+  }
+
+  struct TableGuard {
+    TABLE* t{nullptr};
+    ~TableGuard() {
+      if (t != nullptr) {
+        intern_close_table(t);
+        t = nullptr;
+      }
+    }
+  } table_guard{mysql_table};
+
+  handler* h = mysql_table->file;
+  if (mysql_table->read_set != nullptr) {
+    bitmap_set_all(mysql_table->read_set);
+  }
+  if (mysql_table->write_set != nullptr) {
+    bitmap_set_all(mysql_table->write_set);
+  }
+
+  if (h != nullptr) {
+    ha_innobase* innodb = dynamic_cast<ha_innobase*>(h);
+    if (innodb != nullptr) {
+      innodb->init_table_handle_for_HANDLER();
+    }
+  }
+
+  trx_t* stmt_trx = thd_to_trx(thd);
+  if (stmt_trx == nullptr && trx != nullptr) {
+    thd_to_trx(thd) = trx;
+    stmt_trx = trx;
+  }
+  if (stmt_trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  trx_start_if_not_started(stmt_trx, true, UT_LOCATION_HERE);
+  struct TrxDepthGuard {
+    trx_t* trx{nullptr};
+    bool entered{false};
+    ~TrxDepthGuard() {
+      if (entered && trx != nullptr) {
+        TrxInInnoDB::end_stmt(trx);
+      }
+    }
+  } depth_guard{stmt_trx, false};
+  TrxInInnoDB::begin_stmt(stmt_trx);
+  depth_guard.entered = true;
+
+  auto map_handler_err = [](int rc) -> dberr_t {
+    switch (rc) {
+      case 0:
+        return DB_SUCCESS;
+      case HA_ERR_LOCK_WAIT_TIMEOUT:
+        return DB_LOCK_WAIT_TIMEOUT;
+      case HA_ERR_LOCK_DEADLOCK:
+        return DB_DEADLOCK;
+      default:
+        return DB_ERROR;
+    }
+  };
+
+  bool locked = false;
+  int lock_rc = h->ha_external_lock(thd, F_WRLCK);
+  dberr_t lock_err = map_handler_err(lock_rc);
+  if (lock_err != DB_SUCCESS) {
+    return lock_err;
+  }
+  locked = true;
+
+  struct LockGuard {
+    handler* h;
+    THD* thd;
+    bool& locked_ref;
+    ~LockGuard() {
+      if (locked_ref && h != nullptr) {
+        h->ha_external_lock(thd, F_UNLCK);
+        locked_ref = false;
+      }
+    }
+  } lock_guard{h, thd, locked};
+
+  if (h->ha_rnd_init(true)) {
+    ib::warn() << "VECINDEX: ha_rnd_init failed for aux backfill on '"
+               << aux_name << "'";
+    return DB_ERROR;
+  }
+
+  struct RndEndGuard {
+    handler* h{nullptr};
+    ~RndEndGuard() {
+      if (h != nullptr) {
+        h->ha_rnd_end();
+      }
+    }
+  } rnd_guard{h};
+
+  dict_index_t* clust_index = index->table->first_index();
+  if (clust_index == nullptr) {
+    return DB_ERROR;
+  }
+
+  const ulint pk_fields = dict_index_get_n_unique(clust_index);
+  if (pk_fields == 0 || pk_fields >= mysql_table->s->fields) {
+    return DB_ERROR;
+  }
+
+  Field* faiss_field = mysql_table->field[pk_fields];
+  if (faiss_field == nullptr || mysql_table->record[1] == nullptr) {
+    return DB_ERROR;
+  }
+
+  size_t updated = 0;
+  std::shared_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+  while (true) {
+    int rc = h->ha_rnd_next(mysql_table->record[0]);
+    if (rc == HA_ERR_END_OF_FILE) {
+      break;
+    }
+    if (rc != 0) {
+      ib::warn() << "VECINDEX: ha_rnd_next failed for aux backfill on '"
+                 << aux_name << "' rc=" << rc;
+      return DB_ERROR;
+    }
+
+    std::vector<vec_pk_column_t> pk_cols;
+    bool pk_ok = vec_extract_pk_columns(
+        mysql_table, clust_index, pk_fields,
+        [mysql_table](size_t idx) {
+          return (idx < static_cast<size_t>(mysql_table->s->fields))
+                     ? mysql_table->field[idx]
+                     : nullptr;
+        },
+        pk_cols);
+    if (!pk_ok) {
+      return DB_ERROR;
+    }
+
+    std::string key = vec_pack_pk_key(pk_cols, pk_fields);
+    if (key.empty()) {
+      continue;
+    }
+    auto it = seg->vid_pk_mapping.pk_to_vid.find(key);
+    if (it == seg->vid_pk_mapping.pk_to_vid.end()) {
+      continue;
+    }
+    const uint64_t new_vid = it->second;
+    if (!faiss_field->is_null()) {
+      const ulonglong current =
+          static_cast<ulonglong>(faiss_field->val_int());
+      if (current == new_vid) {
+        continue;
+      }
+    }
+
+    if (mysql_table->s != nullptr && mysql_table->s->rec_buff_length > 0) {
+      std::memcpy(mysql_table->record[1], mysql_table->record[0],
+                  mysql_table->s->rec_buff_length);
+    }
+
+    faiss_field->store(static_cast<longlong>(new_vid), true);
+    rc = h->ha_update_row(mysql_table->record[1], mysql_table->record[0]);
+    dberr_t err = map_handler_err(rc);
+    if (err != DB_SUCCESS) {
+      return err;
+    }
+    ++updated;
+  }
+
+  ib::warn() << "VECINDEX: aux backfill updated rows=" << updated
+             << " table=" << aux_name;
+  return DB_SUCCESS;
+}
+
 bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
                               vec_index_ctx_t *ctx) {
   ib::warn() << "VECINDEX: function::vec_try_rotate_mem_index() 1 Trying to rotate mem index.";
@@ -519,6 +769,7 @@ class VecBgThdGuard {
       current_thd = prev_thd_;
       return false;
     }
+    current_thd = thd_;
     thd_->set_command(COM_DAEMON);
     // DD helpers (Update_dictionary_tables_ctx) require autocommit off.
     thd_->variables.option_bits &= ~OPTION_AUTOCOMMIT;
@@ -540,6 +791,9 @@ class VecBgThdGuard {
     trx_t *&trx_ref = thd_to_trx(thd_);
     if (trx_ref == nullptr) {
       trx_ref = innobase_trx_allocate(thd_);
+      owns_trx_ = true;
+    } else {
+      owns_trx_ = false;
     }
     trx_ = trx_ref;
     if (trx_ == nullptr) {
@@ -580,35 +834,32 @@ class VecBgThdGuard {
 
  private:
   void cleanup() {
-    if (trx_ != nullptr) {
-      trx_free_for_mysql(trx_);
-      trx_ = nullptr;
-      if (thd_ != nullptr) {
-        thd_to_trx(thd_) = nullptr;
-      }
-    }
     if (thd_ != nullptr) {
+      current_thd = thd_;
       destroy_thd(thd_);
       thd_ = nullptr;
       current_thd = prev_thd_;
     }
+    trx_ = nullptr;
+    owns_trx_ = false;
   }
 
   THD *thd_{nullptr};
   trx_t *trx_{nullptr};
   THD *prev_thd_{nullptr};
+  bool owns_trx_{false};
 };
 
-void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
+bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
                        vec_index_segment_t *seg) {
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Building index segment in bg.";
   if (index == nullptr || ctx == nullptr || seg == nullptr) {
     ib::warn() << "VECINDEX: function::vec_bg_build_task() Invalid arguments.";
-    return;
+    return false;
   }
   if (vec_should_skip_task(index)) {
     ib::warn() << "VECINDEX: function::vec_bg_build_task() Skip build for dropping/aux table.";
-    return;
+    return false;
   }
   ctx->build_in_progress = true;
   auto clear_build_flag = [&]() {
@@ -617,24 +868,85 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
 
   std::vector<float> xb;
   std::vector<int64_t> ids;
+  vid_pk_mapping_t new_mapping;
+  std::vector<int64_t> old_to_new;
+  std::vector<uint8_t> bitmap_snapshot;
   const size_t dim = ctx->params.dim;
   {
     std::shared_lock<std::shared_mutex> seg_lock;
     if (seg->rw_lock) {
       seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
     }
-    if (dim == 0 || !vec_dump_segment(seg, dim, xb, ids)) {
+    if (dim == 0 || seg->index == nullptr) {
       clear_build_flag();
-      ib::warn() << "VECINDEX: function::vec_bg_build_task() Failed to dump segment data.";
-      return;
+      ib::warn() << "VECINDEX: function::vec_bg_build_task() Invalid segment data.";
+      return false;
     }
+    const size_t n = seg->index->ntotal();
+    bitmap_snapshot = seg->vecindex_bitmap.bits;
+    old_to_new.assign(n, -1);
+    auto is_marked = [&](size_t idx) -> bool {
+      const size_t byte = idx / 8;
+      const size_t bit = idx % 8;
+      if (byte >= bitmap_snapshot.size()) {
+        return false;
+      }
+      return (bitmap_snapshot[byte] >> bit) & 0x01;
+    };
+
+    size_t alive = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (!is_marked(i)) {
+        ++alive;
+      }
+    }
+
+    xb.reserve(alive * dim);
+    ids.reserve(alive);
+    new_mapping.key_length = seg->vid_pk_mapping.key_length;
+    new_mapping.pk_values.reserve(alive);
+
+    const auto &pk_values = seg->vid_pk_mapping.pk_values;
+    for (size_t i = 0; i < n; ++i) {
+      if (is_marked(i)) {
+        continue;
+      }
+      if (i >= pk_values.size() || pk_values[i].empty()) {
+        clear_build_flag();
+        ib::warn() << "VECINDEX: missing pk mapping for seg_id="
+                   << seg->vecindex_id << " vid=" << i;
+        return false;
+      }
+
+      const size_t new_id = ids.size();
+      xb.resize((new_id + 1) * dim);
+      if (!seg->index->reconstruct(i, xb.data() + new_id * dim)) {
+        clear_build_flag();
+        ib::warn() << "VECINDEX: failed to reconstruct seg_id="
+                   << seg->vecindex_id << " vid=" << i;
+        return false;
+      }
+      ids.push_back(static_cast<int64_t>(new_id));
+      new_mapping.pk_values.push_back(pk_values[i]);
+      if (new_mapping.key_length == 0) {
+        new_mapping.key_length = new_mapping.pk_values.back().size();
+      }
+      const auto &entry = new_mapping.pk_values.back();
+      std::string key(reinterpret_cast<const char *>(entry.data()), entry.size());
+      new_mapping.pk_to_vid[key] = static_cast<uint64_t>(new_id);
+      old_to_new[i] = static_cast<int64_t>(new_id);
+    }
+
+    new_mapping.is_mem_diff = false;
+    new_mapping.mem_diff.clear();
+    new_mapping.ready = true;
   }
 
   std::string index_path;
   if (!vec_resolve_index_path(seg->aux_table_name, &index_path)) {
     clear_build_flag();
     ib::warn() << "VECINDEX: function::vec_bg_build_task() Failed to resolve index path.";
-    return;
+    return false;
   }
 
   // Prepare metadata entry (append-only; crash recovery TODO).
@@ -666,18 +978,20 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
   if (!target) {
     clear_build_flag();
     ib::warn() << "VECINDEX: function::vec_bg_build_task() Failed to create target index.";
-    return;
+    return false;
   }
 
-  target->train(ids.size(), xb.data());
-  target->add(ids.size(), xb.data(), ids.data());
+  if (!ids.empty()) {
+    target->train(ids.size(), xb.data());
+    target->add(ids.size(), xb.data(), ids.data());
+  }
   
   target->save(index_path);
   const std::string mapping_path = vec_vid_pk_mapping_path(index_path);
   bool pk_mapping_saved = false;
   if (!mapping_path.empty()) {
     pk_mapping_saved =
-        vec_vid_pk_mapping_save(seg->vid_pk_mapping, mapping_path);
+        vec_vid_pk_mapping_save(new_mapping, mapping_path);
     if (!pk_mapping_saved) {
       ib::warn() << "VECINDEX: failed to persist PK mapping to '"
                  << mapping_path << "'";
@@ -689,8 +1003,52 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
     if (seg->rw_lock) {
       seg_lock = std::unique_lock<std::shared_mutex>(*seg->rw_lock);
     }
+    const std::vector<uint8_t> current_bits = seg->vecindex_bitmap.bits;
+    auto is_marked_current = [&](size_t idx) -> bool {
+      const size_t byte = idx / 8;
+      const size_t bit = idx % 8;
+      if (byte >= current_bits.size()) {
+        return false;
+      }
+      return (current_bits[byte] >> bit) & 0x01;
+    };
     seg->index_file_name = index_path;
     seg->index = std::move(target);
+    seg->vecindex_bitmap.clear();
+    seg->vecindex_bitmap.ensure_size(new_mapping.pk_values.size());
+    for (size_t i = 0; i < old_to_new.size(); ++i) {
+      if (old_to_new[i] < 0) {
+        continue;
+      }
+      if (is_marked_current(i)) {
+        seg->vecindex_bitmap.mark(static_cast<size_t>(old_to_new[i]));
+      }
+    }
+    seg->vid_pk_mapping = std::move(new_mapping);
+  }
+
+  THD *thd = current_thd;
+  if (thd != nullptr) {
+    trx_t *trx = thd_to_trx(thd);
+    dberr_t backfill_err =
+        vec_backfill_aux_faiss_id(trx, index, seg, thd);
+    // if (backfill_err != DB_SUCCESS) {
+    //   ib::warn() << "VECINDEX: aux backfill failed err=" << backfill_err;
+    //   (void)trans_rollback_stmt(thd);
+    //   (void)trans_rollback(thd);
+    // } else {
+    //   bool commit_ok = !trans_commit_stmt(thd, false);
+    //   if (commit_ok) {
+    //     commit_ok = !trans_commit(thd, false);
+    //   }
+    //   if (!commit_ok) {
+    //     ib::warn() << "VECINDEX: aux backfill commit failed";
+    //     (void)trans_rollback_stmt(thd);
+    //     (void)trans_rollback(thd);
+    //   }
+    // }
+  } else {
+    ib::warn() << "VECINDEX: aux backfill skipped (no THD)";
   }
 
   if (meta_ready) {
@@ -706,36 +1064,14 @@ void vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
 
   clear_build_flag();
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Finished building index segment.";
+  return true;
 }
 
 bool vec_rotate_mem_index_bg(table_id_t table_id, space_index_t index_id) {
   ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Rotating mem index in bg.";
-  VecBgThdGuard guard;
-  if (!guard.create()) {
-    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to create background thread.";
-    return false;
-  }
-  if (!guard.start_trx()) {
-    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to start transaction.";
-    return false;
-  }
+  bool rename_committed = false;
+  bool bg_built = false;
 
-  MDL_ticket* mdl = nullptr;
-  dict_table_t* table =
-      dd_table_open_on_id(table_id, guard.thd(), &mdl, false, true);
-  if (table == nullptr) {
-    guard.rollback();
-    return false;
-  }
-
-  dict_index_t* index = vec_find_index_by_id(table, index_id);
-  if (index == nullptr || index->vec_runtime == nullptr) {
-    dd_table_close(table, guard.thd(), &mdl, false);
-    guard.rollback();
-    return false;
-  }
-
-  vec_index_ctx_t* ctx = index->vec_runtime;
   struct PendingGuard {
     vec_index_ctx_t* ctx{nullptr};
     ~PendingGuard() {
@@ -743,39 +1079,108 @@ bool vec_rotate_mem_index_bg(table_id_t table_id, space_index_t index_id) {
         ctx->is_rotation_pending.store(false);
       }
     }
-  } pending_guard{ctx};
+  } pending_guard{};
 
-  if (vec_should_skip_task(index)) {
+  {
+    VecBgThdGuard guard;
+    if (!guard.create()) {
+      ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to create background thread.";
+      return false;
+    }
+    if (!guard.start_trx()) {
+      ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to start transaction.";
+      return false;
+    }
+
+    MDL_ticket* mdl = nullptr;
+    dict_table_t* table =
+        dd_table_open_on_id(table_id, guard.thd(), &mdl, false, true);
+    if (table == nullptr) {
+      guard.rollback();
+      return false;
+    }
+
+    dict_index_t* index = vec_find_index_by_id(table, index_id);
+    if (index == nullptr || index->vec_runtime == nullptr) {
+      dd_table_close(table, guard.thd(), &mdl, false);
+      guard.rollback();
+      return false;
+    }
+
+    vec_index_ctx_t* ctx = index->vec_runtime;
+    pending_guard.ctx = ctx;
+
+    if (vec_should_skip_task(index)) {
+      dd_table_close(table, guard.thd(), &mdl, false);
+      guard.rollback();
+      ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Skip rotation for dropping/aux table.";
+      return false;
+    }
+
+    bool rotated = vec_try_rotate_mem_index(guard.trx(), index, ctx);
+    if (rotated) {
+      rename_committed = guard.commit();
+      if (!rename_committed) {
+        guard.rollback();
+      }
+    } else {
+      guard.rollback();
+    }
+
     dd_table_close(table, guard.thd(), &mdl, false);
-    guard.rollback();
-    ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Skip rotation for dropping/aux table.";
-    return false;
   }
 
-  bool rotated = vec_try_rotate_mem_index(guard.trx(), index, ctx);
-  if (rotated) {
-    rotated = guard.commit();
-  } else {
-    guard.rollback();
-  }
+  if (rename_committed) {
+    VecBgThdGuard build_guard;
+    if (!build_guard.create()) {
+      ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to create build thread.";
+    } else if (!build_guard.start_trx()) {
+      ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Failed to start build transaction.";
+    } else {
+      MDL_ticket* mdl = nullptr;
+      dict_table_t* table =
+          dd_table_open_on_id(table_id, build_guard.thd(), &mdl, false, true);
+      if (table == nullptr) {
+        build_guard.rollback();
+      } else {
+        dict_index_t* index = vec_find_index_by_id(table, index_id);
+        if (index == nullptr || index->vec_runtime == nullptr) {
+          dd_table_close(table, build_guard.thd(), &mdl, false);
+          build_guard.rollback();
+        } else if (vec_should_skip_task(index)) {
+          dd_table_close(table, build_guard.thd(), &mdl, false);
+          build_guard.rollback();
+          ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Skip build for dropping/aux table.";
+        } else {
+          vec_index_ctx_t* ctx = index->vec_runtime;
+          vec_index_segment_t* staging_seg = nullptr;
+          {
+            std::lock_guard<std::shared_mutex> lk(ctx->mu);
+            if (!ctx->segments.empty()) {
+              staging_seg = &ctx->segments.back();
+            }
+          }
+          if (staging_seg != nullptr && staging_seg->immutable) {
+            bg_built = vec_bg_build_task(index, ctx, staging_seg);
+          }
 
-  if (rotated) {
-    vec_index_segment_t* staging_seg = nullptr;
-    {
-      std::lock_guard<std::shared_mutex> lk(ctx->mu);
-      if (!ctx->segments.empty()) {
-        staging_seg = &ctx->segments.back();
+          if (bg_built) {
+            if (!build_guard.commit()) {
+              bg_built = false;
+            }
+          } else {
+            build_guard.rollback();
+          }
+          dd_table_close(table, build_guard.thd(), &mdl, false);
+        }
       }
     }
-    if (staging_seg != nullptr && staging_seg->immutable) {
-      vec_bg_build_task(index, ctx, staging_seg);
-    }
   }
 
-  dd_table_close(table, guard.thd(), &mdl, false);
+  const bool ok = rename_committed && bg_built;
   ib::warn() << "VECINDEX: function::vec_rotate_mem_index_bg() Rotation "
-             << (rotated ? "succeeded." : "failed.");
-  return rotated;
+             << (ok ? "succeeded." : "failed.");
+  return ok;
 }
 
 }  // namespace
@@ -1023,6 +1428,9 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
     }
     const ulonglong faiss_id_ull =
         static_cast<ulonglong>(faiss_field->val_int());
+    if (faiss_id_ull == std::numeric_limits<ulonglong>::max()) {
+      continue;
+    }
     dberr_t cache_err = vec_insert_aux_cache(
         &seg->vid_pk_mapping, clust_index, static_cast<uint64_t>(faiss_id_ull),
         pk_cols);
@@ -1578,11 +1986,7 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
       return false;
     }
 
-    Field *faiss_field = aux_table->field[pk_fields];
-    if (faiss_field == nullptr || faiss_field->is_null()) {
-      continue;
-    }
-    entry.old_id = static_cast<uint64_t>(faiss_field->val_int());
+    entry.old_id = 0;
 
     std::string key = vec_pack_pk_key(entry.pk_cols, pk_fields);
     if (key.empty()) {
@@ -1750,20 +2154,6 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
     }
   }
 #endif
-
-  for (const auto &entry : entries) {
-    if (entry.new_id == std::numeric_limits<uint64_t>::max()) {
-      continue;
-    }
-    dberr_t upd_err =
-        vec_aux_update_pk_vid(trx, index, entry.pk_cols, entry.new_id);
-    if (upd_err != DB_SUCCESS) {
-      ib::warn() << "VECMETA: failed to update MEM faiss_id during recovery "
-                 << "id=" << entry.old_id << "->" << entry.new_id
-                 << " err=" << upd_err;
-      return false;
-    }
-  }
 
   if (trx != nullptr &&
       trx->state.load(std::memory_order_relaxed) != TRX_STATE_NOT_STARTED) {
