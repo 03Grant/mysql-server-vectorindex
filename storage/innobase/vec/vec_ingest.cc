@@ -15,6 +15,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -187,14 +188,14 @@ static dberr_t vec_apply_bucket(trx_t* exec_trx, vec_trx_bucket_t& bucket) {
 
 // 事务提交钩子里调用：遍历所有桶应用
 dberr_t vec_on_trx_commit(trx_t* trx) {
-  auto* tctx = vec_get_or_create_trx_ctx(trx);
-  if (!tctx) {
-    ib::warn() << "VECINDEX: cannot get vec_trx_ctx_t";
-    return DB_ERROR;
-  } 
   if (trx == nullptr) {
     ib::warn() << "VECINDEX: vec_on_trx_commit called with null trx_t";
     return DB_ERROR;
+  }
+
+  auto* tctx = vec_lookup_trx_ctx(trx);
+  if (tctx == nullptr) {
+    return DB_SUCCESS;
   }
 
   trx_t* exec_trx = trx;
@@ -202,69 +203,81 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
   bool owns_exec_trx = false;
   dberr_t last_err = DB_SUCCESS;
 
-  if (trx->state.load(std::memory_order_acquire) != TRX_STATE_ACTIVE) {
-    background = trx_allocate_for_background();
-    if (background == nullptr) {
-      ib::warn() << "VECINDEX: failed to allocate background transaction for aux insert";
-      return DB_ERROR;
-    }
-    trx_start_internal(background, UT_LOCATION_HERE);
-    exec_trx = background;
-    owns_exec_trx = true;
-  }
-
-  ib::warn() << "VECINDEX: flushing vector rows for trx " << trx->id
-             << " using exec_trx " << exec_trx->id;
-
   std::unordered_map<dict_index_t*, vec_trx_bucket_t> buckets;
+  std::unordered_set<dict_index_t*> touched_indexes;
   {
     std::lock_guard<std::mutex> lk(tctx->mu);
     buckets = tctx->by_index;
+    touched_indexes = tctx->touched_indexes;
   }
 
   std::vector<dict_index_t*> flushed_indexes;
-  for (auto& kv : buckets) {
-    last_err = vec_apply_bucket(exec_trx, kv.second);
-    if (last_err != DB_SUCCESS) {
-      ib::warn() << "VECINDEX: vec_apply_bucket failed with error " << last_err;
-      vec_trx_ctx_clear(tctx);
-      break;
-    }
-    flushed_indexes.push_back(kv.first);
-  }
-
-
-  DEBUG_SYNC_C("vec_aux_before_aux_commit");
-  DBUG_EXECUTE_IF("crash_vec_aux_before_aux_commit", DBUG_SUICIDE(););
-  ib::warn() << "TEST_VEC_CONCUR: Trx_commit called!";
-
-  if (owns_exec_trx) {
-    if (last_err == DB_SUCCESS) {
-      dberr_t commit_err = trx_commit_for_mysql(exec_trx);
-      if (commit_err != DB_SUCCESS) {
-        ib::warn() << "VECINDEX: commit of background aux inserts failed with error "
-                   << commit_err;
-        last_err = commit_err;
+  if (!buckets.empty()) {
+    if (trx->state.load(std::memory_order_acquire) != TRX_STATE_ACTIVE) {
+      background = trx_allocate_for_background();
+      if (background == nullptr) {
+        ib::warn() << "VECINDEX: failed to allocate background transaction for aux insert";
+        return DB_ERROR;
       }
-    } else {
-      /* Background trx is not on mysql_trx_list; use savepoint rollback to
-      avoid the in_mysql_trx_list assertion. */
-      trx_rollback_to_savepoint(exec_trx, nullptr);
+      trx_start_internal(background, UT_LOCATION_HERE);
+      exec_trx = background;
+      owns_exec_trx = true;
     }
-    trx_free_for_background(exec_trx);
-  }
 
-  if (last_err != DB_SUCCESS) {
-    return last_err;
-  }
+    ib::warn() << "VECINDEX: flushing vector rows for trx " << trx->id
+               << " using exec_trx " << exec_trx->id;
 
-  DEBUG_SYNC_C("vec_aux_after_aux_commit");
-  DBUG_EXECUTE_IF("crash_vec_aux_after_aux_commit", DBUG_SUICIDE(););
+    for (auto& kv : buckets) {
+      last_err = vec_apply_bucket(exec_trx, kv.second);
+      if (last_err != DB_SUCCESS) {
+        ib::warn() << "VECINDEX: vec_apply_bucket failed with error " << last_err;
+        vec_trx_ctx_clear(tctx);
+        break;
+      }
+      flushed_indexes.push_back(kv.first);
+    }
+
+    DEBUG_SYNC_C("vec_aux_before_aux_commit");
+    DBUG_EXECUTE_IF("crash_vec_aux_before_aux_commit", DBUG_SUICIDE(););
+    ib::warn() << "TEST_VEC_CONCUR: Trx_commit called!";
+
+    if (owns_exec_trx) {
+      if (last_err == DB_SUCCESS) {
+        dberr_t commit_err = trx_commit_for_mysql(exec_trx);
+        if (commit_err != DB_SUCCESS) {
+          ib::warn() << "VECINDEX: commit of background aux inserts failed with error "
+                     << commit_err;
+          last_err = commit_err;
+        }
+      } else {
+        /* Background trx is not on mysql_trx_list; use savepoint rollback to
+        avoid the in_mysql_trx_list assertion. */
+        trx_rollback_to_savepoint(exec_trx, nullptr);
+      }
+      trx_free_for_background(exec_trx);
+    }
+
+    if (last_err != DB_SUCCESS) {
+      return last_err;
+    }
+
+    DEBUG_SYNC_C("vec_aux_after_aux_commit");
+    DBUG_EXECUTE_IF("crash_vec_aux_after_aux_commit", DBUG_SUICIDE(););
+  }
 
   // 成功后清空缓冲
   vec_trx_ctx_clear(tctx);
 
   // If exceed size, then submit tasks.
+  if (!touched_indexes.empty()) {
+    for (auto* idx : touched_indexes) {
+      if (idx == nullptr) {
+        continue;
+      }
+      flushed_indexes.push_back(idx);
+    }
+  }
+
   for (dict_index_t* idx : flushed_indexes) {
     if (idx == nullptr) {
       continue;
@@ -305,12 +318,14 @@ void vec_on_trx_rollback(trx_t* trx) {
   }
 
   std::vector<vec_bitmap_undo_entry_t> undo_entries;
+  std::vector<vec_insert_undo_entry_t> inserted_vids;
   std::vector<vec_update_undo_entry_t> update_entries;
   std::unordered_map<dict_index_t*, std::vector<std::string>> insert_keys;
   std::unordered_map<dict_index_t*, std::vector<std::string>> delete_keys;
   {
     std::lock_guard<std::mutex> lk(tctx->mu);
     undo_entries = tctx->bitmap_changes;
+    inserted_vids = tctx->inserted_vids;
     update_entries = tctx->update_changes;
     for (const auto& kv : tctx->by_index) {
       if (kv.second.items.empty()) {
@@ -414,6 +429,34 @@ void vec_on_trx_rollback(trx_t* trx) {
                  << " old_val=" << it->old_val;
     }
 
+  }
+
+  for (const auto& entry : inserted_vids) {
+    vec_index_ctx_t* vec_ctx = entry.ctx;
+    if (vec_ctx == nullptr) {
+      continue;
+    }
+    std::shared_lock<std::shared_mutex> ctx_lock(vec_ctx->mu);
+    vec_index_segment_t* seg = nullptr;
+    for (auto& s : vec_ctx->segments) {
+      if (s.vecindex_id == entry.segment_id) {
+        seg = &s;
+        break;
+      }
+    }
+    if (seg == nullptr) {
+      seg = vec_ctx->mutable_segment();
+      if (seg != nullptr && seg->vecindex_id != entry.segment_id &&
+          entry.segment_id != 0) {
+        seg = nullptr;
+      }
+    }
+    if (seg != nullptr) {
+      std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+      seg->vecindex_bitmap.set(static_cast<size_t>(entry.vid), true);
+    } else {
+      vec_ctx->needs_aux_refresh = true;
+    }
   }
 
   vec_trx_ctx_clear(tctx); // 没有改 Faiss/表，自然丢弃

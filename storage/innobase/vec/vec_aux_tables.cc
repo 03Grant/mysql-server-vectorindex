@@ -1792,11 +1792,6 @@ dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
     cache->pk_values.resize(target + 1);
   }
   cache->pk_values[target] = std::move(packed);
-  {
-    const auto &entry = cache->pk_values[target];
-    std::string key(reinterpret_cast<const char *>(entry.data()), entry.size());
-    cache->pk_to_vid[key] = faiss_id;
-  }
   cache->ready = true;
 
   return DB_SUCCESS;
@@ -1990,15 +1985,6 @@ bool vec_vid_pk_mapping_load(const std::string& path,
       mapping->clear();
       return false;
     }
-  }
-
-  for (size_t i = 0; i < mapping->pk_values.size(); ++i) {
-    const auto &entry = mapping->pk_values[i];
-    if (entry.empty()) {
-      continue;
-    }
-    std::string key(reinterpret_cast<const char *>(entry.data()), entry.size());
-    mapping->pk_to_vid[key] = static_cast<uint64_t>(i);
   }
 
   mapping->ready = true;

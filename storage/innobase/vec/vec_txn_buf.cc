@@ -41,6 +41,11 @@ inline ulint vec_pk_field_count(const dict_index_t *clust) {
   return clust->n_uniq;
 }
 
+inline bool vec_pk_columns_ready(const std::vector<vec_pk_column_t> &cols,
+                                 ulint pk_fields) {
+  return pk_fields > 0 && cols.size() >= pk_fields;
+}
+
 // —— 抽取向量字节并校验 ——
 static bool vec_extract_and_validate(const dfield_t *field, unsigned dim,
                                      std::vector<float> &out) {
@@ -302,7 +307,9 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
     }
     ctx->deleted_pks_in_trx.clear();
     ctx->bitmap_changes.clear();
+    ctx->inserted_vids.clear();
     ctx->update_changes.clear();
+    ctx->touched_indexes.clear();
   }
 
   trx_t *owner = ctx->owner;
@@ -326,7 +333,84 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
   }
 }
 
-// —— 收集一行放入全局tctx bucket中 ——
+// Immediate insert into vector index + aux table with rollback tracking.
+dberr_t vec_insert_one_row(trx_t *trx, dict_table_t *table,
+                           dict_index_t *vindex,
+                           const std::vector<vec_pk_column_t> &pk_columns,
+                           const std::vector<float> &vec_values,
+                           uint64_t *out_vid) {
+  if (trx == nullptr || table == nullptr || vindex == nullptr) {
+    return DB_ERROR;
+  }
+
+  const vec_params_t *params = vindex->vec_params;
+  const unsigned dim = params != nullptr ? params->dim : 0;
+  if (dim == 0 || vec_values.size() != dim) {
+    return DB_ERROR;
+  }
+
+  dict_index_t *clust = table->first_index();
+  const ulint pk_fields = vec_pk_field_count(clust);
+  if (clust == nullptr || pk_fields == 0 ||
+      !vec_pk_columns_ready(pk_columns, pk_fields)) {
+    return DB_ERROR;
+  }
+
+  vec_index_ctx_t *ctx = vindex->vec_runtime;
+  if (ctx == nullptr) {
+    return DB_ERROR;
+  }
+
+  vec_trx_ctx_t *tctx = vec_get_or_create_trx_ctx(trx);
+  if (tctx == nullptr) {
+    return DB_ERROR;
+  }
+
+  uint64_t vid = 0;
+  uint32_t seg_id = 0;
+  dberr_t cache_err = DB_SUCCESS;
+  {
+    std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+    vec_index_segment_t *seg = ctx->mutable_segment();
+    if (seg == nullptr || seg->index == nullptr || seg->rw_lock == nullptr) {
+      return DB_ERROR;
+    }
+
+    std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+    const size_t before = seg->index->ntotal();
+    vid = static_cast<uint64_t>(before);
+    const int64_t id = static_cast<int64_t>(vid);
+    seg->index->add(1, vec_values.data(), &id);
+    seg_id = seg->vecindex_id;
+
+    cache_err =
+        vec_insert_aux_cache(&seg->vid_pk_mapping, clust, vid, pk_columns);
+    seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(tctx->mu);
+    tctx->inserted_vids.push_back({ctx, vindex, seg_id, vid});
+    tctx->touched_indexes.insert(vindex);
+  }
+
+  if (cache_err != DB_SUCCESS) {
+    return cache_err;
+  }
+
+  dberr_t aux_err = vec_aux_insert_one(trx, vindex, pk_columns, vid);
+  if (aux_err != DB_SUCCESS) {
+    return aux_err;
+  }
+
+  if (out_vid != nullptr) {
+    *out_vid = vid;
+  }
+
+  return DB_SUCCESS;
+}
+
+// —— 单行立即写入向量索引与辅助表 ——
 int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
                         const dfield_t *vector_field, const unsigned dim,
                         const dtuple_t *row_tuple) {
@@ -356,60 +440,25 @@ int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
     }
   }
 
-  vec_trx_ctx_t *tctx = vec_get_or_create_trx_ctx(trx);
-  if (tctx == nullptr) {
-    return -1;
-  }
-
-  vec_item_t item;
-  if (!vec_extract_and_validate(vector_field, dim, item.vec)) {
+  std::vector<float> vec_values;
+  if (!vec_extract_and_validate(vector_field, dim, vec_values)) {
     trx->error_state = DB_ERROR;
     return -2;  // 长度/数据非法
   }
 
-  if (!vec_capture_pk_columns(table, row_tuple, item.pk_columns)) {
+  std::vector<vec_pk_column_t> pk_columns;
+  if (!vec_capture_pk_columns(table, row_tuple, pk_columns)) {
     trx->error_state = DB_ERROR;
     return -3;
   }
 
-  item.pk_key = vec_pack_pk_key(item.pk_columns, pk_fields);
-  if (item.pk_key.empty()) {
-    trx->error_state = DB_ERROR;
-    return -3;
-  }
-
-  dberr_t aux_err = vec_aux_insert_pk_null(trx, vindex, item.pk_columns);
-  if (aux_err != DB_SUCCESS) {
-    trx->error_state = aux_err;
+  dberr_t ins_err =
+      vec_insert_one_row(trx, table, vindex, pk_columns, vec_values, nullptr);
+  if (ins_err != DB_SUCCESS) {
+    trx->error_state = ins_err;
     return -5;
   }
 
-  {
-    std::lock_guard<std::mutex> lk(tctx->mu);
-    auto &bucket = tctx->by_index[vindex];
-    if (bucket.index == nullptr) {
-      bucket.index = vindex;
-      bucket.dim = dim;
-      bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
-    } else if (bucket.dim != dim) {
-      trx->error_state = DB_ERROR;
-      return -4;  // dim 不一致
-    }
-
-    if (bucket.aux_mode == vec_aux_mode_t::UNKNOWN) {
-      bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
-    } else if (bucket.aux_mode != vec_aux_mode_t::PREINSERT_NULL) {
-      if (bucket.items.empty()) {
-        bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
-      } else {
-        trx->error_state = DB_ERROR;
-        return -6;
-      }
-    }
-
-    bucket.inserted_keys.insert(item.pk_key);
-    bucket.items.emplace_back(std::move(item));
-  }
   return 0;
 }
 
@@ -443,10 +492,18 @@ vec_trx_ctx_t* vec_lookup_trx_ctx(trx_t* trx) {
 }
 
 bool vec_trx_has_work(trx_t* trx) {
-    if (auto* ctx = vec_lookup_trx_ctx(trx)) {
-        for (const auto& kv : ctx->by_index) {
-            if (!kv.second.items.empty()) return true;
-        }
+  if (auto* ctx = vec_lookup_trx_ctx(trx)) {
+    std::lock_guard<std::mutex> lk(ctx->mu);
+    if (!ctx->inserted_vids.empty() || !ctx->bitmap_changes.empty() ||
+        !ctx->update_changes.empty() || !ctx->deleted_pks_in_trx.empty() ||
+        !ctx->touched_indexes.empty()) {
+      return true;
     }
-    return false;
+    for (const auto& kv : ctx->by_index) {
+      if (!kv.second.items.empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
 }

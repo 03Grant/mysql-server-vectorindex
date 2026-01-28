@@ -7,7 +7,6 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include "vec_id_alloc.h"
 #include "vec_params.h"
@@ -30,7 +29,6 @@ static constexpr char kVecIndexLoadingMsg[] = "Vector index loading, retry";
 struct vid_pk_mapping_t {
   size_t key_length{0};  // length of MySQL-format PK tuple
   std::vector<std::vector<unsigned char>> pk_values;  // indexed by faiss_id
-  std::unordered_map<std::string, uint64_t> pk_to_vid;  // packed PK -> faiss_id (Only MEM table use it)
   bool ready{false};
 
   // Sometimes we need to track _MEM index changes. Because everytime we add/remove a vector, we need to update the PK mapping.
@@ -44,7 +42,6 @@ struct vid_pk_mapping_t {
   void clear() {
     key_length = 0;
     pk_values.clear();
-    pk_to_vid.clear();
     is_mem_diff = false;
     mem_diff.clear();
     ready = false;

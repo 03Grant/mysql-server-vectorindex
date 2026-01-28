@@ -58,6 +58,14 @@ struct vec_bitmap_undo_entry_t {
   bool             old_val{false};
 };
 
+// Record inserted vector IDs for rollback cleanup.
+struct vec_insert_undo_entry_t {
+  vec_index_ctx_t* ctx{nullptr};
+  dict_index_t*    index{nullptr};
+  uint32_t         segment_id{0};
+  uint64_t         vid{0};
+};
+
 // Record update details for rollback logging.
 struct vec_update_undo_entry_t {
   dict_index_t* index{nullptr};
@@ -77,8 +85,12 @@ struct vec_trx_ctx_t {
       deleted_pks_in_trx;
   // 提交前 bitmap 改动的回滚日志
   std::vector<vec_bitmap_undo_entry_t> bitmap_changes;
+  // Inserted vector IDs to mark on rollback.
+  std::vector<vec_insert_undo_entry_t> inserted_vids;
   // Update rollback log entries (logging only).
   std::vector<vec_update_undo_entry_t> update_changes;
+  // Indexes touched by immediate inserts (for commit-time checks).
+  std::unordered_set<dict_index_t*> touched_indexes;
 };
 
 // ==== 对外 API ====
@@ -102,7 +114,7 @@ std::string vec_format_pk_columns_debug(
 // 保证事务上有一个 vec_trx_ctx，可复用
 vec_trx_ctx_t* vec_get_or_create_trx_ctx(trx_t* trx);
 
-// 在“插入/更新行”时调用：抽取向量 + 主键快照 + 放入桶
+// 在“插入/更新行”时调用：抽取向量 + 主键快照 + 立即写入向量索引与辅助表
 // 不检查度量前处理，不改动字节，只校验长度与维度。
 int vec_collect_one_row(trx_t*           trx,
                         dict_table_t*    table,
@@ -117,6 +129,14 @@ int vec_collect_one_row(std::vector<vec_item_t> &bucket,
                         const dfield_t* vector_field,
                         const unsigned  dim,
                         const dtuple_t* row_tuple);
+
+// Immediate insert path: add to vector index and aux table, record rollback info.
+dberr_t vec_insert_one_row(trx_t* trx,
+                           dict_table_t* table,
+                           dict_index_t* vindex,
+                           const std::vector<vec_pk_column_t>& pk_columns,
+                           const std::vector<float>& vec_values,
+                           uint64_t* out_vid);
 
 // 提交成功或回滚时清空
 void vec_trx_ctx_clear(vec_trx_ctx_t* ctx);
