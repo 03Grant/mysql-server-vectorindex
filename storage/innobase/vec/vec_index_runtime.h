@@ -113,6 +113,18 @@ struct vec_index_segment_t {
   bool                immutable{false};   // immutable segments are persisted to disk
 };
 
+enum class vec_delete_status_t : uint8_t {
+  PENDING = 0,
+  MARKED = 1,
+};
+
+struct vec_pending_delete_t {
+  std::string        pk_key;
+  uint32_t           segment_id{0};
+  uint64_t           vid{0};
+  vec_delete_status_t status{vec_delete_status_t::PENDING};
+};
+
 struct vec_index_ctx_t {
   std::shared_mutex         mu;
   // runtime handler, include one in_mem_index (segments[0]) and several immutable indexes.
@@ -138,6 +150,8 @@ struct vec_index_ctx_t {
   dict_table_t*              pending_aux_dict{nullptr};
 
   uint32_t                   max_vecindex_id{0};
+  // Pending deletes recorded at DML time; purge will mark bitmap then update status.
+  std::vector<vec_pending_delete_t> pending_deletes;
 
   vec_index_segment_t* mutable_segment() {
     return segments.empty() ? nullptr : &segments.front();
@@ -155,3 +169,40 @@ struct vec_index_ctx_t {
     return idx < segments.size() ? &segments[idx] : nullptr;
   }
 };
+
+// Pending delete helpers (in-memory implementation).
+// These helpers manage in-memory records describing vector deletes that should
+// be applied during purge. They are designed so the backend can later be
+// replaced by a persistent table with the same interface.
+// All helpers are thread-safe via vec_index_ctx_t::mu.
+
+// Add or update a pending delete record keyed by pk_key.
+// If a record for pk_key exists, segment_id/vid are overwritten and status is
+// reset to PENDING. Returns false if ctx is null or pk_key is empty.
+bool vec_pending_delete_add(vec_index_ctx_t* ctx, const std::string& pk_key,
+                            uint32_t segment_id, uint64_t vid);
+
+// Find a pending delete record by pk_key.
+// Copies the record into out and returns true only if status is PENDING.
+bool vec_pending_delete_find(vec_index_ctx_t* ctx, const std::string& pk_key,
+                             vec_pending_delete_t* out);
+
+// Mark a pending delete record as MARKED, typically after bitmap update.
+// Returns true if an exact (pk_key, segment_id, vid) match is found.
+bool vec_pending_delete_marked(vec_index_ctx_t* ctx, const std::string& pk_key,
+                               uint32_t segment_id, uint64_t vid);
+
+// Remove all pending delete records for the given pk_key.
+// Returns the number of records removed (0 if none).
+size_t vec_pending_delete_remove_by_pk(vec_index_ctx_t* ctx,
+                                       const std::string& pk_key);
+
+// Optional extra validation hook for pk matching before bitmap mark.
+// Current implementation compares for equality; keep as a hook for future
+// checks (e.g. collation, normalization, or external lookup).
+bool vec_pending_delete_pk_check(const std::string& expected_pk,
+                                 const std::string& actual_pk);
+
+// Find a segment by vecindex_id (segment id). Returns nullptr if not found.
+vec_index_segment_t* vec_find_segment_by_id(vec_index_ctx_t* ctx,
+                                            uint32_t seg_id);

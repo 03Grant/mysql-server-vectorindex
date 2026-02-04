@@ -1936,25 +1936,6 @@ static inline ulint vec_pk_field_count(const dict_index_t *clust_index) {
   return clust_index->n_uniq;
 }
 
-static vec_index_segment_t *vec_find_segment(vec_index_ctx_t *ctx,
-                                             uint32_t seg_id) {
-  if (ctx == nullptr) {
-    return nullptr;
-  }
-
-  for (auto &seg : ctx->segments) {
-    if (seg.vecindex_id == seg_id) {
-      return &seg;
-    }
-  }
-
-  if (seg_id == 0) {
-    return ctx->mutable_segment();
-  }
-
-  return nullptr;
-}
-
 static inline bool vec_pk_columns_ready(const std::vector<vec_pk_column_t> &cols,
                                         ulint pk_fields) {
   return pk_fields > 0 && cols.size() >= pk_fields;
@@ -2161,21 +2142,11 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
       continue;
     }
 
-    {
-      std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
-      ib::warn() << "VEC Del: vec_index mark bitmap.";
-      vec_index_segment_t *seg = vec_find_segment(ctx, target_seg_id);
-      if (seg != nullptr) {
-        std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
-        const bool old_val =
-            seg->vecindex_bitmap.is_marked(static_cast<size_t>(target_vid));
-        seg->vecindex_bitmap.set(static_cast<size_t>(target_vid), true);
-        std::lock_guard<std::mutex> trx_lock(trx_ctx->mu);
-        trx_ctx->bitmap_changes.push_back(
-            {ctx, vec_index, target_seg_id, target_vid, old_val});
-      } else {
-        ctx->needs_aux_refresh = true;
-      }
+    ib::warn() << "VEC Del: record pending bitmap mark.";
+    if (!vec_pending_delete_add(ctx, pk_key, target_seg_id, target_vid)) {
+      ib::warn() << "VEC Del: pending delete add failed index "
+                 << " seg_id=" << target_seg_id
+                 << " vid=" << target_vid;
     }
   }
 

@@ -272,3 +272,25 @@ void vec_meta_fill_entry(VecSegmentEntry* entry, uint64_t seg_id,
   }
   entry->checksum = vec_meta_checksum(*entry);
 }
+
+bool vec_meta_append_event(const dict_index_t* index, const vec_params_t& params,
+                           uint64_t seg_id, uint64_t count,
+                           VecSegmentState state,
+                           const std::string& file_name,
+                           bool has_pk_mapping) {
+  std::string meta_path;
+  if (!vec_meta_path_for_index(index, &meta_path)) {
+    return false;
+  }
+
+  VecMetaHeader header = vec_meta_make_header(index, params);
+  VecMetaFile meta_file;
+  if (!meta_file.open_or_create(meta_path, header)) {
+    return false;
+  }
+
+  VecSegmentEntry entry{};
+  vec_meta_fill_entry(&entry, seg_id, count, state, file_name,
+                      has_pk_mapping ? VEC_SEG_FLAG_HAS_PK_MAPPING : 0);
+  return meta_file.append(&entry, nullptr);
+}

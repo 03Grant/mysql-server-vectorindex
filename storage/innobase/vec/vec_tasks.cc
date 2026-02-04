@@ -3,15 +3,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <string>
+
+#include <unistd.h>
 
 #include "trx0trx.h"
 #include "ut0ut.h"
@@ -44,6 +47,137 @@
 #include "vec_txn_buf.h"
 
 namespace {
+
+constexpr uint32_t VEC_SNAPSHOT_MAGIC = 0x56454353;  // "VECS"
+constexpr uint16_t VEC_SNAPSHOT_VERSION = 1;
+
+#pragma pack(push, 1)
+struct VecSnapshotHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint64_t table_id;
+  uint64_t index_id;
+  uint64_t seg_id;
+  uint32_t dim;
+  uint64_t total;
+  uint64_t bitmap_bytes;
+  uint64_t pk_count;
+};
+#pragma pack(pop)
+
+static std::string vec_snapshot_path(const dict_index_t* index,
+                                     table_id_t table_id,
+                                     space_index_t index_id,
+                                     uint32_t seg_id) {
+  std::string meta_path;
+  if (!vec_meta_path_for_index(index, &meta_path)) {
+    return {};
+  }
+  const std::string dir = vec_meta_dirname(meta_path);
+  if (dir.empty()) {
+    return {};
+  }
+  std::string file = "vecsnap_";
+  file.append(std::to_string(static_cast<unsigned long long>(table_id)));
+  file.push_back('_');
+  file.append(std::to_string(static_cast<unsigned long long>(index_id)));
+  file.push_back('_');
+  file.append(std::to_string(static_cast<unsigned long long>(seg_id)));
+  file.append(".tmp");
+  return vec_meta_join(dir, file);
+}
+
+static bool vec_write_segment_snapshot(dict_index_t* index,
+                                       vec_index_ctx_t* ctx,
+                                       vec_index_segment_t* seg,
+                                       table_id_t table_id,
+                                       space_index_t index_id) {
+  if (index == nullptr || ctx == nullptr || seg == nullptr ||
+      seg->index == nullptr) {
+    return false;
+  }
+
+  const std::string path =
+      vec_snapshot_path(index, table_id, index_id, seg->vecindex_id);
+  if (path.empty()) {
+    return false;
+  }
+
+  FILE* fp = std::fopen(path.c_str(), "wb");
+  if (fp == nullptr) {
+    return false;
+  }
+
+  auto close_guard = std::unique_ptr<FILE, decltype(&std::fclose)>(
+      fp, &std::fclose);
+
+  auto write_bytes = [&](const void* data, size_t len) -> bool {
+    return (len == 0) || (std::fwrite(data, 1, len, fp) == len);
+  };
+
+  const size_t dim = ctx->params.dim;
+  std::shared_lock<std::shared_mutex> seg_lock;
+  if (seg->rw_lock) {
+    seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
+  }
+
+  const uint64_t total = seg->index->ntotal();
+  const uint64_t bitmap_bytes = seg->vecindex_bitmap.bits.size();
+  const uint64_t pk_count = seg->vid_pk_mapping.pk_values.size();
+
+  VecSnapshotHeader header{};
+  header.magic = VEC_SNAPSHOT_MAGIC;
+  header.version = VEC_SNAPSHOT_VERSION;
+  header.reserved = 0;
+  header.table_id = static_cast<uint64_t>(table_id);
+  header.index_id = static_cast<uint64_t>(index_id);
+  header.seg_id = static_cast<uint64_t>(seg->vecindex_id);
+  header.dim = static_cast<uint32_t>(dim);
+  header.total = total;
+  header.bitmap_bytes = bitmap_bytes;
+  header.pk_count = pk_count;
+
+  if (!write_bytes(&header, sizeof(header))) {
+    return false;
+  }
+
+  if (!write_bytes(seg->vecindex_bitmap.bits.data(),
+                   static_cast<size_t>(bitmap_bytes))) {
+    return false;
+  }
+
+  for (const auto& pk : seg->vid_pk_mapping.pk_values) {
+    const uint32_t len = static_cast<uint32_t>(pk.size());
+    if (!write_bytes(&len, sizeof(len))) {
+      return false;
+    }
+    if (!write_bytes(pk.data(), pk.size())) {
+      return false;
+    }
+  }
+
+  if (dim != 0 && total != 0) {
+    std::vector<float> buf(dim);
+    for (uint64_t i = 0; i < total; ++i) {
+      if (!seg->index->reconstruct(static_cast<size_t>(i), buf.data())) {
+        return false;
+      }
+      if (!write_bytes(buf.data(), dim * sizeof(float))) {
+        return false;
+      }
+    }
+  }
+
+  if (std::fflush(fp) != 0) {
+    return false;
+  }
+  const int fd = fileno(fp);
+  if (fd < 0 || fsync(fd) != 0) {
+    return false;
+  }
+  return true;
+}
 
 static bool vec_should_skip_task(const dict_index_t* index) {
   if (index == nullptr || index->table == nullptr) {
@@ -685,28 +819,18 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
     return false;
   }
 
-  // Prepare metadata entry (append-only; crash recovery TODO).
-  std::string meta_path;
-  VecMetaFile meta_file;
-  VecSegmentEntry meta_entry{};
-  long meta_offset = -1;
-  bool meta_ready = false;
-  if (vec_meta_path_for_index(index, &meta_path)) {
-    VecMetaHeader header = vec_meta_make_header(index, ctx->params);
-    if (meta_file.open_or_create(meta_path, header)) {
-      vec_meta_fill_entry(&meta_entry,
-                          static_cast<uint64_t>(seg->vecindex_id),
-                          static_cast<uint64_t>(ids.size()),
-                          VecSegmentState::Preparing,
-                          vec_meta_basename(index_path));
-      meta_ready = meta_file.append(&meta_entry, &meta_offset);
-    } else {
-      ib::warn() << "VECMETA: unable to open meta file '" << meta_path << "'";
+  const std::string index_basename = vec_meta_basename(index_path);
+  auto log_event = [&](VecSegmentState state, bool has_pk_mapping) {
+    if (!vec_meta_append_event(index, ctx->params,
+                               static_cast<uint64_t>(seg->vecindex_id),
+                               static_cast<uint64_t>(ids.size()),
+                               state, index_basename, has_pk_mapping)) {
+      ib::warn() << "VECMETA: failed to append event state="
+                 << static_cast<unsigned>(state) << " seg_id="
+                 << seg->vecindex_id;
     }
-  } else {
-    ib::warn() << "VECMETA: failed to derive meta path for index "
-               << (index->name ? index->name : "(null)");
-  }
+  };
+  log_event(VecSegmentState::Preparing, false);
 
   auto target = ctx->params.backend == BackendType::Faiss
                     ? vec_make_faiss_index(ctx->params)
@@ -723,6 +847,7 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
   }
   
   target->save(index_path);
+  log_event(VecSegmentState::BuiltIndex, false);
   const std::string mapping_path = vec_vid_pk_mapping_path(index_path);
   bool pk_mapping_saved = false;
   if (!mapping_path.empty()) {
@@ -731,6 +856,8 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
     if (!pk_mapping_saved) {
       ib::warn() << "VECINDEX: failed to persist PK mapping to '"
                  << mapping_path << "'";
+    } else {
+      log_event(VecSegmentState::PkmapSaved, true);
     }
   }
 
@@ -768,16 +895,7 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
     ib::warn() << "VECINDEX: aux backfill skipped (no THD)";
   }
 
-  if (meta_ready) {
-    if (pk_mapping_saved) {
-      vec_meta_mark_pk_mapping(&meta_entry, true);
-    }
-    meta_entry.state = static_cast<uint8_t>(VecSegmentState::Committed);
-    if (!meta_file.overwrite(meta_offset, &meta_entry)) {
-      ib::warn() << "VECMETA: failed to commit meta entry for seg "
-                 << seg->vecindex_id;
-    }
-  }
+  log_event(VecSegmentState::Committed, pk_mapping_saved);
 
   clear_build_flag();
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Finished building index segment.";
@@ -840,6 +958,23 @@ bool vec_rotate_mem_index_bg(table_id_t table_id, space_index_t index_id) {
       if (!rename_committed) {
         guard.rollback();
       }
+      if (rename_committed) {
+        vec_index_segment_t* staging_seg = nullptr;
+        {
+          std::shared_lock<std::shared_mutex> lk(ctx->mu);
+          if (!ctx->segments.empty()) {
+            staging_seg = &ctx->segments.back();
+          }
+        }
+        if (staging_seg != nullptr && staging_seg->immutable) {
+          if (!vec_write_segment_snapshot(index, ctx, staging_seg, table_id,
+                                          index_id)) {
+            ib::warn() << "VECMETA: failed to write segment snapshot for index "
+                       << (index->name ? index->name : "(null)")
+                       << " seg_id=" << staging_seg->vecindex_id;
+          }
+        }
+      }
     } else {
       guard.rollback();
     }
@@ -847,6 +982,8 @@ bool vec_rotate_mem_index_bg(table_id_t table_id, space_index_t index_id) {
     dd_table_close(table, guard.thd(), &mdl, false);
   }
 
+  
+  // TODO now we no longer need the build guard, because we don't have trx task in vec_bg_build_task;
   if (rename_committed) {
     VecBgThdGuard build_guard;
     if (!build_guard.create()) {

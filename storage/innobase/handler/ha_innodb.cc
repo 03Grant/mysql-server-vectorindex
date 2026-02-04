@@ -11801,6 +11801,9 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
 
     innobase_srv_conc_exit_innodb(m_prebuilt);
 
+    if (search_err == DB_RECORD_NOT_FOUND) {
+      continue;
+    }
     if (search_err != DB_SUCCESS) {
       vec_clear_row_cache();
       return convert_error_code_to_mysql(search_err, 0, thd);
@@ -11846,6 +11849,9 @@ int ha_innobase::ha_vec_fetch_rows(const std::vector<Vec_hit> &batch,
   }
 
   const auto &row = m_vec_row_cache_rows[read_no];
+  if (row.empty()) {
+    return HA_ERR_KEY_NOT_FOUND;
+  }
   if (row.size() != table->s->reclength) {
     return HA_ERR_INTERNAL_ERROR;
   }

@@ -372,10 +372,14 @@ void vec_on_trx_rollback(trx_t* trx) {
     }
     ib::warn() << "VEC_ROLLBACK_DELETE: index=" << vec_index_name(index)
                << " count=" << keys.size();
+    vec_index_ctx_t* ctx = index != nullptr ? index->vec_runtime : nullptr;
     for (const auto& key : keys) {
       ib::warn() << "VEC_ROLLBACK_DELETE: index=" << vec_index_name(index)
                  << " pk_key_bytes=" << key.size()
                  << " pk_key_hex=" << vec_hex_preview(key, kVecRollbackHexPreviewBytes);
+      if (ctx != nullptr) {
+        vec_pending_delete_remove_by_pk(ctx, key);
+      }
     }
   }
 
