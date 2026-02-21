@@ -64,6 +64,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "read0read.h"
 #include "record_buffer.h"
 #include "rem0cmp.h"
+#include "rem0rec.h"
 #include "row0mysql.h"
 #include "row0row.h"
 #include "row0upd.h"
@@ -2902,6 +2903,20 @@ bool row_sel_store_mysql_rec(byte *mysql_rec, row_prebuilt_t *prebuilt,
 
   ut_ad(rec_clust || rec_index == prebuilt_index);
   ut_ad(!rec_clust || rec_index->is_clustered());
+
+  if (prebuilt != nullptr) {
+    if (rec_index != nullptr && rec_index->is_clustered()) {
+      const ulint *trx_offsets = offsets;
+      Rec_offsets offsets_holder;
+      if (trx_offsets == nullptr) {
+        trx_offsets = offsets_holder.compute(rec, rec_index);
+      }
+      prebuilt->last_vis_trx_id =
+          row_get_rec_trx_id(rec, rec_index, trx_offsets);
+    } else {
+      prebuilt->last_vis_trx_id = 0;
+    }
+  }
 
   /* If blob_heap provided by the caller is not that of prebuilt's blob heap
   then the onus would be on the caller to empty the blob heap if required. */

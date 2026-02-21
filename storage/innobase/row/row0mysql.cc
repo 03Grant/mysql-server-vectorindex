@@ -2086,46 +2086,32 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
       trx_ctx->deleted_pks_in_trx[vec_index].insert(pk_key);
     }
 
-    struct SegInfo {
-      uint32_t id;
-      std::string aux_name;
-    };
-    std::vector<SegInfo> candidates;
+    std::string aux_name;
     {
       std::shared_lock<std::shared_mutex> lock(ctx->mu);
-      const std::string prefix =
-          ctx->index_name_prefix.empty() ? vec_aux_prefix(vec_index)
-                                         : ctx->index_name_prefix;
-      for (auto &seg : ctx->segments) {
-        std::string aux_name = seg.aux_table_name;
-        if (aux_name.empty() && !prefix.empty()) {
-          aux_name = seg.immutable ? vec_aux_segment_name(prefix, seg.vecindex_id)
-                                   : vec_aux_mem_name(prefix);
-        }
-        candidates.push_back({seg.vecindex_id, aux_name});
-      }
+      aux_name = ctx->aux_table_name;
+    }
+    if (aux_name.empty()) {
+      aux_name = vec_aux_active_name(vec_index);
+    }
+    if (aux_name.empty()) {
+      ib::warn() << "VEC Del: missing aux table name for index "
+                 << (vec_index->name ? vec_index->name : "(null)");
+      continue;
     }
 
-    uint32_t target_seg_id = UINT32_MAX;
-    uint64_t target_vid = 0;
+    std::string target_seg_id;
     bool found = false;
     ib::warn() << "VEC Del: Delete vec_index loop.";
-    for (const auto &seg_info : candidates) {
-      uint64_t vid = 0;
-      ib::warn() << "VEC Del: Delete vec_index segment " << seg_info.aux_name;
-      dberr_t del_err = vec_aux_handler_delete(
-          trx, seg_info.aux_name, clust_index, pk_fields, pk_columns, &vid);
-      if (del_err == DB_SUCCESS) {
-        target_seg_id = seg_info.id;
-        target_vid = vid;
-        found = true;
-        ib::warn() << "VEC Del: Delete found in segment " << target_seg_id
-                   << " with vid " << target_vid;
-        break;
-      } else if (del_err == DB_DEADLOCK ||
-                 del_err == DB_LOCK_WAIT_TIMEOUT) {
-        return del_err;
-      }
+    ib::warn() << "VEC Del: Delete vec_index aux " << aux_name;
+    dberr_t del_err = vec_aux_handler_delete(
+        trx, aux_name, clust_index, pk_fields, pk_columns, &target_seg_id);
+    if (del_err == DB_SUCCESS) {
+      found = true;
+      ib::warn() << "VEC Del: Delete found in seg_id " << target_seg_id;
+    } else if (del_err == DB_DEADLOCK ||
+               del_err == DB_LOCK_WAIT_TIMEOUT) {
+      return del_err;
     }
 
     if (!found) {
@@ -2133,20 +2119,8 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
       continue;
     }
 
-    /* If this delete is only canceling an uncommitted insert, we still
-    delete the aux-row but skip bitmap marking to avoid touching a bogus
-    VID (e.g. UINT64_MAX). */
-    if (target_vid == std::numeric_limits<uint64_t>::max()) {
-      ib::warn() << "VEC Del: skip bitmap mark due to sentinel vid="
-                 << target_vid;
+    if (target_seg_id.empty()) {
       continue;
-    }
-
-    ib::warn() << "VEC Del: record pending bitmap mark.";
-    if (!vec_pending_delete_add(ctx, pk_key, target_seg_id, target_vid)) {
-      ib::warn() << "VEC Del: pending delete add failed index "
-                 << " seg_id=" << target_seg_id
-                 << " vid=" << target_vid;
     }
   }
 
@@ -2274,15 +2248,6 @@ static dberr_t row_vecindex_update(row_prebuilt_t *prebuilt) {
     }
   }
 
-  if (node_ctx != nullptr) {
-    node_ctx->vec_delete_pk_columns = old_pk_columns;
-    node_ctx->vec_delete_pk_fields = pk_fields;
-  }
-  dberr_t del_err = row_vecindex_delete(prebuilt, nullptr);
-  if (del_err != DB_SUCCESS) {
-    return del_err;
-  }
-
   for (auto *vec_index : vec_indexes) {
     const std::vector<float> *vec_values =
         vec_find_update_vec(vec_entries, vec_index);
@@ -2291,11 +2256,48 @@ static dberr_t row_vecindex_update(row_prebuilt_t *prebuilt) {
                  << (vec_index->name ? vec_index->name : "(null)") << "'";
       return DB_ERROR;
     }
+
+    std::string new_seg_id;
     dberr_t ins_err =
-        vec_insert_one_row(trx, table, vec_index, new_pk_columns, *vec_values,
-                           nullptr);
+        vec_insert_one_row_no_aux(trx, table, vec_index, new_pk_columns,
+                                  *vec_values, nullptr, &new_seg_id, 0);
     if (ins_err != DB_SUCCESS) {
       return ins_err;
+    }
+
+    vec_index_ctx_t *ctx = vec_index->vec_runtime;
+    if (ctx == nullptr) {
+      ib::warn() << "VEC Upd: ctx nullptr";
+      return DB_ERROR;
+    }
+
+    std::string aux_name;
+    {
+      std::shared_lock<std::shared_mutex> lock(ctx->mu);
+      aux_name = ctx->aux_table_name;
+    }
+    if (aux_name.empty()) {
+      aux_name = vec_aux_active_name(vec_index);
+    }
+    if (aux_name.empty()) {
+      ib::warn() << "VEC Upd: missing aux table name for index "
+                 << (vec_index->name ? vec_index->name : "(null)");
+      return DB_ERROR;
+    }
+
+    std::string old_seg_id;
+    dberr_t upd_err = vec_aux_handler_update(
+        trx, aux_name, clust_index, pk_fields, old_pk_columns, new_pk_columns,
+        new_seg_id, &old_seg_id);
+    if (upd_err == DB_RECORD_NOT_FOUND) {
+      ib::warn() << "VEC Upd: AUX record not found for index '"
+                 << (vec_index->name ? vec_index->name : "(null)") << "'";
+      return upd_err;
+    } else if (upd_err == DB_DEADLOCK ||
+               upd_err == DB_LOCK_WAIT_TIMEOUT) {
+      return upd_err;
+    } else if (upd_err != DB_SUCCESS) {
+      return upd_err;
     }
   }
 

@@ -78,62 +78,6 @@ check.
 If you make a change in this module make sure that no codepath is
 introduced where a call to log_free_check() is bypassed. */
 
-static inline ulint vec_pk_field_count(const dict_index_t *clust_index) {
-  if (clust_index == nullptr) {
-    return 0;
-  }
-  if (clust_index->name != nullptr &&
-      std::strcmp(clust_index->name, "GEN_CLUST_INDEX") == 0) {
-    return 1;
-  }
-  return clust_index->n_uniq;
-}
-
-static void row_purge_vecindex_mark(purge_node_t *node,
-                                    dict_index_t *vec_index) {
-  if (node == nullptr || vec_index == nullptr || node->table == nullptr) {
-    return;
-  }
-
-  vec_index_ctx_t *ctx = vec_index->vec_runtime;
-  if (ctx == nullptr) {
-    return;
-  }
-
-  dict_index_t *clust = node->table->first_index();
-  const ulint pk_fields = vec_pk_field_count(clust);
-  if (pk_fields == 0 || node->row == nullptr) {
-    return;
-  }
-
-  const std::string pk_key =
-      vec_pack_pk_key_from_tuple(node->table, node->row, pk_fields);
-  if (pk_key.empty()) {
-    return;
-  }
-
-  vec_pending_delete_t rec;
-  if (!vec_pending_delete_find(ctx, pk_key, &rec)) {
-    return;
-  }
-
-  if (!vec_pending_delete_pk_check(rec.pk_key, pk_key)) {
-    return;
-  }
-
-  vec_index_segment_t *seg = vec_find_segment_by_id(ctx, rec.segment_id);
-  if (seg == nullptr || seg->rw_lock == nullptr) {
-    ctx->needs_aux_refresh = true;
-    return;
-  }
-
-  {
-    std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
-    seg->vecindex_bitmap.set(static_cast<size_t>(rec.vid), true);
-  }
-
-  vec_pending_delete_marked(ctx, pk_key, rec.segment_id, rec.vid);
-}
 
 /** Create a purge node to a query graph.
 @param[in]      parent  parent node, i.e., a thr node
@@ -731,9 +675,7 @@ static inline void row_purge_remove_multi_sec_if_poss(purge_node_t *node,
     }
 
     if (node->index->type & DICT_VECINDEX) {
-      row_purge_vecindex_mark(node, node->index);
       node->index = node->index->next();
-      ib::warn() << "VEC Delete: purge marked.";
       continue;
     }
 
@@ -789,9 +731,7 @@ static void row_purge_upd_exist_or_extern_func(IF_DEBUG(const que_thr_t *thr, )
     }
 
     if (node->index->type & DICT_VECINDEX) {
-      row_purge_vecindex_mark(node, node->index);
       node->index = node->index->next();
-      ib::warn() << "VEC Update: purge marked.";
       continue;
     }
 

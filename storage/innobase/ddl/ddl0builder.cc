@@ -40,9 +40,11 @@ Created 2020-11-01 by Sunny Bains. */
 #include "ddl0impl-rtree.h"
 #include "lob0lob.h"
 #include "os0thread-create.h"
+#include "rem0rec.h"
 #include "row0ext.h"
 #include "row0vers.h"
 #include "ut0stage.h"
+#include "storage/innobase/vec/vec_aux_tables.h"
 #include "storage/innobase/vec/vec_txn_buf.h"
 
 namespace ddl {
@@ -1385,16 +1387,42 @@ dberr_t Builder::vector_add_row(Row &row, size_t thread_id) noexcept {
 
   const dfield_t *vector_field = dtuple_get_nth_field(tuple, col_no);
   const unsigned dim = static_cast<unsigned>(vec_index->vec_params->dim);
-  //trx_t *trx = m_ctx.m_trx;
+  trx_t *trx = m_ctx.m_trx;
   dict_table_t *table = m_ctx.m_new_table;
 
-  int rc = vec_collect_one_row(this->m_thread_ctxs[thread_id]->m_vec_items, table, vec_index, vector_field, dim, tuple);
+  std::vector<vec_pk_column_t> pk_columns;
+  std::string seg_id;
+  trx_id_t creator_trx_id = 0;
+  if (row.m_rec != nullptr) {
+    const dict_index_t *clust_index = m_ctx.index();
+    if (clust_index != nullptr && clust_index->is_clustered()) {
+      creator_trx_id = rec_get_trx_id(row.m_rec, clust_index);
+    }
+  }
+
+  int rc = vec_collect_one_row_no_aux(trx, table, vec_index, vector_field, dim,
+                                      tuple, &pk_columns, &seg_id,
+                                      creator_trx_id);
   if (rc != 0) {
-    ib::warn() << "VECINDEX: buffering row for index '"
+    dberr_t vec_err = trx->error_state;
+    if (vec_err == DB_SUCCESS) {
+      vec_err = DB_ERROR;
+    }
+    ib::warn() << "VECINDEX: inserting row for index '"
                << (vec_index->name ? vec_index->name : "(null)")
-               << "' failed with rc=" << rc;
+               << "' failed with rc=" << rc
+               << " error_state=" << vec_err;
+    return vec_err;
+  }
+
+  if (seg_id.empty()) {
+    ib::warn() << "VECINDEX: missing seg_id for index '"
+               << (vec_index->name ? vec_index->name : "(null)") << "'";
     return DB_ERROR;
   }
+
+  auto *thread_ctx = m_thread_ctxs[thread_id];
+  thread_ctx->m_vec_aux_rows.push_back({std::move(pk_columns), seg_id});
 
   return DB_SUCCESS;
 }
@@ -2020,38 +2048,26 @@ dberr_t Builder::fts_sort_and_build() noexcept {
 }
 
 dberr_t Builder::flush_vector_rows() noexcept {
-  vec_trx_ctx_t *tctx = vec_get_or_create_trx_ctx(m_ctx.m_trx);
-  if (tctx == nullptr) {
-    return DB_ERROR;
-  }
   dict_index_t *index = m_index;
-  auto &global_bucket = tctx->by_index[index];
-
-  if (global_bucket.index == nullptr) {
-    global_bucket.index = index;
-    global_bucket.dim = index->vec_params->dim;
-    global_bucket.aux_mode = vec_aux_mode_t::DIRECT_INSERT;
+  if (index == nullptr || !is_vector_index()) {
+    return DB_SUCCESS;
   }
 
-  if (global_bucket.aux_mode == vec_aux_mode_t::UNKNOWN) {
-    global_bucket.aux_mode = vec_aux_mode_t::DIRECT_INSERT;
-  } else if (global_bucket.aux_mode != vec_aux_mode_t::DIRECT_INSERT) {
-    ib::warn() << "VECINDEX: inconsistent aux mode when flushing vector rows";
+  trx_t *trx = m_ctx.m_trx;
+  if (trx == nullptr) {
     return DB_ERROR;
   }
 
   for (auto *thread_ctx : m_thread_ctxs) {
-    auto &items = thread_ctx->m_vec_items;
-    // ib::warn() << "VECINDEX: flushing " << items.size()
-    //            << " buffered rows for index '"
-    //            << (index->name ? index->name : "(null)") << "'";
-    if (!items.empty()) {
-      const auto old_size = global_bucket.items.size();
-      global_bucket.items.resize(old_size + items.size());
-      std::move(items.begin(), items.end(), global_bucket.items.begin() + old_size);
-      items.clear();
-      items.shrink_to_fit();
+    auto &rows = thread_ctx->m_vec_aux_rows;
+    for (auto &row : rows) {
+      dberr_t err = vec_aux_insert_one(trx, index, row.pk_columns, row.seg_id);
+      if (err != DB_SUCCESS) {
+        return err;
+      }
     }
+    rows.clear();
+    rows.shrink_to_fit();
   }
 
   return DB_SUCCESS;

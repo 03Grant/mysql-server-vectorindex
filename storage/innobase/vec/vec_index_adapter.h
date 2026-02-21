@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include "vec_params.h"
-#include "univ.i" 
+#include "univ.i"
 #include "db0err.h"
+#include "trx0types.h"
 
 struct vec_index_ctx_t;
 struct dict_index_t;
@@ -43,5 +45,6 @@ int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   
 int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n);
 
 int vec_search(vec_index_ctx_t& ctx, const float* q, size_t nq,
-           size_t k, float* distances, int64_t* labels, uint32_t* segments,
+           size_t k, float* distances, int64_t* labels, std::string* segments,
+           trx_id_t* trx_ids,
            const VecRuntimeSearchParams* params = nullptr);                   // 召回

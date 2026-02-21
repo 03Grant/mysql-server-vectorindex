@@ -17,7 +17,7 @@ struct vec_index_segment_t;
 class THD;
 
 struct VecBuildTask {
-  table_id_t table_id{0};
+  dict_index_t* index{nullptr};
   space_index_t index_id{0};
 };
 
@@ -52,18 +52,13 @@ class VecTaskManager {
   std::atomic<bool> running{false};
 };
 
-/* Performs the lightweight rotation (rename current mutable aux table to a
-segment, create fresh mutable aux table, swap runtime segments).
+/* Performs the lightweight rotation (swap mutable/immutable segments).
 Caller must provide an active transaction. Returns true on success. */
 bool vec_rotate_mem_index(trx_t* trx, dict_index_t* index);
 
-/* Prepare a fresh aux table in the caller (user) THD before scheduling a
-rotation. This creates the table and registers DD immediately, leaving it
-ready to be renamed to *_MEM by the background rotate task. */
-bool vec_prepare_pending_mem_table(dict_index_t* index);
-
+// SINGLEAXU:DELETE
 /* Load vid->PK mapping for a specific immutable segment. Prefer persisted
-   mapping files when available; fall back to scanning the aux table. */
+   mapping files when available. */
 bool vec_load_aux_cache_for_segment(dict_index_t* vec_index,
                                     vec_index_ctx_t* ctx,
                                     vec_index_segment_t* seg, THD* thd);

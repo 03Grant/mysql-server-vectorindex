@@ -38,6 +38,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0pread.h"
 #include "storage/innobase/vec/vec_txn_buf.h"
 
+#include <string>
+#include <vector>
+
 namespace ddl {
 
 // Forward declaration.
@@ -234,6 +237,11 @@ struct Builder {
   static void write_redo(const dict_index_t *index) noexcept;
 
  private:
+  struct Vec_aux_row {
+    std::vector<vec_pk_column_t> pk_columns;
+    std::string seg_id;
+  };
+
   /** State of a cluster index reader thread. */
   struct Thread_ctx {
     /** Constructor.
@@ -270,8 +278,9 @@ struct Builder {
     /** For spatial/Rtree rows handling. */
     RTree_inserter *m_rtree_inserter{};
 
-    /** For vector index rows handling. */
-    std::vector<vec_item_t> m_vec_items;
+    /** Deferred aux table inserts for vector index rows. */
+    std::vector<Vec_aux_row> m_vec_aux_rows;
+
   };
 
   using Allocator = ut::allocator<Thread_ctx *>;

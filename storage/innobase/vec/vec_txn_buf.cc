@@ -300,13 +300,7 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
 
   {
     std::lock_guard<std::mutex> lk(ctx->mu);
-    for (auto &kv : ctx->by_index) {
-      kv.second.items.clear();
-      kv.second.inserted_keys.clear();
-      kv.second.aux_mode = vec_aux_mode_t::UNKNOWN;
-    }
     ctx->deleted_pks_in_trx.clear();
-    ctx->bitmap_changes.clear();
     ctx->inserted_vids.clear();
     ctx->update_changes.clear();
     ctx->touched_indexes.clear();
@@ -314,7 +308,6 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
 
   trx_t *owner = ctx->owner;
   if (owner == nullptr) {
-    ctx->by_index.clear();
     return;
   }
 
@@ -328,9 +321,7 @@ void vec_trx_ctx_clear(vec_trx_ctx_t *ctx) {
     }
   }
 
-  if (!owned) {
-    ctx->by_index.clear();
-  }
+  (void)owned;
 }
 
 // Immediate insert into vector index + aux table with rollback tracking.
@@ -367,7 +358,7 @@ dberr_t vec_insert_one_row(trx_t *trx, dict_table_t *table,
   }
 
   uint64_t vid = 0;
-  uint32_t seg_id = 0;
+  std::string seg_id;
   dberr_t cache_err = DB_SUCCESS;
   {
     std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
@@ -382,10 +373,12 @@ dberr_t vec_insert_one_row(trx_t *trx, dict_table_t *table,
     const int64_t id = static_cast<int64_t>(vid);
     seg->index->add(1, vec_values.data(), &id);
     seg_id = seg->vecindex_id;
+    if (seg_id.empty()) {
+      return DB_ERROR;
+    }
 
-    cache_err =
-        vec_insert_aux_cache(&seg->vid_pk_mapping, clust, vid, pk_columns);
-    seg->vecindex_bitmap.ensure_size(seg->vid_pk_mapping.size());
+    cache_err = vec_insert_aux_cache(&seg->vid_pk_mapping, clust, vid,
+                                     pk_columns, trx->id);
   }
 
   {
@@ -398,7 +391,7 @@ dberr_t vec_insert_one_row(trx_t *trx, dict_table_t *table,
     return cache_err;
   }
 
-  dberr_t aux_err = vec_aux_insert_one(trx, vindex, pk_columns, vid);
+  dberr_t aux_err = vec_aux_insert_one(trx, vindex, pk_columns, seg_id);
   if (aux_err != DB_SUCCESS) {
     return aux_err;
   }
@@ -462,28 +455,153 @@ int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
   return 0;
 }
 
-// 放入已有的bucket中
-int vec_collect_one_row(std::vector<vec_item_t> &bucket, dict_table_t *table, dict_index_t *vindex,
-                        const dfield_t *vector_field, const unsigned dim,
-                        const dtuple_t *row_tuple){
-
-  if (!table || !vindex || !vector_field || !row_tuple || dim == 0) {
-    return -1;
-  }
-  vec_item_t item;
-  if (!vec_extract_and_validate(vector_field, dim, item.vec)) {
-    return -2;  // 长度/数据非法
+// Insert into vector index + aux cache, skip aux table insert (DDL use).
+// If creator_trx_id is provided, use it for aux cache tracking instead of current trx id.
+dberr_t vec_insert_one_row_no_aux(
+    trx_t *trx, dict_table_t *table, dict_index_t *vindex,
+    const std::vector<vec_pk_column_t> &pk_columns,
+    const std::vector<float> &vec_values, uint64_t *out_vid,
+    std::string *out_seg_id, trx_id_t creator_trx_id) {
+  if (trx == nullptr || table == nullptr || vindex == nullptr) {
+    return DB_ERROR;
   }
 
-  if (!vec_capture_pk_columns(table, row_tuple, item.pk_columns)) {
-    return -3;
+  const vec_params_t *params = vindex->vec_params;
+  const unsigned dim = params != nullptr ? params->dim : 0;
+  if (dim == 0 || vec_values.size() != dim) {
+    return DB_ERROR;
   }
 
-  bucket.emplace_back(std::move(item));
-  return 0;
+  dict_index_t *clust = table->first_index();
+  const ulint pk_fields = vec_pk_field_count(clust);
+  if (clust == nullptr || pk_fields == 0 ||
+      !vec_pk_columns_ready(pk_columns, pk_fields)) {
+    return DB_ERROR;
+  }
+
+  vec_index_ctx_t *ctx = vindex->vec_runtime;
+  if (ctx == nullptr) {
+    return DB_ERROR;
+  }
+
+  vec_trx_ctx_t *tctx = vec_get_or_create_trx_ctx(trx);
+  if (tctx == nullptr) {
+    return DB_ERROR;
+  }
+
+  uint64_t vid = 0;
+  std::string seg_id;
+  dberr_t cache_err = DB_SUCCESS;
+  {
+    std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+    vec_index_segment_t *seg = ctx->mutable_segment();
+    if (seg == nullptr || seg->index == nullptr || seg->rw_lock == nullptr) {
+      return DB_ERROR;
+    }
+
+    std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+    const size_t before = seg->index->ntotal();
+    vid = static_cast<uint64_t>(before);
+    const int64_t id = static_cast<int64_t>(vid);
+    seg->index->add(1, vec_values.data(), &id);
+    seg_id = seg->vecindex_id;
+    if (seg_id.empty()) {
+      return DB_ERROR;
+    }
+
+    const trx_id_t real_trx_id =
+        (creator_trx_id != 0) ? creator_trx_id : trx->id;
+    cache_err = vec_insert_aux_cache(&seg->vid_pk_mapping, clust, vid,
+                                     pk_columns, real_trx_id);
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(tctx->mu);
+    tctx->inserted_vids.push_back({ctx, vindex, seg_id, vid});
+    tctx->touched_indexes.insert(vindex);
+  }
+
+  if (cache_err != DB_SUCCESS) {
+    return cache_err;
+  }
+
+  if (out_vid != nullptr) {
+    *out_vid = vid;
+  }
+  if (out_seg_id != nullptr) {
+    *out_seg_id = seg_id;
+  }
+
+  return DB_SUCCESS;
 }
 
 
+
+// —— DDL 路径：立即写入索引与缓存，延后 aux 表写入 ——
+int vec_collect_one_row_no_aux(trx_t *trx, dict_table_t *table,
+                               dict_index_t *vindex,
+                               const dfield_t *vector_field,
+                               const unsigned dim,
+                               const dtuple_t *row_tuple,
+                               std::vector<vec_pk_column_t> *out_pk_columns,
+                               std::string *out_seg_id,
+                               trx_id_t creator_trx_id) {
+  if (!trx || !table || !vindex || !vector_field || !row_tuple || dim == 0) {
+    return -1;
+  }
+
+  dict_index_t *clust = table->first_index();
+  const ulint pk_fields = vec_pk_field_count(clust);
+  if (clust == nullptr || pk_fields == 0) {
+    trx->error_state = DB_ERROR;
+    return -1;
+  }
+
+  vec_index_ctx_t *ctx = vindex->vec_runtime;
+  if (ctx != nullptr) {
+    const VecBootstrapState state =
+        ctx->bootstrap_state.load(std::memory_order_acquire);
+    if (state != VecBootstrapState::READY) {
+      if (state == VecBootstrapState::NOT_STARTED ||
+          state == VecBootstrapState::FAILED) {
+        vec_schedule_bootstrap_load(vindex);
+      }
+      my_error(ER_INTERNAL_ERROR, MYF(0), kVecIndexLoadingMsg);
+      trx->error_state = DB_VECINDEX_NOT_READY;
+      return -7;
+    }
+  }
+
+  std::vector<float> vec_values;
+  if (!vec_extract_and_validate(vector_field, dim, vec_values)) {
+    trx->error_state = DB_ERROR;
+    return -2;  // 长度/数据非法
+  }
+
+  std::vector<vec_pk_column_t> pk_columns;
+  if (!vec_capture_pk_columns(table, row_tuple, pk_columns)) {
+    trx->error_state = DB_ERROR;
+    return -3;
+  }
+
+  std::string seg_id;
+  dberr_t ins_err = vec_insert_one_row_no_aux(
+      trx, table, vindex, pk_columns, vec_values, nullptr, &seg_id,
+      creator_trx_id);
+  if (ins_err != DB_SUCCESS) {
+    trx->error_state = ins_err;
+    return -5;
+  }
+
+  if (out_pk_columns != nullptr) {
+    *out_pk_columns = std::move(pk_columns);
+  }
+  if (out_seg_id != nullptr) {
+    *out_seg_id = seg_id;
+  }
+
+  return 0;
+}
 
 vec_trx_ctx_t* vec_lookup_trx_ctx(trx_t* trx) {
     std::lock_guard<std::mutex> g(g_trx_ctx_mu);
@@ -494,15 +612,10 @@ vec_trx_ctx_t* vec_lookup_trx_ctx(trx_t* trx) {
 bool vec_trx_has_work(trx_t* trx) {
   if (auto* ctx = vec_lookup_trx_ctx(trx)) {
     std::lock_guard<std::mutex> lk(ctx->mu);
-    if (!ctx->inserted_vids.empty() || !ctx->bitmap_changes.empty() ||
-        !ctx->update_changes.empty() || !ctx->deleted_pks_in_trx.empty() ||
+    if (!ctx->inserted_vids.empty() || !ctx->update_changes.empty() ||
+        !ctx->deleted_pks_in_trx.empty() ||
         !ctx->touched_indexes.empty()) {
       return true;
-    }
-    for (const auto& kv : ctx->by_index) {
-      if (!kv.second.items.empty()) {
-        return true;
-      }
     }
   }
   return false;

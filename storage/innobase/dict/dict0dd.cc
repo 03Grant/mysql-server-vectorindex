@@ -7169,6 +7169,12 @@ static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
       }
       out->set_char_length(static_cast<uint>(c->len));
       break;
+    case DATA_VARCHAR:
+      // DATA_VARCHAR is used for true VARCHAR with latin1 collation.
+      out->set_type(dd::enum_column_types::VARCHAR);
+      out->set_collation_id(my_charset_latin1.number);
+      out->set_char_length(static_cast<uint>(c->len));
+      break;
 
     case DATA_BLOB:
       out->set_type(dd::enum_column_types::BLOB);
@@ -7267,7 +7273,30 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
 
   vec_dd_add_index_elements(dd_pk, aux_pk, dd_cols);
 
-  // 4) u_faiss_id secondary index disabled.
+  // 4) Secondary index on seg_id (if present on the physical aux table).
+  const dict_index_t *aux_seg =
+      dict_table_get_index_on_name(table, "VEC_SEG_ID", true);
+  if (aux_seg == nullptr) {
+    aux_seg = dict_table_get_index_on_name(table, "VEC_SEG_ID", false);
+  }
+
+  if (aux_seg != nullptr) {
+    dd::Index *dd_seg = dd_table->add_index();
+    dd_seg->set_name("VEC_SEG_ID");
+    dd_seg->set_algorithm(dd::Index::IA_BTREE);
+    dd_seg->set_algorithm_explicit(false);
+    dd_seg->set_visible(true);
+    dd_seg->set_type(dd::Index::IT_MULTIPLE);
+    dd_seg->set_ordinal_position(2);
+    dd_seg->set_generated(false);
+    dd_seg->set_engine(dd_table->engine());
+    dd_seg->options().set("flags", 0);
+
+    vec_dd_add_index_elements(dd_seg, aux_seg, dd_cols);
+  } else {
+    ib::warn() << "VECINDEX: missing VEC_SEG_ID index on aux table "
+               << table->name.m_name;
+  }
 
   // 5) 确定/分配 dd_space_id（强烈建议复用 FTS helper：它涵盖各种空间情况）
   dd::Object_id dd_space_id = dd::INVALID_OBJECT_ID;

@@ -7,7 +7,9 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
+#include "trx0types.h"
 #include "vec_id_alloc.h"
 #include "vec_params.h"
 #include "vec_index.h"
@@ -25,25 +27,18 @@ enum class VecBootstrapState : uint8_t {
 };
 
 static constexpr char kVecIndexLoadingMsg[] = "Vector index loading, retry";
+static constexpr size_t kVecSegmentIdMaxLen = 256;
 
 struct vid_pk_mapping_t {
   size_t key_length{0};  // length of MySQL-format PK tuple
-  std::vector<std::vector<unsigned char>> pk_values;  // indexed by faiss_id
+  std::vector<std::vector<unsigned char>> pk_values;  // indexed by vec_id
+  trx_ids_t trx_ids;  // creator transaction ids aligned to vec_id
   bool ready{false};
-
-  // Sometimes we need to track _MEM index changes. Because everytime we add/remove a vector, we need to update the PK mapping.
-  // This is used to record the differences. For example, we delete 2 from {0,1,2,3}
-  // When recover, we only reconstruct {0,1,3} so the location changed.
-  // At these time, we set mem_diff[3]=1, so we access pk_values[faiss_id=3-1] to get pk.
-  bool is_mem_diff{false};
-  // mem_diff[faiss_id] = faiss_id - pk_values_index; -1 means missing.
-  std::vector<int64_t> mem_diff;
 
   void clear() {
     key_length = 0;
     pk_values.clear();
-    is_mem_diff = false;
-    mem_diff.clear();
+    trx_ids.clear();
     ready = false;
   }
 
@@ -55,47 +50,12 @@ struct vid_pk_mapping_t {
     }
     return pk_values[idx].data();
   }
-};
 
-// Bitmap to track deleted vector IDs (VIDs) inside a segment.
-struct vecindex_bitmap_t {
-  std::vector<uint8_t> bits;
-
-  void clear() { bits.clear(); }
-
-  void ensure_size(size_t nbits) {
-    const size_t bytes = (nbits + 7) / 8;
-    if (bytes > bits.size()) {
-      bits.resize(bytes, 0);
+  trx_id_t get_trx_id(size_t idx) const {
+    if (!ready || idx >= trx_ids.size()) {
+      return 0;
     }
-  }
-
-  void mark(size_t idx) {
-    const size_t byte = idx / 8;
-    const size_t bit = idx % 8;
-    ensure_size(idx + 1);
-    bits[byte] |= static_cast<uint8_t>(1u << bit);
-  }
-
-  bool is_marked(size_t idx) const {
-    const size_t byte = idx / 8;
-    const size_t bit = idx % 8;
-    if (byte >= bits.size()) {
-      return false;
-    }
-    return (bits[byte] >> bit) & 0x01;
-  }
-
-  void set(size_t idx, bool value) {
-    ensure_size(idx + 1);
-    const size_t byte = idx / 8;
-    const size_t bit = idx % 8;
-    const uint8_t mask = static_cast<uint8_t>(1u << bit);
-    if (value) {
-      bits[byte] |= mask;
-    } else {
-      bits[byte] &= static_cast<uint8_t>(~mask);
-    }
+    return trx_ids[idx];
   }
 };
 
@@ -104,40 +64,37 @@ struct vec_index_segment_t {
   std::shared_ptr<std::shared_mutex> rw_lock{
       std::make_shared<std::shared_mutex>()};
   std::unique_ptr<IVectorIndex> index;    // concrete vector index
-  dict_table_t       *aux_dict_table{nullptr};  // cached aux dict object bound to this segment
   vid_pk_mapping_t    vid_pk_mapping;     // PK mapping aligned to faiss_ids for this segment
-  vecindex_bitmap_t   vecindex_bitmap;    // Deletion bitmap for this segment
-  std::string         aux_table_name;     // resolved aux table name for this segment
   std::string         index_file_name;    // persisted filename (immutable segments)
-  uint32_t            vecindex_id{0};
+  std::string         vecindex_id;        // segment id as string (max 256 bytes)
   bool                immutable{false};   // immutable segments are persisted to disk
-};
-
-enum class vec_delete_status_t : uint8_t {
-  PENDING = 0,
-  MARKED = 1,
-};
-
-struct vec_pending_delete_t {
-  std::string        pk_key;
-  uint32_t           segment_id{0};
-  uint64_t           vid{0};
-  vec_delete_status_t status{vec_delete_status_t::PENDING};
 };
 
 struct vec_index_ctx_t {
   std::shared_mutex         mu;
-  // runtime handler, include one in_mem_index (segments[0]) and several immutable indexes.
+  // runtime handler, include one mutable MEM index (seg_id == max_vecindex_id)
+  // and several immutable indexes.
   std::vector<vec_index_segment_t> segments;
+  // Map segment id -> index in segments. Call vec_rebuild_segment_id_map() after
+  // any segment insert/erase or id update. For pure append to segments, call
+  // vec_append_segment_id_map(). The rebuild path refreshes entries incrementally.
+  std::unordered_map<std::string, size_t> segment_id_map;
   vec_id_allocator_t        id_alloc;       // monotonic id allocator for Faiss IDs
   vec_params_t              params;         // parameters for immutable index not for in_mem_index
   bool                      inited{false};  // inited is true when in_mem_index is created successfully
 
   // naming helpers used to relate auxiliary tables / persisted index files
   std::string                index_name_prefix;    // base stem for persisted index files
+  // shared auxiliary table (PK + seg_id) for all segments
+  std::string                aux_table_name;       // resolved aux table name
+  dict_table_t*              aux_dict_table{nullptr};  // cached aux dict object
 
+  //SINGLE_AUX: TO BE DELETED
   // when the mutable segment is being built into an immutable one, keep its snapshot here
   vec_index_segment_t        staging_segment;
+
+
+
   bool                       build_in_progress{false};
   std::atomic<bool>          is_rotation_pending{false};
   std::atomic<bool>          needs_aux_refresh{false};  // request user THD to refresh aux cache
@@ -145,21 +102,17 @@ struct vec_index_ctx_t {
   std::atomic<bool>          bootstrap_load_submitted{false};
   std::atomic<bool>          bootstrap_loaded{false};
 
+
+  //SINGLE_AUX: TO BE DELETED
   // Precreated aux table waiting to be renamed to _MEM during rotation.
   std::string                pending_aux_name;
   dict_table_t*              pending_aux_dict{nullptr};
 
-  uint32_t                   max_vecindex_id{0};
-  // Pending deletes recorded at DML time; purge will mark bitmap then update status.
-  std::vector<vec_pending_delete_t> pending_deletes;
+  uint32_t                   max_vecindex_id{0};  // MEM seg_id (largest numeric id)
 
-  vec_index_segment_t* mutable_segment() {
-    return segments.empty() ? nullptr : &segments.front();
-  }
+  vec_index_segment_t* mutable_segment();
 
-  const vec_index_segment_t* mutable_segment() const {
-    return segments.empty() ? nullptr : &segments.front();
-  }
+  const vec_index_segment_t* mutable_segment() const;
 
   vec_index_segment_t* get_segment(size_t idx) {
     return idx < segments.size() ? &segments[idx] : nullptr;
@@ -170,39 +123,11 @@ struct vec_index_ctx_t {
   }
 };
 
-// Pending delete helpers (in-memory implementation).
-// These helpers manage in-memory records describing vector deletes that should
-// be applied during purge. They are designed so the backend can later be
-// replaced by a persistent table with the same interface.
-// All helpers are thread-safe via vec_index_ctx_t::mu.
-
-// Add or update a pending delete record keyed by pk_key.
-// If a record for pk_key exists, segment_id/vid are overwritten and status is
-// reset to PENDING. Returns false if ctx is null or pk_key is empty.
-bool vec_pending_delete_add(vec_index_ctx_t* ctx, const std::string& pk_key,
-                            uint32_t segment_id, uint64_t vid);
-
-// Find a pending delete record by pk_key.
-// Copies the record into out and returns true only if status is PENDING.
-bool vec_pending_delete_find(vec_index_ctx_t* ctx, const std::string& pk_key,
-                             vec_pending_delete_t* out);
-
-// Mark a pending delete record as MARKED, typically after bitmap update.
-// Returns true if an exact (pk_key, segment_id, vid) match is found.
-bool vec_pending_delete_marked(vec_index_ctx_t* ctx, const std::string& pk_key,
-                               uint32_t segment_id, uint64_t vid);
-
-// Remove all pending delete records for the given pk_key.
-// Returns the number of records removed (0 if none).
-size_t vec_pending_delete_remove_by_pk(vec_index_ctx_t* ctx,
-                                       const std::string& pk_key);
-
-// Optional extra validation hook for pk matching before bitmap mark.
-// Current implementation compares for equality; keep as a hook for future
-// checks (e.g. collation, normalization, or external lookup).
-bool vec_pending_delete_pk_check(const std::string& expected_pk,
-                                 const std::string& actual_pk);
-
 // Find a segment by vecindex_id (segment id). Returns nullptr if not found.
 vec_index_segment_t* vec_find_segment_by_id(vec_index_ctx_t* ctx,
-                                            uint32_t seg_id);
+                                            const std::string& seg_id);
+
+std::string vec_segment_id_from_u32(uint32_t id);
+uint32_t vec_segment_id_to_u32(const std::string& seg_id);
+void vec_rebuild_segment_id_map(vec_index_ctx_t* ctx);
+void vec_append_segment_id_map(vec_index_ctx_t* ctx);

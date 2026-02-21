@@ -145,8 +145,9 @@ struct sdi_vector_t {
 
 struct Vec_hit {
   longlong faiss_id;
-  uint32 segment{0};
+  std::string segment;
   float distance;
+  ulonglong trx_id{0};
 };
 
 typedef bool (*qc_engine_callback)(THD *thd, const char *table_key,

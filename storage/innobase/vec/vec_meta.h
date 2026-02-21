@@ -70,6 +70,12 @@ class VecMetaFile {
 /* Helpers for reading a metadata file. */
 bool vec_meta_read_all(const std::string& path, VecMetaHeader* header_out,
                        std::vector<VecSegmentEntry>* entries_out);
+bool vec_meta_read_mem_seg_id(const dict_index_t* index,
+                              const vec_params_t& params,
+                              uint64_t* out_mem_seg_id);
+bool vec_meta_write_mem_seg_id(const dict_index_t* index,
+                               const vec_params_t& params,
+                               uint64_t mem_seg_id);
 
 /* Path helpers. */
 bool vec_meta_path_for_index(const dict_index_t* index, std::string* out);

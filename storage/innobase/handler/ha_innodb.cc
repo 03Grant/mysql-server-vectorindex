@@ -48,6 +48,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #endif /* !UNIV_HOTBACKUP */
 
 #include <cstdint>
+#include <shared_mutex>
 
 #include <auto_thd.h>
 #include <errno.h>
@@ -64,6 +65,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <time.h>
 
 #include <algorithm>
+#include <atomic>
 #include <iomanip>
 #include <memory>
 #include <shared_mutex>
@@ -165,13 +167,16 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0thread-create.h"
 #include "os0thread.h"
 #include "p_s.h"
+#include "page0page.h"
 #include "page0zip.h"
 #include "pars0pars.h"
+#include "rem0rec.h"
 #include "rem0types.h"
 #include "row0ext.h"
 #include "row0import.h"
 #include "row0ins.h"
 #include "row0mysql.h"
+#include "row0row.h"
 #include "row0quiesce.h"
 #include "row0sel.h"
 #include "row0upd.h"
@@ -11543,15 +11548,48 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
 
   std::vector<float> distances(top_k);
   std::vector<int64_t> labels(top_k);
-  std::vector<uint32_t> segments(top_k);
+  std::vector<std::string> segments(top_k);
+  std::vector<trx_id_t> trx_ids(top_k);
 
   const float *query_vec = reinterpret_cast<const float *>(query);
   const int search_error =
       vec_search(*ctx, query_vec, 1, top_k, distances.data(), labels.data(),
-                 segments.data(), runtime_ptr);
+                 segments.data(), trx_ids.data(), runtime_ptr);
   if (search_error != 0) {
     ib::warn() << "Vector search failed with error code: " << search_error;
     return HA_ERR_INTERNAL_ERROR;
+  }
+
+  auto find_segment = [&](const std::string &seg_id) -> vec_index_segment_t * {
+    if (auto *seg = vec_find_segment_by_id(ctx, seg_id)) {
+      return seg;
+    }
+    return nullptr;
+  };
+
+  THD *thd = ha_thd();
+  if (thd != nullptr) {
+    for (size_t i = 0; i < top_k; ++i) {
+      if (labels[i] < 0 || trx_ids[i] != 0) {
+        continue;
+      }
+      std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+      vec_index_segment_t *seg = find_segment(segments[i]);
+      if (seg == nullptr || seg->index == nullptr) {
+        continue;
+      }
+      if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
+        if (!vec_load_aux_cache_for_segment(index, ctx, seg, thd) ||
+            !seg->vid_pk_mapping.ready) {
+          continue;
+        }
+      }
+      const int64_t faiss_id = labels[i];
+      if (faiss_id >= 0) {
+        trx_ids[i] = seg->vid_pk_mapping.get_trx_id(
+            static_cast<size_t>(faiss_id));
+      }
+    }
   }
 
   // ib::warn() << "Vector search found " << top_k << " results.";
@@ -11563,6 +11601,7 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
     hit.faiss_id = static_cast<longlong>(labels[i]);
     hit.segment = segments[i];
     hit.distance = distances[i];
+    hit.trx_id = static_cast<ulonglong>(trx_ids[i]);
     result->push_back(hit);
   }
 
@@ -11628,25 +11667,26 @@ int ha_innobase::ha_vec_fetch_row(const Vec_hit &) {
   return HA_ERR_WRONG_COMMAND;
 }
 
+static inline bool vec_is_visible(trx_id_t vec_trx_id,
+                                  trx_id_t visible_trx_id) {
+  if (visible_trx_id == 0) {
+    return false;
+  }
+  return vec_trx_id == visible_trx_id;
+}
+
 /** Locate vector segment by its runtime ID. */
 static vec_index_segment_t *vec_find_segment(vec_index_ctx_t *ctx,
-                                             uint32_t segment_id) {
+                                             const std::string &segment_id) {
   if (ctx == nullptr) {
     return nullptr;
   }
   std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
 
-  for (auto &seg : ctx->segments) {
-    if (seg.vecindex_id == segment_id) {
-      return &seg;
-    }
+  if (segment_id.empty()) {
+    return nullptr;
   }
-
-  if (segment_id < ctx->segments.size()) {
-    return &ctx->segments[segment_id];
-  }
-
-  return nullptr;
+  return vec_find_segment_by_id(ctx, segment_id);
 }
 
 int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
@@ -11724,7 +11764,7 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
 
   auto ensure_segment_ready = [&](const Vec_hit &hit) -> vec_index_segment_t * {
     vec_index_segment_t *seg =
-        vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
+        vec_find_segment(ctx, hit.segment);
     if (seg == nullptr || seg->index == nullptr) {
       ib::warn() << "VECFETCH[c02] unknown segment id=" << hit.segment;
       return nullptr;
@@ -11747,6 +11787,8 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
       return HA_ERR_INTERNAL_ERROR;
     }
     if (ensure_segment_ready(hit) == nullptr) {
+      ib::warn() << "VECFETCH[c04] failed to ensure segment is ready for hit with segment="
+                 << hit.segment << " and faiss_id=" << hit.faiss_id;
       vec_clear_row_cache();
       return HA_ERR_WRONG_COMMAND;
     }
@@ -11754,6 +11796,7 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
 
   dtuple_t *tuple = m_prebuilt->search_tuple;
   if (tuple == nullptr) {
+    ib::warn() << "VECFETCH[c05] search tuple is null";
     vec_clear_row_cache();
     return HA_ERR_WRONG_COMMAND;
   }
@@ -11766,7 +11809,7 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   for (size_t i = 0; i < batch.size(); ++i) {
     const Vec_hit &hit = batch[i];
     vec_index_segment_t *seg =
-        vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
+        vec_find_segment(ctx, hit.segment);
 
     bool bound = false;
     {
@@ -11796,6 +11839,7 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
       return convert_error_code_to_mysql(enter_err, 0, thd);
     }
 
+    m_prebuilt->last_vis_trx_id = 0;
     dberr_t search_err = row_search_for_mysql(
         table->record[0], PAGE_CUR_GE, m_prebuilt, ROW_SEL_EXACT, 0);
 
@@ -11805,8 +11849,20 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
       continue;
     }
     if (search_err != DB_SUCCESS) {
+      ib::warn() << "VECFETCH[c11] row search failed for segment=" << hit.segment
+                 << " faiss_id=" << hit.faiss_id
+                 << " with error code: " << search_err;
       vec_clear_row_cache();
       return convert_error_code_to_mysql(search_err, 0, thd);
+    }
+
+    const trx_id_t t_vis = m_prebuilt->last_vis_trx_id;
+    const trx_id_t t_r = static_cast<trx_id_t>(hit.trx_id);
+    if (!vec_is_visible(t_r, t_vis)) {
+      ib::warn() << "VECFETCH[c12] row not visible for hit with segment="
+                 << hit.segment << " faiss_id=" << hit.faiss_id
+                 << " trx_id=" << t_r << " visible_trx_id=" << t_vis;
+      continue;
     }
 
     auto &row = m_vec_row_cache_rows[i];

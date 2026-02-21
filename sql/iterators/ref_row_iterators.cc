@@ -765,9 +765,10 @@ int VectorSearchIterator::Read() {
 
     if (error == HA_ERR_KEY_NOT_FOUND || error == HA_ERR_END_OF_FILE) {
       sql_print_warning(
-          "VectorSearchIterator: missing base row for table=%s faiss_id=%lld "
+          "VectorSearchIterator: missing base row for table=%s faiss_id=%lld segment=%s trx_id=%lu "
           "(error=%d)",
-          table()->alias, candidate.faiss_id, error);
+          table()->alias, candidate.faiss_id, candidate.segment.c_str(), candidate.trx_id,
+          error);
       continue;
     }
 
