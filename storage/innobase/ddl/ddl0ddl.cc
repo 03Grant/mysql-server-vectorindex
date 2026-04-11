@@ -310,16 +310,21 @@ dict_index_t *create_index(trx_t *trx, dict_table_t *table,
                   "column-type", mysql_type);
     }
 
-    const uint64_t actual_length = static_cast<uint64_t>(col->len);
     const uint64_t expected_length =
         static_cast<uint64_t>(parsed.dim) * sizeof(float);
 
-    if (actual_length != expected_length) {
-      return fail("Column '" + std::string(table->get_col_name(field_def.m_col_no)) +
-                  "' length " + std::to_string(actual_length) +
-                  " bytes does not match expected " + std::to_string(expected_length) +
-                  " bytes (dim=" + std::to_string(parsed.dim) + ").",
-                  "column-bytes", actual_length);
+    if (!is_vector_type) {
+      const uint64_t actual_length = static_cast<uint64_t>(col->len);
+
+      if (actual_length != expected_length) {
+        return fail("Column '" +
+                        std::string(table->get_col_name(field_def.m_col_no)) +
+                        "' length " + std::to_string(actual_length) +
+                        " bytes does not match expected " +
+                        std::to_string(expected_length) + " bytes (dim=" +
+                        std::to_string(parsed.dim) + ").",
+                    "column-bytes", actual_length);
+      }
     }
     auto *params =
         static_cast<vec_params_t *>(mem_heap_alloc(index->heap, sizeof(vec_params_t)));

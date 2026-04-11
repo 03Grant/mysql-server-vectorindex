@@ -1385,9 +1385,9 @@ inline bool vec_cache_read_u32(const unsigned char *&p, size_t &remain,
   return true;
 }
 
-static bool vec_bind_tuple_from_entry(const unsigned char *data, size_t len,
-                                      dict_index_t *clust_index,
-                                      dtuple_t *tuple) {
+bool vec_bind_tuple_from_entry_impl(const unsigned char *data, size_t len,
+                                    dict_index_t *clust_index,
+                                    dtuple_t *tuple) {
   if (data == nullptr || clust_index == nullptr || tuple == nullptr) {
     return false;
   }
@@ -1503,6 +1503,12 @@ inline bool vec_pk_flush(FILE *fp) {
 
 }  // namespace
 
+bool vec_aux_bind_tuple_from_entry(const unsigned char *data, size_t len,
+                                   dict_index_t *clust_index,
+                                   dtuple_t *tuple) {
+  return vec_bind_tuple_from_entry_impl(data, len, clust_index, tuple);
+}
+
 dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
                              dict_index_t *clust_index, uint64_t faiss_id,
                              const std::vector<vec_pk_column_t> &pk_columns,
@@ -1565,8 +1571,8 @@ bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
   }
 
   const std::vector<unsigned char> &entry = cache->pk_values[idx];
-  return vec_bind_tuple_from_entry(entry.data(), entry.size(), clust_index,
-                                   tuple);
+  return vec_aux_bind_tuple_from_entry(entry.data(), entry.size(), clust_index,
+                                       tuple);
 }
 
 bool vec_aux_cache_bind_tuple_copy(const vid_pk_mapping_t *cache,
@@ -1590,8 +1596,8 @@ bool vec_aux_cache_bind_tuple_copy(const vid_pk_mapping_t *cache,
 
   const std::vector<unsigned char> &entry = cache->pk_values[idx];
   entry_copy->assign(entry.begin(), entry.end());
-  return vec_bind_tuple_from_entry(entry_copy->data(), entry_copy->size(),
-                                   clust_index, tuple);
+  return vec_aux_bind_tuple_from_entry(entry_copy->data(), entry_copy->size(),
+                                       clust_index, tuple);
 }
 
 

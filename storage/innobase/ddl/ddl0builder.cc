@@ -1390,8 +1390,8 @@ dberr_t Builder::vector_add_row(Row &row, size_t thread_id) noexcept {
   trx_t *trx = m_ctx.m_trx;
   dict_table_t *table = m_ctx.m_new_table;
 
+  std::vector<float> vec_values;
   std::vector<vec_pk_column_t> pk_columns;
-  std::string seg_id;
   trx_id_t creator_trx_id = 0;
   if (row.m_rec != nullptr) {
     const dict_index_t *clust_index = m_ctx.index();
@@ -1401,28 +1401,35 @@ dberr_t Builder::vector_add_row(Row &row, size_t thread_id) noexcept {
   }
 
   int rc = vec_collect_one_row_no_aux(trx, table, vec_index, vector_field, dim,
-                                      tuple, &pk_columns, &seg_id,
+                                      tuple, &vec_values, &pk_columns,
                                       creator_trx_id);
   if (rc != 0) {
     dberr_t vec_err = trx->error_state;
     if (vec_err == DB_SUCCESS) {
       vec_err = DB_ERROR;
     }
-    ib::warn() << "VECINDEX: inserting row for index '"
+    ib::warn() << "VECINDEX: extracting row for index '"
                << (vec_index->name ? vec_index->name : "(null)")
                << "' failed with rc=" << rc
                << " error_state=" << vec_err;
     return vec_err;
   }
 
-  if (seg_id.empty()) {
-    ib::warn() << "VECINDEX: missing seg_id for index '"
-               << (vec_index->name ? vec_index->name : "(null)") << "'";
+  if (vec_values.size() != dim) {
+    ib::warn() << "VECINDEX: extracted vector size mismatch for index '"
+               << (vec_index->name ? vec_index->name : "(null)")
+               << "' size=" << vec_values.size()
+               << " dim=" << dim;
     return DB_ERROR;
   }
 
   auto *thread_ctx = m_thread_ctxs[thread_id];
-  thread_ctx->m_vec_aux_rows.push_back({std::move(pk_columns), seg_id});
+  thread_ctx->m_vec_values.insert(thread_ctx->m_vec_values.end(),
+                                  vec_values.begin(), vec_values.end());
+  vec_ddl_aux_row_t meta{};
+  meta.pk_columns = std::move(pk_columns);
+  meta.creator_trx_id = creator_trx_id;
+  thread_ctx->m_vec_aux_rows.push_back(std::move(meta));
 
   return DB_SUCCESS;
 }
@@ -2058,16 +2065,39 @@ dberr_t Builder::flush_vector_rows() noexcept {
     return DB_ERROR;
   }
 
+  const vec_params_t *params = index->vec_params;
+  const size_t dim = params != nullptr ? static_cast<size_t>(params->dim) : 0;
+  if (dim == 0) {
+    return DB_ERROR;
+  }
+
   for (auto *thread_ctx : m_thread_ctxs) {
     auto &rows = thread_ctx->m_vec_aux_rows;
-    for (auto &row : rows) {
-      dberr_t err = vec_aux_insert_one(trx, index, row.pk_columns, row.seg_id);
-      if (err != DB_SUCCESS) {
-        return err;
-      }
+    auto &vec_values = thread_ctx->m_vec_values;
+    if (rows.empty()) {
+      vec_values.clear();
+      vec_values.shrink_to_fit();
+      continue;
     }
+    if (vec_values.size() != rows.size() * dim) {
+      ib::warn() << "VECINDEX: deferred vector row buffer size mismatch for index '"
+                 << (index->name ? index->name : "(null)")
+                 << "' values=" << vec_values.size()
+                 << " rows=" << rows.size()
+                 << " dim=" << dim;
+      return DB_ERROR;
+    }
+
+    dberr_t err = vec_insert_rows_no_aux(trx, m_ctx.m_new_table, index,
+                                         vec_values.data(), rows.size(), rows);
+    if (err != DB_SUCCESS) {
+      return err;
+    }
+
     rows.clear();
     rows.shrink_to_fit();
+    vec_values.clear();
+    vec_values.shrink_to_fit();
   }
 
   return DB_SUCCESS;

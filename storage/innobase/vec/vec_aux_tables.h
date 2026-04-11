@@ -80,6 +80,9 @@ dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
                              trx_id_t creator_trx_id);
 
 // Bind cached PK entry directly to a clustered-index tuple
+bool vec_aux_bind_tuple_from_entry(const unsigned char *data, size_t len,
+                                   dict_index_t *clust_index,
+                                   dtuple_t *tuple);
 bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
                               uint64_t faiss_id, dict_index_t *clust_index,
                               dtuple_t *tuple);

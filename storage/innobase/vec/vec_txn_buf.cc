@@ -535,16 +535,111 @@ dberr_t vec_insert_one_row_no_aux(
   return DB_SUCCESS;
 }
 
+dberr_t vec_insert_rows_no_aux(
+    trx_t *trx, dict_table_t *table, dict_index_t *vindex, const float *xb,
+    size_t n, const std::vector<vec_ddl_aux_row_t> &rows) {
+  if (trx == nullptr || table == nullptr || vindex == nullptr) {
+    return DB_ERROR;
+  }
+  if (n == 0) {
+    return DB_SUCCESS;
+  }
+  if (xb == nullptr || rows.size() != n) {
+    return DB_ERROR;
+  }
+
+  const vec_params_t *params = vindex->vec_params;
+  const unsigned dim = params != nullptr ? params->dim : 0;
+  if (dim == 0) {
+    return DB_ERROR;
+  }
+
+  dict_index_t *clust = table->first_index();
+  const ulint pk_fields = vec_pk_field_count(clust);
+  if (clust == nullptr || pk_fields == 0) {
+    return DB_ERROR;
+  }
+
+  vec_index_ctx_t *ctx = vindex->vec_runtime;
+  if (ctx == nullptr) {
+    return DB_ERROR;
+  }
+
+  vec_trx_ctx_t *tctx = vec_get_or_create_trx_ctx(trx);
+  if (tctx == nullptr) {
+    return DB_ERROR;
+  }
+
+  std::vector<int64_t> ids(n);
+  std::string seg_id;
+  dberr_t cache_err = DB_SUCCESS;
+  {
+    std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+    vec_index_segment_t *seg = ctx->mutable_segment();
+    if (seg == nullptr || seg->index == nullptr || seg->rw_lock == nullptr) {
+      return DB_ERROR;
+    }
+
+    std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
+    const size_t before = seg->index->ntotal();
+    for (size_t i = 0; i < n; ++i) {
+      if (!vec_pk_columns_ready(rows[i].pk_columns, pk_fields)) {
+        return DB_ERROR;
+      }
+      ids[i] = static_cast<int64_t>(before + i);
+    }
+
+    seg->index->add(n, xb, ids.data());
+    seg_id = seg->vecindex_id;
+    if (seg_id.empty()) {
+      return DB_ERROR;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+      const trx_id_t real_trx_id =
+          (rows[i].creator_trx_id != 0) ? rows[i].creator_trx_id : trx->id;
+      cache_err = vec_insert_aux_cache(&seg->vid_pk_mapping, clust,
+                                       static_cast<uint64_t>(ids[i]),
+                                       rows[i].pk_columns, real_trx_id);
+      if (cache_err != DB_SUCCESS) {
+        break;
+      }
+    }
+  }
+
+  if (cache_err != DB_SUCCESS) {
+    return cache_err;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(tctx->mu);
+    for (size_t i = 0; i < n; ++i) {
+      tctx->inserted_vids.push_back(
+          {ctx, vindex, seg_id, static_cast<uint64_t>(ids[i])});
+    }
+    tctx->touched_indexes.insert(vindex);
+  }
+
+  for (const auto &row : rows) {
+    dberr_t aux_err = vec_aux_insert_one(trx, vindex, row.pk_columns, seg_id);
+    if (aux_err != DB_SUCCESS) {
+      return aux_err;
+    }
+  }
+
+  return DB_SUCCESS;
+}
 
 
-// —— DDL 路径：立即写入索引与缓存，延后 aux 表写入 ——
+
+// —— DDL 路径：只抽取向量与主键，延后统一 flush ——
 int vec_collect_one_row_no_aux(trx_t *trx, dict_table_t *table,
                                dict_index_t *vindex,
                                const dfield_t *vector_field,
                                const unsigned dim,
                                const dtuple_t *row_tuple,
+                               std::vector<float> *out_vec_values,
                                std::vector<vec_pk_column_t> *out_pk_columns,
-                               std::string *out_seg_id,
                                trx_id_t creator_trx_id) {
   if (!trx || !table || !vindex || !vector_field || !row_tuple || dim == 0) {
     return -1;
@@ -584,20 +679,13 @@ int vec_collect_one_row_no_aux(trx_t *trx, dict_table_t *table,
     return -3;
   }
 
-  std::string seg_id;
-  dberr_t ins_err = vec_insert_one_row_no_aux(
-      trx, table, vindex, pk_columns, vec_values, nullptr, &seg_id,
-      creator_trx_id);
-  if (ins_err != DB_SUCCESS) {
-    trx->error_state = ins_err;
-    return -5;
-  }
+  static_cast<void>(creator_trx_id);
 
+  if (out_vec_values != nullptr) {
+    *out_vec_values = std::move(vec_values);
+  }
   if (out_pk_columns != nullptr) {
     *out_pk_columns = std::move(pk_columns);
-  }
-  if (out_seg_id != nullptr) {
-    *out_seg_id = seg_id;
   }
 
   return 0;

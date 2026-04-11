@@ -89,6 +89,7 @@ dberr_t vec_params_from_string(const std::string& s,
     if (key_l == "backend") {
       if (val_l == "faiss") out->backend = BackendType::Faiss;
       else if (val_l == "hnswlib" || val_l == "hnsw") out->backend = BackendType::Hnswlib;
+      else if (val_l == "diskann") out->backend = BackendType::Diskann;
       else {
         if (err) *err = "unsupported backend: " + val;
         return DB_UNSUPPORTED;
@@ -97,7 +98,8 @@ dberr_t vec_params_from_string(const std::string& s,
 
     } else if (key_l == "type") {
       if      (val_l == "flat")    out->type_tag = VEC_T_FLAT;
-      else if (val_l == "hnsw")    out->type_tag = VEC_T_HNSW;
+      else if (val_l == "hnsw" || val_l == "vamana")
+        out->type_tag = VEC_T_HNSW;
       else if (val_l == "ivfflat") out->type_tag = VEC_T_IVFFLAT;
       else if (val_l == "ivfpq")   out->type_tag = VEC_T_IVFPQ;
       else {
@@ -245,6 +247,13 @@ dberr_t vec_params_from_string(const std::string& s,
     default:
       if (err) *err = "unknown type tag";
       return DB_UNSUPPORTED;
+  }
+
+  if (out->backend == BackendType::Diskann &&
+      out->type_tag != VEC_T_FLAT &&
+      out->type_tag != VEC_T_HNSW) {
+    if (err) *err = "diskann backend supports only flat or vamana";
+    return DB_UNSUPPORTED;
   }
 
   return DB_SUCCESS;

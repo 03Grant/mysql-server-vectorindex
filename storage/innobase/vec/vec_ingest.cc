@@ -3,6 +3,7 @@
 #include "trx0trx.h"
 #include "vec_index.h"
 #include "vec_tasks.h"
+#include "vec_merger.h"
 #include <unordered_set>
 #include <vector>
 #include <shared_mutex>
@@ -63,6 +64,7 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
         VecTaskManager::instance().submit_task(idx);
       }
     }
+    (void)vec_schedule_merge_if_needed(idx);
   }
 
 

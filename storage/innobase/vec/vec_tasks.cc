@@ -41,6 +41,7 @@
 #include "vec_aux_tables.h"
 #include "vec_faiss_factory.h"
 #include "vec_hnswlib_factory.h"
+#include "vec_diskann_factory.h"
 #include "vec_index.h"
 #include "vec_index_runtime.h"
 #include "vec_meta.h"
@@ -293,6 +294,8 @@ std::unique_ptr<IVectorIndex> make_mutable_index(const vec_params_t &params) {
       return vec_make_faiss_index(mem_params);
     case BackendType::Hnswlib:
       return vec_make_hnswlib_index(mem_params);
+    case BackendType::Diskann:
+      return vec_make_diskann_index(mem_params);
     default:
       return nullptr;
   }
@@ -598,9 +601,20 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
   };
   log_event(VecSegmentState::Preparing, false);
 
-  auto target = ctx->params.backend == BackendType::Faiss
-                    ? vec_make_faiss_index(ctx->params)
-                    : vec_make_hnswlib_index(ctx->params);
+  std::unique_ptr<IVectorIndex> target;
+  switch (ctx->params.backend) {
+    case BackendType::Faiss:
+      target = vec_make_faiss_index(ctx->params);
+      break;
+    case BackendType::Hnswlib:
+      target = vec_make_hnswlib_index(ctx->params);
+      break;
+    case BackendType::Diskann:
+      target = vec_make_diskann_index(ctx->params);
+      break;
+    default:
+      break;
+  }
   if (!target) {
     clear_build_flag();
     ib::warn() << "VECINDEX: function::vec_bg_build_task() Failed to create target index.";
@@ -722,6 +736,14 @@ bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
 
   if (seg->vid_pk_mapping.ready) {
     // Usually this way
+    return true;
+  }
+
+  std::unique_lock<std::shared_mutex> seg_lock;
+  if (seg->rw_lock) {
+    seg_lock = std::unique_lock<std::shared_mutex>(*seg->rw_lock);
+  }
+  if (seg->vid_pk_mapping.ready) {
     return true;
   }
 
@@ -1728,15 +1750,34 @@ class VecMetaLoader {
                                      : ctx->index_name_prefix;
 
     if (meta_ok) {
-      ib::warn() << "VECMETA: loading " << entries.size()
-                 << " segments for index "
+      std::unordered_map<uint64_t, VecSegmentEntry> latest_by_id;
+      latest_by_id.reserve(entries.size());
+      for (const auto &entry : entries) {
+        latest_by_id[entry.seg_id] = entry;
+      }
+      std::vector<VecSegmentEntry> latest_entries;
+      latest_entries.reserve(latest_by_id.size());
+      for (const auto &kv : latest_by_id) {
+        latest_entries.push_back(kv.second);
+      }
+      std::sort(latest_entries.begin(), latest_entries.end(),
+                [](const VecSegmentEntry &a, const VecSegmentEntry &b) {
+                  return a.seg_id < b.seg_id;
+                });
+
+      ib::warn() << "VECMETA: loading " << latest_entries.size()
+                 << " segments (from " << entries.size()
+                 << " entries) for index "
                  << (index->name ? index->name : "(null)");
 
-      for (const auto &entry : entries) {
+      for (const auto &entry : latest_entries) {
         vec_index_segment_t *inserted = nullptr;
         ib::warn() << "VECMETA: processing segment " << entry.seg_id
                    << " with state " << static_cast<int>(entry.state)
                    << " and file name '" << entry.file_name << "'";
+        if (entry.state == static_cast<uint8_t>(VecSegmentState::Tombstone)) {
+          continue;
+        }
         if (entry.state != static_cast<uint8_t>(VecSegmentState::Committed)) {
           continue;
         }
@@ -1761,9 +1802,20 @@ class VecMetaLoader {
           continue;
         }
 
-        auto target = ctx->params.backend == BackendType::Faiss
-                          ? vec_make_faiss_index(ctx->params)
-                          : vec_make_hnswlib_index(ctx->params);
+        std::unique_ptr<IVectorIndex> target;
+        switch (ctx->params.backend) {
+          case BackendType::Faiss:
+            target = vec_make_faiss_index(ctx->params);
+            break;
+          case BackendType::Hnswlib:
+            target = vec_make_hnswlib_index(ctx->params);
+            break;
+          case BackendType::Diskann:
+            target = vec_make_diskann_index(ctx->params);
+            break;
+          default:
+            break;
+        }
         if (!target) {
           ib::warn() << "VECMETA: unable to allocate index for seg_id="
                      << seg_id_num;

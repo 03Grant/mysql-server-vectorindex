@@ -3,6 +3,7 @@ add_library(innobase_vec STATIC
   vec_index_runtime.cc
   vec_faiss_factory.cc
   vec_hnswlib_factory.cc
+  vec_diskann_factory.cc
   vec_index_adapter.cc
   vec_meta.cc
   vec_builder.cc
@@ -10,6 +11,7 @@ add_library(innobase_vec STATIC
   vec_id_alloc.cc
   vec_txn_buf.cc
   vec_ingest.cc
+  vec_merger.cc
   vec_sql.cc
   vec_tasks.cc
 )
@@ -18,21 +20,26 @@ add_library(innobase_vec STATIC
 target_include_directories(innobase_vec PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/..            # storage/innobase/*
   ${CMAKE_CURRENT_SOURCE_DIR}/../include    # storage/innobase/include/*
+  ${CMAKE_BINARY_DIR}
+  ${CMAKE_BINARY_DIR}/include
   ${CMAKE_SOURCE_DIR}/external/faiss        # submodule headers
   ${CMAKE_SOURCE_DIR}/external/hnswlib      # submodule headers (HNSWLIB)
+  ${CMAKE_SOURCE_DIR}/external/DiskANN/include
 )
 
 find_package(OpenMP)
 
-# choose the FAISS target: first avx512 -> avx2 -> generic
-if (TARGET faiss_avx512)
-  set(_FAISS_TGT faiss_avx512)
-elseif (TARGET faiss_avx2)
-  set(_FAISS_TGT faiss_avx2)
-elseif (TARGET faiss)
-  set(_FAISS_TGT faiss)
-else()
-  message(FATAL_ERROR "No FAISS target found. Did you enable -DWITH_FAISS=ON?")
+if (WITH_FAISS)
+  # choose the FAISS target: first avx512 -> avx2 -> generic
+  if (TARGET faiss_avx512)
+    set(_FAISS_TGT faiss_avx512)
+  elseif (TARGET faiss_avx2)
+    set(_FAISS_TGT faiss_avx2)
+  elseif (TARGET faiss)
+    set(_FAISS_TGT faiss)
+  else()
+    message(FATAL_ERROR "FAISS is enabled but no FAISS target was built.")
+  endif()
 endif()
 
 if (WITH_HNSWLIB)
@@ -40,6 +47,14 @@ if (WITH_HNSWLIB)
     set(_HNSWLIB_TGT hnswlib)
   else()
     message(FATAL_ERROR "HNSWLIB is enabled but the target 'hnswlib' was not built.")
+  endif()
+endif()
+
+if (WITH_DISKANN)
+  if (TARGET diskann_vendor)
+    set(_DISKANN_TGT diskann_vendor)
+  else()
+    message(FATAL_ERROR "DiskANN is enabled but the target 'diskann_vendor' was not built.")
   endif()
 endif()
 
@@ -56,6 +71,11 @@ if (DEFINED _HNSWLIB_TGT)
   message(STATUS "innobase_vec will link with HNSWLIB: ${_HNSWLIB_TGT}")
 endif()
 
+if (DEFINED _DISKANN_TGT)
+  list(APPEND _VECINDEX_LIBRARIES ${_DISKANN_TGT})
+  message(STATUS "innobase_vec will link with DiskANN: ${_DISKANN_TGT}")
+endif()
+
 if (OpenMP_CXX_FOUND)
   list(APPEND _VECINDEX_LIBRARIES OpenMP::OpenMP_CXX)
   message(STATUS "innobase_vec will link with OpenMP")
@@ -64,11 +84,12 @@ else()
 endif()
 
 if (NOT _VECINDEX_LIBRARIES)
-  message(FATAL_ERROR "Neither FAISS nor HNSWLIB targets were found for linking.")
+  message(FATAL_ERROR "No vector backend target was found for linking.")
 endif()
 
 # 链接所有收集到的库
 target_link_libraries(innobase_vec PUBLIC ${_VECINDEX_LIBRARIES})
+add_dependencies(innobase_vec GenError)
 
 target_compile_definitions(innobase_vec PRIVATE WITH_VECINDEX=1)
 

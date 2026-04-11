@@ -1,7 +1,9 @@
 #include "vec_hnswlib_factory.h"
 #include "vec_index.h"
+#include "ut0ut.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -10,6 +12,28 @@
 #include <vector>
 
 namespace {
+
+std::atomic<bool> g_hnsw_add_omp_logged{false};
+
+#ifdef _OPENMP
+void log_hnsw_add_omp_once(const vec_params_t& params, size_t n) {
+  bool expected = false;
+  if (!g_hnsw_add_omp_logged.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  const int requested_threads = params.build_threads > 0 ? params.build_threads : 1;
+  ib::warn() << "VECINDEX: HNSWlib add OpenMP requested_threads="
+             << requested_threads
+             << " actual_threads=" << omp_get_num_threads()
+             << " max_threads=" << omp_get_max_threads()
+             << " num_procs=" << omp_get_num_procs()
+             << " dynamic=" << omp_get_dynamic()
+             << " n=" << n
+             << " dim=" << params.dim;
+}
+#endif
 
 std::unique_ptr<hnswlib::SpaceInterface<float>> make_space(const vec_params_t& p) {
   switch (p.metric_tag) {
@@ -121,8 +145,19 @@ class HnswlibVectorIndex : public IVectorIndex {
 
 #ifdef _OPENMP
     const int threads = params_.build_threads > 0 ? params_.build_threads : 1;
-#pragma omp parallel for schedule(static) num_threads(threads)
-#endif
+#pragma omp parallel num_threads(threads)
+    {
+      log_hnsw_add_omp_once(params_, n);
+#pragma omp for schedule(static)
+      for (long long i = 0; i < static_cast<long long>(n); ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        const hnswlib::labeltype label =
+            ids ? static_cast<hnswlib::labeltype>(ids[idx])
+                : static_cast<hnswlib::labeltype>(current_count());
+        active_index()->addPoint(xb + idx * params_.dim, label);
+      }
+    }
+#else
     for (long long i = 0; i < static_cast<long long>(n); ++i) {
       const size_t idx = static_cast<size_t>(i);
       const hnswlib::labeltype label =
@@ -130,6 +165,7 @@ class HnswlibVectorIndex : public IVectorIndex {
               : static_cast<hnswlib::labeltype>(current_count());
       active_index()->addPoint(xb + idx * params_.dim, label);
     }
+#endif
   }
 
   void search(size_t nq, const float* xq, size_t k,

@@ -4,6 +4,7 @@
 #include "vec_index_runtime.h"
 #include "vec_faiss_factory.h"
 #include "vec_hnswlib_factory.h"
+#include "vec_diskann_factory.h"
 #include "vec_aux_tables.h"
 #include "vec_meta.h"
 
@@ -442,6 +443,9 @@ bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
       break;
     case BackendType::Hnswlib:
       index = vec_make_hnswlib_index(p);
+      break;
+    case BackendType::Diskann:
+      index = vec_make_diskann_index(p);
       break;
     default:
       break;

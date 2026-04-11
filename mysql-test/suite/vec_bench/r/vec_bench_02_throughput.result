@@ -1,0 +1,12 @@
+mode=throughput
+schema=vec_bench
+topk=100
+query_count=10000
+connections=32
+build_threads=128
+ef_search=16,32,48,64,80,96,112,128,144,160,176
+datasets=sift10m,deep10m
+csv=MYSQLTEST_VARDIR/tmp/vec_bench_throughput/throughput_report.csv
+json=MYSQLTEST_VARDIR/tmp/vec_bench_throughput/throughput_report.json
+csv_rows=22
+cleanup_after=1

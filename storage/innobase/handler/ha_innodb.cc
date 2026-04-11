@@ -11549,12 +11549,10 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
   std::vector<float> distances(top_k);
   std::vector<int64_t> labels(top_k);
   std::vector<std::string> segments(top_k);
-  std::vector<trx_id_t> trx_ids(top_k);
-
   const float *query_vec = reinterpret_cast<const float *>(query);
   const int search_error =
       vec_search(*ctx, query_vec, 1, top_k, distances.data(), labels.data(),
-                 segments.data(), trx_ids.data(), runtime_ptr);
+                 segments.data(), nullptr, runtime_ptr);
   if (search_error != 0) {
     ib::warn() << "Vector search failed with error code: " << search_error;
     return HA_ERR_INTERNAL_ERROR;
@@ -11568,32 +11566,6 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
   };
 
   THD *thd = ha_thd();
-  if (thd != nullptr) {
-    for (size_t i = 0; i < top_k; ++i) {
-      if (labels[i] < 0 || trx_ids[i] != 0) {
-        continue;
-      }
-      std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
-      vec_index_segment_t *seg = find_segment(segments[i]);
-      if (seg == nullptr || seg->index == nullptr) {
-        continue;
-      }
-      if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
-        if (!vec_load_aux_cache_for_segment(index, ctx, seg, thd) ||
-            !seg->vid_pk_mapping.ready) {
-          continue;
-        }
-      }
-      const int64_t faiss_id = labels[i];
-      if (faiss_id >= 0) {
-        trx_ids[i] = seg->vid_pk_mapping.get_trx_id(
-            static_cast<size_t>(faiss_id));
-      }
-    }
-  }
-
-  // ib::warn() << "Vector search found " << top_k << " results.";
-
   result->reserve(top_k);
   for (size_t i = 0; i < top_k; ++i) {
     if (labels[i] < 0) continue;
@@ -11601,8 +11573,52 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
     hit.faiss_id = static_cast<longlong>(labels[i]);
     hit.segment = segments[i];
     hit.distance = distances[i];
-    hit.trx_id = static_cast<ulonglong>(trx_ids[i]);
-    result->push_back(hit);
+
+    std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+    vec_index_segment_t *seg = find_segment(hit.segment);
+    if (seg == nullptr || seg->index == nullptr) {
+      ib::warn() << "VECSEARCH[s01] stale segment id=" << hit.segment
+                 << " for faiss_id=" << hit.faiss_id;
+      continue;
+    }
+
+    if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
+      if (thd == nullptr ||
+          !vec_load_aux_cache_for_segment(index, ctx, seg, thd)) {
+        ib::warn() << "VECSEARCH[s02] auxiliary PK cache not ready for segment "
+                   << hit.segment << " faiss_id=" << hit.faiss_id;
+        continue;
+      }
+    }
+
+    std::shared_lock<std::shared_mutex> seg_lock;
+    if (seg->rw_lock) {
+      seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
+    }
+
+    if (!seg->vid_pk_mapping.ready) {
+      ib::warn() << "VECSEARCH[s03] PK cache still not ready for segment "
+                 << hit.segment << " faiss_id=" << hit.faiss_id;
+      continue;
+    }
+
+    const size_t faiss_id = static_cast<size_t>(hit.faiss_id);
+    if (faiss_id >= seg->vid_pk_mapping.pk_values.size()) {
+      ib::warn() << "VECSEARCH[s04] faiss_id out of range for segment "
+                 << hit.segment << " faiss_id=" << hit.faiss_id;
+      continue;
+    }
+
+    const auto &pk_entry = seg->vid_pk_mapping.pk_values[faiss_id];
+    if (pk_entry.empty()) {
+      ib::warn() << "VECSEARCH[s05] missing PK entry for segment "
+                 << hit.segment << " faiss_id=" << hit.faiss_id;
+      continue;
+    }
+
+    hit.pk_entry.assign(pk_entry.begin(), pk_entry.end());
+    hit.trx_id = static_cast<ulonglong>(seg->vid_pk_mapping.get_trx_id(faiss_id));
+    result->push_back(std::move(hit));
   }
 
   return 0;
@@ -11675,20 +11691,6 @@ static inline bool vec_is_visible(trx_id_t vec_trx_id,
   return vec_trx_id == visible_trx_id;
 }
 
-/** Locate vector segment by its runtime ID. */
-static vec_index_segment_t *vec_find_segment(vec_index_ctx_t *ctx,
-                                             const std::string &segment_id) {
-  if (ctx == nullptr) {
-    return nullptr;
-  }
-  std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
-
-  if (segment_id.empty()) {
-    return nullptr;
-  }
-  return vec_find_segment_by_id(ctx, segment_id);
-}
-
 int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   vec_clear_row_cache();
 
@@ -11710,10 +11712,6 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
     return HA_ERR_WRONG_COMMAND;
   }
 
-  vec_index_ctx_t *ctx = vec_index->vec_runtime;
-  if (ctx == nullptr) {
-    return HA_ERR_WRONG_COMMAND;
-  }
   dict_table_t *dict_table = vec_index->table;
   if (dict_table == nullptr) {
     return HA_ERR_WRONG_COMMAND;
@@ -11762,38 +11760,6 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   m_prebuilt->init_search_tuples_types();
   build_template(true);
 
-  auto ensure_segment_ready = [&](const Vec_hit &hit) -> vec_index_segment_t * {
-    vec_index_segment_t *seg =
-        vec_find_segment(ctx, hit.segment);
-    if (seg == nullptr || seg->index == nullptr) {
-      ib::warn() << "VECFETCH[c02] unknown segment id=" << hit.segment;
-      return nullptr;
-    }
-    if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
-      if (!vec_load_aux_cache_for_segment(vec_index, ctx, seg, thd) ||
-          !seg->vid_pk_mapping.ready) {
-        ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready for segment "
-                   << hit.segment;
-        return nullptr;
-      }
-    }
-    return seg;
-  };
-
-  for (const auto &hit : batch) {
-    if (hit.faiss_id < 0) {
-      ib::warn() << "VECFETCH[c03] negative faiss_id in batch";
-      vec_clear_row_cache();
-      return HA_ERR_INTERNAL_ERROR;
-    }
-    if (ensure_segment_ready(hit) == nullptr) {
-      ib::warn() << "VECFETCH[c04] failed to ensure segment is ready for hit with segment="
-                 << hit.segment << " and faiss_id=" << hit.faiss_id;
-      vec_clear_row_cache();
-      return HA_ERR_WRONG_COMMAND;
-    }
-  }
-
   dtuple_t *tuple = m_prebuilt->search_tuple;
   if (tuple == nullptr) {
     ib::warn() << "VECFETCH[c05] search tuple is null";
@@ -11804,32 +11770,19 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   dict_index_copy_types(tuple, clust_index, clust_field_count);
   dtuple_set_n_fields(tuple, clust_field_count);
   dtuple_set_n_fields_cmp(tuple, pk_field_count);
-
-  std::vector<unsigned char> pk_entry_copy;
   for (size_t i = 0; i < batch.size(); ++i) {
     const Vec_hit &hit = batch[i];
-    vec_index_segment_t *seg =
-        vec_find_segment(ctx, hit.segment);
-
-    bool bound = false;
-    {
-      std::shared_lock<std::shared_mutex> seg_lock;
-      if (seg != nullptr && seg->rw_lock) {
-        seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
-      }
-      if (seg != nullptr) {
-        bound = vec_aux_cache_bind_tuple_copy(&seg->vid_pk_mapping,
-                                              static_cast<uint64_t>(hit.faiss_id),
-                                              clust_index, tuple,
-                                              &pk_entry_copy);
-      }
+    if (hit.pk_entry.empty()) {
+      ib::warn() << "VECFETCH[c10] missing PK entry for "
+                 << "segment=" << hit.segment << " faiss_id=" << hit.faiss_id;
+      continue;
     }
-    if (!bound) {
-      ib::warn() << "VECFETCH[c10] missing or corrupt cache entry for "
-                 << "segment=" << hit.segment
-                 << " faiss_id=" << hit.faiss_id;
-      vec_clear_row_cache();
-      return HA_ERR_WRONG_COMMAND;
+
+    if (!vec_aux_bind_tuple_from_entry(hit.pk_entry.data(), hit.pk_entry.size(),
+                                       clust_index, tuple)) {
+      ib::warn() << "VECFETCH[c10] corrupt PK entry for "
+                 << "segment=" << hit.segment << " faiss_id=" << hit.faiss_id;
+      continue;
     }
 
     restore_record(table, s->default_values);
@@ -24599,8 +24552,8 @@ mysql_declare_plugin(innobase){
     i_s_innodb_ft_being_deleted, i_s_innodb_ft_config,
     i_s_innodb_ft_index_cache, i_s_innodb_ft_index_table, i_s_innodb_tables,
     i_s_innodb_tablestats, i_s_innodb_indexes, i_s_innodb_tablespaces,
-    i_s_innodb_columns, i_s_innodb_virtual, i_s_innodb_cached_indexes,
-    i_s_innodb_session_temp_tablespaces
+    i_s_vecindex_stats, i_s_innodb_columns, i_s_innodb_virtual,
+    i_s_innodb_cached_indexes, i_s_innodb_session_temp_tablespaces
 
     mysql_declare_plugin_end;
 

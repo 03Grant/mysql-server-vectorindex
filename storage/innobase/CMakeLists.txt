@@ -268,10 +268,10 @@ SET(INNOBASE_SOURCES
   ut/ut0wqueue.cc)
 
 
-option(WITH_VECINDEX "Enable InnoDB Vector Index (FAISS)" ON)
+option(WITH_VECINDEX "Enable InnoDB Vector Index" ON)
 
-# only add vec if faiss is also enabled at top level and external/faiss exists
-if (WITH_VECINDEX AND WITH_FAISS)
+# Build vecindex when at least one vector backend is enabled.
+if (WITH_VECINDEX AND (WITH_FAISS OR WITH_HNSWLIB OR WITH_DISKANN))
   add_subdirectory(vec)
 endif()
 

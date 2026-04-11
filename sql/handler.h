@@ -148,6 +148,7 @@ struct Vec_hit {
   std::string segment;
   float distance;
   ulonglong trx_id{0};
+  std::vector<unsigned char> pk_entry;
 };
 
 typedef bool (*qc_engine_callback)(THD *thd, const char *table_key,

@@ -237,11 +237,6 @@ struct Builder {
   static void write_redo(const dict_index_t *index) noexcept;
 
  private:
-  struct Vec_aux_row {
-    std::vector<vec_pk_column_t> pk_columns;
-    std::string seg_id;
-  };
-
   /** State of a cluster index reader thread. */
   struct Thread_ctx {
     /** Constructor.
@@ -278,8 +273,11 @@ struct Builder {
     /** For spatial/Rtree rows handling. */
     RTree_inserter *m_rtree_inserter{};
 
-    /** Deferred aux table inserts for vector index rows. */
-    std::vector<Vec_aux_row> m_vec_aux_rows;
+    /** Deferred vector payloads, flattened as contiguous dim-sized rows. */
+    std::vector<float> m_vec_values;
+
+    /** Deferred aux/cache metadata for vector index rows. */
+    std::vector<vec_ddl_aux_row_t> m_vec_aux_rows;
 
   };
 

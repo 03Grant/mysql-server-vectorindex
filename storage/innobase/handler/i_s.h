@@ -58,6 +58,7 @@ extern struct st_mysql_plugin i_s_innodb_temp_table_info;
 extern struct st_mysql_plugin i_s_innodb_tables;
 extern struct st_mysql_plugin i_s_innodb_tablestats;
 extern struct st_mysql_plugin i_s_innodb_indexes;
+extern struct st_mysql_plugin i_s_vecindex_stats;
 extern struct st_mysql_plugin i_s_innodb_columns;
 extern struct st_mysql_plugin i_s_innodb_foreign;
 extern struct st_mysql_plugin i_s_innodb_foreign_cols;

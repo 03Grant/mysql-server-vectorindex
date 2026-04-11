@@ -25,6 +25,12 @@ struct vec_pk_column_t {
   std::vector<unsigned char> data;
 };
 
+// DDL build path metadata for one deferred vector row.
+struct vec_ddl_aux_row_t {
+  std::vector<vec_pk_column_t> pk_columns;
+  trx_id_t creator_trx_id{0};
+};
+
 struct vec_index_ctx_t;
 
 // Record inserted vector IDs for rollback cleanup.
@@ -89,16 +95,16 @@ int vec_collect_one_row(trx_t*           trx,
                         const unsigned   dim,
                         const dtuple_t*  row_tuple);     // 当前行的 InnoDB tuple
 
-// DDL path: extract vector + PK, insert into index and aux cache only.
-// Returns pk columns + seg_id for deferred aux table insert.
+// DDL path: extract vector + PK only. The caller batches rows and flushes them
+// into the mutable index later.
 int vec_collect_one_row_no_aux(trx_t*           trx,
                                dict_table_t*    table,
                                dict_index_t*    vindex,
                                const dfield_t*  vector_field,
                                const unsigned   dim,
                                const dtuple_t*  row_tuple,
+                               std::vector<float>* out_vec_values,
                                std::vector<vec_pk_column_t>* out_pk_columns,
-                               std::string*     out_seg_id,
                                trx_id_t         creator_trx_id = 0);
 
 // Immediate insert path: add to vector index and aux table, record rollback info.
@@ -119,6 +125,15 @@ dberr_t vec_insert_one_row_no_aux(
     uint64_t* out_vid,
     std::string* out_seg_id,
     trx_id_t creator_trx_id = 0);
+
+// Batch insert into vector index + aux cache/table, used by DDL flush path.
+dberr_t vec_insert_rows_no_aux(
+    trx_t* trx,
+    dict_table_t* table,
+    dict_index_t* vindex,
+    const float* xb,
+    size_t n,
+    const std::vector<vec_ddl_aux_row_t>& rows);
 
 // 提交成功或回滚时清空
 void vec_trx_ctx_clear(vec_trx_ctx_t* ctx);
