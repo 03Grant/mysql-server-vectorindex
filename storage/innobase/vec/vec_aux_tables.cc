@@ -13,6 +13,7 @@
 #include "ha_innodb.h"      // thd_to_trx
 #include "my_bitmap.h"      // bitmap_set_all
 #include "vec_index_runtime.h"
+#include "vec_diskann_factory.h"
 #include "vec_meta.h"
 #include "current_thd.h"    // current_thd
 #include "sql/sql_table.h"
@@ -1837,7 +1838,15 @@ bool vec_collect_drop_resources(dict_table_t* table,
         for (const auto& entry : entries) {
           if (entry.file_name[0] != '\0') {
             std::string seg_path = vec_meta_join(base_dir, entry.file_name);
-            vec_append_unique(&info.segment_files, seg_path);
+            std::vector<std::string> segment_files;
+            vec_diskann_collect_artifact_paths(seg_path, &segment_files);
+            if (segment_files.empty()) {
+              vec_append_unique(&info.segment_files, seg_path);
+            } else {
+              for (const auto& path : segment_files) {
+                vec_append_unique(&info.segment_files, path);
+              }
+            }
             std::string pkmap_path = vec_vid_pk_mapping_path(seg_path);
             vec_append_unique(&info.pkmap_files, pkmap_path);
           }
@@ -1857,7 +1866,16 @@ bool vec_collect_drop_resources(dict_table_t* table,
           continue;
         }
         if (!seg.index_file_name.empty()) {
-          vec_append_unique(&info.segment_files, seg.index_file_name);
+          std::vector<std::string> segment_files;
+          vec_diskann_collect_artifact_paths(seg.index_file_name,
+                                             &segment_files);
+          if (segment_files.empty()) {
+            vec_append_unique(&info.segment_files, seg.index_file_name);
+          } else {
+            for (const auto& path : segment_files) {
+              vec_append_unique(&info.segment_files, path);
+            }
+          }
           std::string pkmap_path =
               vec_vid_pk_mapping_path(seg.index_file_name);
           vec_append_unique(&info.pkmap_files, pkmap_path);

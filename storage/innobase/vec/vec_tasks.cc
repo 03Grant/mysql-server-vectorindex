@@ -286,6 +286,9 @@ bool vec_extract_vector_field(TABLE *mysql_table, size_t vec_col_no,
 
 std::unique_ptr<IVectorIndex> make_mutable_index(const vec_params_t &params) {
   vec_params_t mem_params = params;
+  if (mem_params.backend == BackendType::Diskann) {
+    mem_params.backend = BackendType::Faiss;
+  }
   mem_params.type_tag = VEC_T_FLAT;
   mem_params.size = 0;
   ib::warn() << "VECINDEX: function::make_mutable_index() Before mutable index with backend ";
@@ -592,7 +595,7 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
   auto log_event = [&](VecSegmentState state, bool has_pk_mapping) {
     if (!vec_meta_append_event(index, ctx->params,
                                static_cast<uint64_t>(seg_id),
-                               static_cast<uint64_t>(ids.size()),
+                               static_cast<uint64_t>(total),
                                state, index_basename, has_pk_mapping)) {
       ib::warn() << "VECMETA: failed to append event state="
                  << static_cast<unsigned>(state) << " seg_id="
@@ -625,8 +628,11 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
     target->train(ids.size(), xb.data());
     target->add(ids.size(), xb.data(), ids.data());
   }
-  
+
   target->save(index_path);
+  if (ctx->params.backend == BackendType::Diskann) {
+    target->load(index_path);
+  }
   log_event(VecSegmentState::BuiltIndex, false);
   const std::string mapping_path = vec_vid_pk_mapping_path(index_path);
   bool pk_mapping_saved = false;
@@ -647,7 +653,9 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
       seg_lock = std::unique_lock<std::shared_mutex>(*seg->rw_lock);
     }
     seg->index_file_name = index_path;
-    seg->index = std::move(target);
+    if (target) {
+      seg->index = std::move(target);
+    }
   }
 
   log_event(VecSegmentState::Committed, pk_mapping_saved);
@@ -655,6 +663,148 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
   clear_build_flag();
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Finished building index segment.";
   return true;
+}
+
+static dberr_t vec_complete_direct_diskann_build_impl(
+    dict_index_t *index, const std::string &data_path, uint64_t row_count,
+    const vid_pk_mapping_t &mapping) {
+  if (index == nullptr || index->vec_runtime == nullptr ||
+      index->vec_params == nullptr || row_count == 0) {
+    return DB_SUCCESS;
+  }
+
+  vec_index_ctx_t *ctx = index->vec_runtime;
+  if (ctx->params.backend != BackendType::Diskann) {
+    ib::warn() << "VECINDEX: direct DiskANN DDL build called for non-DiskANN "
+               << "index '" << (index->name ? index->name : "(null)") << "'";
+    return DB_ERROR;
+  }
+
+  const uint32_t seg_id = ctx->max_vecindex_id;
+  if (seg_id == 0 || seg_id == std::numeric_limits<uint32_t>::max()) {
+    return DB_ERROR;
+  }
+
+  std::string index_path;
+  if (!vec_resolve_index_path(index, seg_id, &index_path)) {
+    return DB_ERROR;
+  }
+
+  std::string build_error;
+  if (!vec_diskann_build_from_fbin(ctx->params,
+                                   static_cast<size_t>(row_count), data_path,
+                                   index_path, &build_error)) {
+    ib::warn() << "VECINDEX: direct DiskANN DDL build failed for index '"
+               << (index->name ? index->name : "(null)")
+               << "' path='" << index_path << "' error=" << build_error;
+    return DB_ERROR;
+  }
+
+  const std::string mapping_path = vec_vid_pk_mapping_path(index_path);
+  if (mapping_path.empty() ||
+      !vec_vid_pk_mapping_save(mapping, mapping_path)) {
+    ib::warn() << "VECINDEX: failed to persist direct DiskANN PK mapping to '"
+               << mapping_path << "'";
+    vec_diskann_remove_artifacts(index_path);
+    std::remove(mapping_path.c_str());
+    return DB_ERROR;
+  }
+
+  std::unique_ptr<IVectorIndex> immutable =
+      vec_make_diskann_index(ctx->params);
+  if (!immutable) {
+    vec_diskann_remove_artifacts(index_path);
+    std::remove(mapping_path.c_str());
+    return DB_ERROR;
+  }
+
+  try {
+    immutable->load(index_path);
+  } catch (const std::exception &e) {
+    ib::warn() << "VECINDEX: failed to load direct DiskANN immutable segment '"
+               << index_path << "' error=" << e.what();
+    vec_diskann_remove_artifacts(index_path);
+    std::remove(mapping_path.c_str());
+    return DB_ERROR;
+  }
+
+  auto new_mutable = make_mutable_index(ctx->params);
+  if (!new_mutable) {
+    vec_diskann_remove_artifacts(index_path);
+    std::remove(mapping_path.c_str());
+    return DB_ERROR;
+  }
+
+  const std::string seg_id_str = vec_segment_id_from_u32(seg_id);
+  const uint32_t new_mem_id = seg_id + 1;
+  const std::string new_mem_id_str = vec_segment_id_from_u32(new_mem_id);
+
+  if (!vec_meta_append_event(index, ctx->params, seg_id, row_count,
+                             VecSegmentState::BuiltIndex,
+                             vec_meta_basename(index_path), false)) {
+    ib::warn() << "VECMETA: failed to append BuiltIndex for direct DiskANN "
+               << "DDL build seg_id=" << seg_id;
+  }
+  if (!vec_meta_append_event(index, ctx->params, seg_id, row_count,
+                             VecSegmentState::PkmapSaved,
+                             vec_meta_basename(index_path), true)) {
+    ib::warn() << "VECMETA: failed to append PkmapSaved for direct DiskANN "
+               << "DDL build seg_id=" << seg_id;
+  }
+  if (!vec_meta_append_event(index, ctx->params, seg_id, row_count,
+                             VecSegmentState::Committed,
+                             vec_meta_basename(index_path), true)) {
+    ib::warn() << "VECMETA: failed to append Committed for direct DiskANN "
+               << "DDL build seg_id=" << seg_id;
+    vec_diskann_remove_artifacts(index_path);
+    std::remove(mapping_path.c_str());
+    return DB_ERROR;
+  }
+
+  {
+    std::lock_guard<std::shared_mutex> ctx_lock(ctx->mu);
+    vec_index_segment_t *mutable_seg = ctx->mutable_segment();
+    if (mutable_seg == nullptr || mutable_seg->vecindex_id != seg_id_str ||
+        mutable_seg->rw_lock == nullptr) {
+      vec_diskann_remove_artifacts(index_path);
+      std::remove(mapping_path.c_str());
+      return DB_ERROR;
+    }
+
+    {
+      std::unique_lock<std::shared_mutex> seg_lock(*mutable_seg->rw_lock);
+      mutable_seg->index = std::move(immutable);
+      mutable_seg->vid_pk_mapping.clear();
+      mutable_seg->index_file_name = index_path;
+      mutable_seg->immutable = true;
+    }
+
+    vec_index_segment_t fresh{};
+    fresh.index = std::move(new_mutable);
+    fresh.immutable = false;
+    fresh.vecindex_id = new_mem_id_str;
+    ctx->segments.push_back(std::move(fresh));
+    ctx->max_vecindex_id = new_mem_id;
+    vec_rebuild_segment_id_map(ctx);
+  }
+
+  if (!vec_meta_write_mem_seg_id(index, ctx->params,
+                                 static_cast<uint64_t>(new_mem_id))) {
+    return DB_ERROR;
+  }
+
+  ctx->bootstrap_state.store(VecBootstrapState::READY,
+                             std::memory_order_release);
+  ctx->bootstrap_loaded.store(true, std::memory_order_release);
+  ctx->bootstrap_load_submitted.store(true, std::memory_order_release);
+  ctx->is_rotation_pending.store(false, std::memory_order_release);
+  ctx->build_in_progress = false;
+  ctx->needs_aux_refresh.store(false, std::memory_order_release);
+  ib::warn() << "VECINDEX: direct DiskANN DDL build completed for index '"
+             << (index->name ? index->name : "(null)")
+             << "' seg_id=" << seg_id << " rows=" << row_count
+             << " file=" << vec_meta_basename(index_path);
+  return DB_SUCCESS;
 }
 
 bool vec_rotate_mem_index_bg(dict_index_t *index) {
@@ -725,6 +875,14 @@ bool vec_rotate_mem_index_bg(dict_index_t *index) {
 }
 
 }  // namespace
+
+dberr_t vec_complete_direct_diskann_build(dict_index_t *index,
+                                          const std::string &data_path,
+                                          uint64_t row_count,
+                                          const vid_pk_mapping_t &mapping) {
+  return vec_complete_direct_diskann_build_impl(index, data_path, row_count,
+                                                mapping);
+}
 
 bool vec_load_aux_cache_for_segment(dict_index_t *vec_index,
                                     vec_index_ctx_t *ctx,

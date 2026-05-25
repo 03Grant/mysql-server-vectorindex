@@ -29,6 +29,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
  DDL build index implementation.
 Created 2020-11-01 by Sunny Bains. */
 
+#include <cstdio>
+#include <fstream>
+#include <limits>
+
 #include <debug_sync.h>
 #include "clone0api.h"
 #include "ddl0fts.h"
@@ -45,9 +49,17 @@ Created 2020-11-01 by Sunny Bains. */
 #include "row0vers.h"
 #include "ut0stage.h"
 #include "storage/innobase/vec/vec_aux_tables.h"
+#include "storage/innobase/vec/vec_meta.h"
+#include "storage/innobase/vec/vec_tasks.h"
 #include "storage/innobase/vec/vec_txn_buf.h"
 
 namespace ddl {
+
+namespace {
+
+constexpr size_t kVecDiskannFlushRows = 16384;
+
+}
 
 /** Context for copying cluster index row for the index to being created. */
 struct Copy_ctx {
@@ -622,6 +634,15 @@ Builder::~Builder() noexcept {
     ut::delete_(m_btr_load);
     m_btr_load = nullptr;
   }
+
+  if (!m_vec_diskann_input_path.empty()) {
+    std::remove(m_vec_diskann_input_path.c_str());
+  }
+}
+
+bool Builder::uses_direct_diskann_ddl_build() const noexcept {
+  return is_vector_index() && m_index != nullptr && m_index->vec_params != nullptr &&
+         m_index->vec_params->backend == BackendType::Diskann;
 }
 
 dberr_t Builder::check_state_of_online_build_log() noexcept {
@@ -1691,6 +1712,16 @@ dberr_t Builder::add_row(Cursor &cursor, Row &row, size_t thread_id,
     }
   } else if (is_vector_index()) {
     err = vector_add_row(row, thread_id);
+    if (err == DB_SUCCESS && uses_direct_diskann_ddl_build()) {
+      auto *thread_ctx = m_thread_ctxs[thread_id];
+      if (thread_ctx != nullptr &&
+          thread_ctx->m_vec_aux_rows.size() >= kVecDiskannFlushRows) {
+        err = latch_release();
+        if (err == DB_SUCCESS) {
+          err = flush_vector_rows(thread_ctx);
+        }
+      }
+    }
   } else {
     err = bulk_add_row(cursor, row, thread_id, std::move(latch_release));
     if (unlikely(err != DB_OVERFLOW && err != DB_SUCCESS &&
@@ -2054,9 +2085,9 @@ dberr_t Builder::fts_sort_and_build() noexcept {
   }
 }
 
-dberr_t Builder::flush_vector_rows() noexcept {
+dberr_t Builder::flush_vector_rows(Thread_ctx *thread_ctx) noexcept {
   dict_index_t *index = m_index;
-  if (index == nullptr || !is_vector_index()) {
+  if (index == nullptr || !is_vector_index() || thread_ctx == nullptr) {
     return DB_SUCCESS;
   }
 
@@ -2071,36 +2102,184 @@ dberr_t Builder::flush_vector_rows() noexcept {
     return DB_ERROR;
   }
 
-  for (auto *thread_ctx : m_thread_ctxs) {
-    auto &rows = thread_ctx->m_vec_aux_rows;
-    auto &vec_values = thread_ctx->m_vec_values;
-    if (rows.empty()) {
-      vec_values.clear();
-      vec_values.shrink_to_fit();
-      continue;
-    }
-    if (vec_values.size() != rows.size() * dim) {
-      ib::warn() << "VECINDEX: deferred vector row buffer size mismatch for index '"
-                 << (index->name ? index->name : "(null)")
-                 << "' values=" << vec_values.size()
-                 << " rows=" << rows.size()
-                 << " dim=" << dim;
-      return DB_ERROR;
-    }
+  auto &rows = thread_ctx->m_vec_aux_rows;
+  auto &vec_values = thread_ctx->m_vec_values;
+  if (rows.empty()) {
+    vec_values.clear();
+    vec_values.shrink_to_fit();
+    return DB_SUCCESS;
+  }
 
+  if (vec_values.size() != rows.size() * dim) {
+    ib::warn() << "VECINDEX: deferred vector row buffer size mismatch for index '"
+               << (index->name ? index->name : "(null)")
+               << "' values=" << vec_values.size() << " rows=" << rows.size()
+               << " dim=" << dim;
+    return DB_ERROR;
+  }
+
+  if (!uses_direct_diskann_ddl_build()) {
     dberr_t err = vec_insert_rows_no_aux(trx, m_ctx.m_new_table, index,
                                          vec_values.data(), rows.size(), rows);
     if (err != DB_SUCCESS) {
       return err;
     }
+  } else {
+    vec_index_ctx_t *ctx = index->vec_runtime;
+    dict_index_t *clust = m_ctx.m_new_table != nullptr
+                              ? m_ctx.m_new_table->first_index()
+                              : nullptr;
+    if (ctx == nullptr || clust == nullptr) {
+      return DB_ERROR;
+    }
 
-    rows.clear();
-    rows.shrink_to_fit();
-    vec_values.clear();
-    vec_values.shrink_to_fit();
+    vec_index_segment_t *seg = nullptr;
+    {
+      std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
+      seg = ctx->mutable_segment();
+    }
+    if (seg == nullptr || seg->vecindex_id.empty()) {
+      return DB_ERROR;
+    }
+
+    if (m_vec_diskann_input_path.empty()) {
+      std::string meta_path;
+      if (!vec_meta_path_for_index(index, &meta_path)) {
+        return DB_ERROR;
+      }
+      const std::string dir = vec_meta_dirname(meta_path);
+      if (dir.empty()) {
+        return DB_ERROR;
+      }
+      m_vec_diskann_input_path =
+          dir + "/vecddl_" +
+          std::to_string(
+              static_cast<unsigned long long>(index->table->id)) +
+          "_" +
+          std::to_string(
+              static_cast<unsigned long long>(index->id)) +
+          ".fbin.tmp";
+
+      std::remove(m_vec_diskann_input_path.c_str());
+      std::ofstream init(m_vec_diskann_input_path,
+                         std::ios::binary | std::ios::trunc);
+      if (!init) {
+        ib::warn() << "VECINDEX: failed to create DiskANN DDL input '"
+                   << m_vec_diskann_input_path << "'";
+        return DB_IO_ERROR;
+      }
+
+      const uint32_t zero_rows = 0;
+      const uint32_t file_dim = static_cast<uint32_t>(dim);
+      init.write(reinterpret_cast<const char *>(&zero_rows), sizeof(zero_rows));
+      init.write(reinterpret_cast<const char *>(&file_dim), sizeof(file_dim));
+      if (!init) {
+        ib::warn() << "VECINDEX: failed to initialize DiskANN DDL input '"
+                   << m_vec_diskann_input_path << "'";
+        return DB_IO_ERROR;
+      }
+    }
+
+    std::ofstream out(m_vec_diskann_input_path,
+                      std::ios::binary | std::ios::app);
+    if (!out) {
+      ib::warn() << "VECINDEX: failed to append DiskANN DDL input '"
+                 << m_vec_diskann_input_path << "'";
+      return DB_IO_ERROR;
+    }
+
+    out.write(reinterpret_cast<const char *>(vec_values.data()),
+              static_cast<std::streamsize>(vec_values.size() *
+                                           sizeof(vec_values[0])));
+    if (!out) {
+      ib::warn() << "VECINDEX: failed while writing DiskANN DDL input '"
+                 << m_vec_diskann_input_path << "'";
+      return DB_IO_ERROR;
+    }
+
+    const uint64_t base_vid = m_vec_diskann_rows;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const trx_id_t real_trx_id =
+          (rows[i].creator_trx_id != 0) ? rows[i].creator_trx_id : trx->id;
+      dberr_t cache_err =
+          vec_insert_aux_cache(&m_vec_diskann_pk_mapping, clust,
+                               base_vid + static_cast<uint64_t>(i),
+                               rows[i].pk_columns, real_trx_id);
+      if (cache_err != DB_SUCCESS) {
+        return cache_err;
+      }
+
+      dberr_t aux_err =
+          vec_aux_insert_one(trx, index, rows[i].pk_columns, seg->vecindex_id);
+      if (aux_err != DB_SUCCESS) {
+        return aux_err;
+      }
+    }
+
+    m_vec_diskann_rows += static_cast<uint64_t>(rows.size());
+  }
+
+  rows.clear();
+  rows.shrink_to_fit();
+  vec_values.clear();
+  vec_values.shrink_to_fit();
+  return DB_SUCCESS;
+}
+
+dberr_t Builder::flush_vector_rows() noexcept {
+  for (auto *thread_ctx : m_thread_ctxs) {
+    dberr_t err = flush_vector_rows(thread_ctx);
+    if (err != DB_SUCCESS) {
+      return err;
+    }
   }
 
   return DB_SUCCESS;
+}
+
+dberr_t Builder::finalize_direct_diskann_build() noexcept {
+  if (!uses_direct_diskann_ddl_build() || m_vec_diskann_rows == 0 ||
+      m_vec_diskann_input_path.empty()) {
+    return DB_SUCCESS;
+  }
+
+  const auto *params = m_index != nullptr ? m_index->vec_params : nullptr;
+  const uint32_t dim = params != nullptr ? params->dim : 0;
+  if (dim == 0 || m_vec_diskann_rows > std::numeric_limits<uint32_t>::max()) {
+    return DB_ERROR;
+  }
+
+  {
+    std::fstream header_io(m_vec_diskann_input_path,
+                           std::ios::binary | std::ios::in | std::ios::out);
+    if (!header_io) {
+      ib::warn() << "VECINDEX: failed to reopen DiskANN DDL input '"
+                 << m_vec_diskann_input_path << "'";
+      return DB_IO_ERROR;
+    }
+
+    const uint32_t rows = static_cast<uint32_t>(m_vec_diskann_rows);
+    header_io.seekp(0, std::ios::beg);
+    header_io.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+    header_io.write(reinterpret_cast<const char *>(&dim), sizeof(dim));
+    if (!header_io) {
+      ib::warn() << "VECINDEX: failed to finalize DiskANN DDL input header '"
+                 << m_vec_diskann_input_path << "'";
+      return DB_IO_ERROR;
+    }
+  }
+
+  dberr_t err = vec_complete_direct_diskann_build(
+      m_index, m_vec_diskann_input_path, m_vec_diskann_rows,
+      m_vec_diskann_pk_mapping);
+  if (err == DB_SUCCESS) {
+    std::remove(m_vec_diskann_input_path.c_str());
+    m_vec_diskann_input_path.clear();
+    m_vec_diskann_pk_mapping.clear();
+    m_vec_diskann_rows = 0;
+  }
+
+  return err;
 }
 
 
@@ -2207,6 +2386,16 @@ dberr_t Builder::finish() noexcept {
   }
 
   dberr_t err{DB_SUCCESS};
+
+  if (uses_direct_diskann_ddl_build()) {
+    err = finalize_direct_diskann_build();
+    if (err != DB_SUCCESS) {
+      set_error(err);
+    }
+
+    set_next_state();
+    return get_error();
+  }
 
   if (get_error() != DB_SUCCESS || !m_ctx.m_online) {
     /* Do not apply any online log. */

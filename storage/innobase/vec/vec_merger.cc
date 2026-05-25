@@ -439,7 +439,14 @@ static void vec_cleanup_segment_files(const std::string &seg_path) {
     }
   };
 
-  drop_one(seg_path);
+  std::vector<std::string> segment_files;
+  vec_diskann_collect_artifact_paths(seg_path, &segment_files);
+  if (segment_files.empty()) {
+    segment_files.push_back(seg_path);
+  }
+  for (const auto &path : segment_files) {
+    drop_one(path);
+  }
   const std::string pkmap_path = vec_vid_pk_mapping_path(seg_path);
   drop_one(pkmap_path);
 }
@@ -747,6 +754,9 @@ void VecMergeManager::process_task(VecMergeTask task) {
   }
 
   target->save(merge_path);
+  if (ctx->params.backend == BackendType::Diskann) {
+    target->load(merge_path);
+  }
 
   if (!vec_meta_append_event(index, ctx->params, seg1_num,
                              static_cast<uint64_t>(ids.size()),

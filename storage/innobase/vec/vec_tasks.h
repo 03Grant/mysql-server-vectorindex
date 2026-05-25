@@ -6,14 +6,17 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <string>
 #include <thread>
 
+#include "db0err.h"
 #include "dict0types.h"
 
 struct dict_index_t;
 struct trx_t;
 struct vec_index_ctx_t;
 struct vec_index_segment_t;
+struct vid_pk_mapping_t;
 class THD;
 
 struct VecBuildTask {
@@ -65,3 +68,10 @@ bool vec_load_aux_cache_for_segment(dict_index_t* vec_index,
 
 /* Schedule a background bootstrap load from vec metadata on startup. */
 void vec_schedule_bootstrap_load(dict_index_t* index);
+
+/* Install a native DiskANN immutable segment built directly from streamed DDL
+   rows, then create a fresh empty mutable delta segment. */
+dberr_t vec_complete_direct_diskann_build(dict_index_t* index,
+                                          const std::string& data_path,
+                                          uint64_t row_count,
+                                          const vid_pk_mapping_t& mapping);

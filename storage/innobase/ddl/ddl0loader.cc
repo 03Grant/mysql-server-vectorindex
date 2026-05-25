@@ -299,6 +299,13 @@ dberr_t Loader::load() noexcept {
   }
 
   for (auto builder : m_builders) {
+    if (builder->is_vector_index() &&
+        builder->uses_direct_diskann_ddl_build()) {
+      ut_a(builder->get_state() == Builder::State::STOP ||
+           builder->get_state() == Builder::State::ERROR);
+      continue;
+    }
+
     ut_a(builder->get_state() == Builder::State::ADD);
     /* RTrees are built during the scan phase, using row by row insert. */
     if (!builder->is_spatial_index() && !builder->is_vector_index()) {
@@ -481,6 +488,21 @@ dberr_t Loader::scan_and_build_indexes() noexcept {
     // ib::warn() << "Loader: Cursor finished reading. ";
     DBUG_EXECUTE_IF("force_virtual_col_build_fail",
                     err = DB_COMPUTE_VALUE_FAILED;);
+
+    if (err == DB_SUCCESS) {
+      for (auto builder : m_builders) {
+        if (!builder->is_vector_index() ||
+            !builder->uses_direct_diskann_ddl_build()) {
+          continue;
+        }
+
+        builder->set_state(Builder::State::FINISH);
+        err = builder->finish();
+        if (err != DB_SUCCESS) {
+          break;
+        }
+      }
+    }
 
     DEBUG_SYNC_C("ddl_after_scan");
     if (err == DB_SUCCESS) {

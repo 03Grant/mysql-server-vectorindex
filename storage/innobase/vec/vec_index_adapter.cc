@@ -114,14 +114,17 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
   const std::string aux_name = vec_aux_table_name(idx);
 
   vec_params_t im_mem_p{};
-  im_mem_p.backend = p.backend;
+  // DiskANN uses a Faiss FLAT mutable collector and only builds its native
+  // immutable/PQFlash form during flush/rotation.
+  im_mem_p.backend = (p.backend == BackendType::Diskann) ? BackendType::Faiss
+                                                         : p.backend;
   im_mem_p.type_tag = VEC_T_FLAT;
   im_mem_p.metric_tag = p.metric_tag;
   im_mem_p.dim = p.dim;
   im_mem_p.size = 0;  // in-mem index has no size limit
   im_mem_p.build_threads = p.build_threads;
-  //im_mem_p.hnsw_m = 32;
-  //im_mem_p.efConstruction = 128;
+  im_mem_p.hnsw_m = 0;
+  im_mem_p.efConstruction = 0;
 
   std::unique_ptr<vec_index_ctx_t> new_ctx;
   vec_index_ctx_t *ctx = idx->vec_runtime;
