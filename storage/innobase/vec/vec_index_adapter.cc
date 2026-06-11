@@ -158,8 +158,8 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
   }
   vec_index_segment_t *mutable_seg = nullptr;
   for (auto &seg : ctx->segments) {
-    if (!seg.immutable) {
-      mutable_seg = &seg;
+    if (seg && !seg->immutable) {
+      mutable_seg = seg.get();
       break;
     }
   }
@@ -218,7 +218,7 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
     (void)vec_meta_write_mem_seg_id(idx, ctx->params,
                                     static_cast<uint64_t>(mem_id));
   }
-  vec_rebuild_segment_id_map(ctx);
+  vec_commit_topology(ctx);
 
   if (new_ctx) {
     idx->vec_runtime = new_ctx.release();
@@ -460,11 +460,11 @@ bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
     return false;
   }
 
-  vec_index_segment_t seg{};
-  seg.index = std::move(index);
-  seg.immutable = false;
+  auto seg = std::make_shared<vec_index_segment_t>();
+  seg->index = std::move(index);
+  seg->immutable = false;
   ctx.segments.push_back(std::move(seg));
-  vec_rebuild_segment_id_map(&ctx);
+  vec_commit_topology(&ctx);
   ctx.inited = true;
   return true;
 }
@@ -474,14 +474,17 @@ bool vec_drop_index(vec_index_ctx_t& ctx, size_t seg_idx, bool allow_drop_mutabl
              << " allow_drop_mutable=" << allow_drop_mutable;
   std::lock_guard<std::shared_mutex> lk(ctx.mu);
   if (seg_idx >= ctx.segments.size()) return false;
-  if (!allow_drop_mutable && !ctx.segments[seg_idx].immutable) return false;
+  if (!allow_drop_mutable &&
+      (!ctx.segments[seg_idx] || !ctx.segments[seg_idx]->immutable)) {
+    return false;
+  }
 
-  auto &seg = ctx.segments[seg_idx];
   ib::warn() << "VECINDEX: vec_drop_index mid seg_idx=" << seg_idx;
 
-  // erase to release the memory
+  // Erase from the writer-side list. The segment object survives until the last
+  // reader that pinned a version containing it releases its reference.
   ctx.segments.erase(ctx.segments.begin() + seg_idx);
-  vec_rebuild_segment_id_map(&ctx);
+  vec_commit_topology(&ctx);
   return true;
 
 }
@@ -529,17 +532,21 @@ static inline bool is_min_better(const vec_params_t& params) {
   return !(params.metric_tag == VEC_M_IP || params.metric_tag == VEC_M_COSINE);
 }
 
-int vec_search(vec_index_ctx_t& ctx,
+int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
                const float* q, size_t nq, size_t k,
                float* D_out, int64_t* I_out, std::string* S_out,
                trx_id_t* T_out,
                const VecRuntimeSearchParams* params)
 {
-  std::shared_lock<std::shared_mutex> ctx_lock(ctx.mu);
-  if (!ctx.inited || ctx.segments.empty()) return -1;
+  // No global lock here. The caller has pinned `ver`, an immutable snapshot of
+  // the segment set; we read only that snapshot, so a concurrent flush/merge
+  // publishing a new version cannot change what we traverse. Per-segment
+  // rw_locks (shared) still synchronize each read against an in-place index
+  // swap or a mutable-segment append.
+  if (!ctx.inited || ver.segments.empty()) return -1;
 
   const bool prefer_small = is_min_better(ctx.params);
-  const size_t nseg = ctx.segments.size();
+  const size_t nseg = ver.segments.size();
 
   struct Candidate {
     float distance;
@@ -557,11 +564,12 @@ int vec_search(vec_index_ctx_t& ctx,
     const float* qvec = q + qi * ctx.params.dim;
 
     for (size_t s = 0; s < nseg; ++s) {
-      auto& seg_meta = ctx.segments[s];
-      std::shared_lock<std::shared_mutex> seg_lock(*seg_meta.rw_lock);
-      auto* seg = seg_meta.index.get();
+      const vec_segment_ptr& seg_meta = ver.segments[s];
+      if (!seg_meta) continue;
+      std::shared_lock<std::shared_mutex> seg_lock(*seg_meta->rw_lock);
+      auto* seg = seg_meta->index.get();
       if (!seg) continue;
-      const std::string& seg_id = seg_meta.vecindex_id;
+      const std::string& seg_id = seg_meta->vecindex_id;
       if (seg_id.empty()) {
         continue;
       }
@@ -575,10 +583,10 @@ int vec_search(vec_index_ctx_t& ctx,
       for (size_t t = 0; t < k; ++t) {
         if (I[t] >= 0) {
           trx_id_t trx_id = 0;
-          if (seg_meta.vid_pk_mapping.ready) {
+          if (seg_meta->vid_pk_mapping.ready) {
             const int64_t faiss_id = I[t];
             if (faiss_id >= 0) {
-              trx_id = seg_meta.vid_pk_mapping.get_trx_id(
+              trx_id = seg_meta->vid_pk_mapping.get_trx_id(
                   static_cast<size_t>(faiss_id));
             }
           }

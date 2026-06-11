@@ -1,5 +1,10 @@
 #include "vec_hnswlib_factory.h"
 #include "vec_index.h"
+// univ.i must precede ut0ut.h: ut0ut.h defines the ut_is_2pow macro only after
+// its own include chain pulls in ut0byte.ic (which uses it). Establishing the
+// InnoDB header chain via univ.i first avoids that ordering error. (Pre-existing
+// issue, unrelated to the versioned-snapshot change.)
+#include "univ.i"
 #include "ut0ut.h"
 
 #include <algorithm>

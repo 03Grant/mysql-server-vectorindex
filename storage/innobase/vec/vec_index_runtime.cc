@@ -52,16 +52,16 @@ const vec_index_segment_t* vec_index_ctx_t::mutable_segment() const {
   if (it != segment_id_map.end()) {
     const size_t idx = it->second;
     if (idx < segments.size()) {
-      const auto *seg = &segments[idx];
-      if (seg->vecindex_id == seg_id) {
+      const auto *seg = segments[idx].get();
+      if (seg != nullptr && seg->vecindex_id == seg_id) {
         return seg;
       }
     }
   }
 
   for (size_t i = 0; i < segments.size(); ++i) {
-    if (segments[i].vecindex_id == seg_id) {
-      return &segments[i];
+    if (segments[i] && segments[i]->vecindex_id == seg_id) {
+      return segments[i].get();
     }
   }
 
@@ -110,7 +110,8 @@ void vec_rebuild_segment_id_map(vec_index_ctx_t* ctx) {
   // Incremental refresh: prune stale entries, then add missing ones.
   for (auto it = map.begin(); it != map.end(); ) {
     const size_t idx = it->second;
-    if (idx >= segments.size() || segments[idx].vecindex_id != it->first) {
+    if (idx >= segments.size() || !segments[idx] ||
+        segments[idx]->vecindex_id != it->first) {
       it = map.erase(it);
     } else {
       ++it;
@@ -118,7 +119,8 @@ void vec_rebuild_segment_id_map(vec_index_ctx_t* ctx) {
   }
 
   for (size_t i = 0; i < segments.size(); ++i) {
-    const auto& id = segments[i].vecindex_id;
+    if (!segments[i]) continue;
+    const auto& id = segments[i]->vecindex_id;
     if (!id.empty() && map.find(id) == map.end()) {
       map[id] = i;
     }
@@ -136,7 +138,10 @@ void vec_append_segment_id_map(vec_index_ctx_t* ctx) {
   }
 
   const size_t idx = segments.size() - 1;
-  const auto &id = segments[idx].vecindex_id;
+  if (!segments[idx]) {
+    return;
+  }
+  const auto &id = segments[idx]->vecindex_id;
   if (id.empty()) {
     return;
   }
@@ -165,18 +170,107 @@ vec_index_segment_t* vec_find_segment_by_id(vec_index_ctx_t* ctx,
   if (it != ctx->segment_id_map.end()) {
     const size_t idx = it->second;
     if (idx < ctx->segments.size()) {
-      auto *seg = &ctx->segments[idx];
-      if (seg->vecindex_id == seg_id) {
+      auto *seg = ctx->segments[idx].get();
+      if (seg != nullptr && seg->vecindex_id == seg_id) {
         return seg;
       }
     }
   }
 
   for (size_t i = 0; i < ctx->segments.size(); ++i) {
-    if (ctx->segments[i].vecindex_id == seg_id) {
-      return &ctx->segments[i];
+    if (ctx->segments[i] && ctx->segments[i]->vecindex_id == seg_id) {
+      return ctx->segments[i].get();
     }
   }
 
   return nullptr;
+}
+
+vec_segment_ptr vec_find_segment_shared(vec_index_ctx_t* ctx,
+                                        const std::string& seg_id) {
+  if (ctx == nullptr || seg_id.empty()) {
+    return nullptr;
+  }
+
+  auto it = ctx->segment_id_map.find(seg_id);
+  if (it != ctx->segment_id_map.end()) {
+    const size_t idx = it->second;
+    if (idx < ctx->segments.size() && ctx->segments[idx] &&
+        ctx->segments[idx]->vecindex_id == seg_id) {
+      return ctx->segments[idx];
+    }
+  }
+
+  for (auto& sp : ctx->segments) {
+    if (sp && sp->vecindex_id == seg_id) {
+      return sp;
+    }
+  }
+
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Versioned snapshot machinery
+// ---------------------------------------------------------------------------
+
+vec_index_segment_t* vec_index_version_t::find(const std::string& seg_id) const {
+  if (seg_id.empty()) {
+    return nullptr;
+  }
+  auto it = id_map.find(seg_id);
+  if (it != id_map.end()) {
+    const size_t idx = it->second;
+    if (idx < segments.size()) {
+      auto* seg = segments[idx].get();
+      if (seg != nullptr && seg->vecindex_id == seg_id) {
+        return seg;
+      }
+    }
+  }
+  for (const auto& sp : segments) {
+    if (sp && sp->vecindex_id == seg_id) {
+      return sp.get();
+    }
+  }
+  return nullptr;
+}
+
+vec_index_segment_t* vec_index_version_t::mutable_segment() const {
+  if (max_vecindex_id == 0) {
+    return nullptr;
+  }
+  return find(vec_segment_id_from_u32(max_vecindex_id));
+}
+
+vec_version_ptr vec_pin_version(const vec_index_ctx_t* ctx) {
+  if (ctx == nullptr) {
+    return nullptr;
+  }
+  // Atomic, reference-count-safe load of the current snapshot. Lock-free with
+  // respect to writers; never blocks a flush/merge.
+  return std::atomic_load(&ctx->current_version);
+}
+
+void vec_publish_version(vec_index_ctx_t* ctx) {
+  if (ctx == nullptr) {
+    return;
+  }
+  // Build the immutable snapshot from the current writer-side state. The caller
+  // must hold ctx->mu exclusively, so no concurrent writer mutates `segments`
+  // or `segment_id_map` while we copy them here.
+  auto ver = std::make_shared<vec_index_version_t>();
+  ver->segments = ctx->segments;          // copies shared_ptr handles only
+  ver->id_map = ctx->segment_id_map;
+  ver->max_vecindex_id = ctx->max_vecindex_id;
+  std::atomic_store(&ctx->current_version,
+                    vec_version_ptr(std::move(ver)));
+}
+
+void vec_commit_topology(vec_index_ctx_t* ctx) {
+  if (ctx == nullptr) {
+    return;
+  }
+  vec_rebuild_segment_id_map(ctx);
+  vec_publish_version(ctx);
 }

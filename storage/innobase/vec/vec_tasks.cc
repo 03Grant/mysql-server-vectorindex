@@ -408,15 +408,17 @@ bool vec_try_rotate_mem_index(trx_t *trx, dict_index_t *index,
 
   mutable_seg->immutable = true;
 
-  vec_index_segment_t fresh{};
-  fresh.index = std::move(new_index);
-  fresh.immutable = false;
-  fresh.vecindex_id = vec_segment_id_from_u32(new_mem_id);
+  auto fresh = std::make_shared<vec_index_segment_t>();
+  fresh->index = std::move(new_index);
+  fresh->immutable = false;
+  fresh->vecindex_id = vec_segment_id_from_u32(new_mem_id);
   ctx->segments.push_back(std::move(fresh));
   ctx->max_vecindex_id = new_mem_id;
   (void)vec_meta_write_mem_seg_id(index, ctx->params,
                                   static_cast<uint64_t>(new_mem_id));
-  vec_append_segment_id_map(ctx);
+  // Publish the new topology (old mutable now immutable + fresh mutable) so
+  // readers see the switch atomically. Done under the exclusive lock.
+  vec_commit_topology(ctx);
   ctx->needs_aux_refresh.store(false);
   lk.unlock();
   ib::warn() << "VECINDEX: function::vec_try_rotate_mem_index() Successfully rotated mem index.";
@@ -779,13 +781,13 @@ static dberr_t vec_complete_direct_diskann_build_impl(
       mutable_seg->immutable = true;
     }
 
-    vec_index_segment_t fresh{};
-    fresh.index = std::move(new_mutable);
-    fresh.immutable = false;
-    fresh.vecindex_id = new_mem_id_str;
+    auto fresh = std::make_shared<vec_index_segment_t>();
+    fresh->index = std::move(new_mutable);
+    fresh->immutable = false;
+    fresh->vecindex_id = new_mem_id_str;
     ctx->segments.push_back(std::move(fresh));
     ctx->max_vecindex_id = new_mem_id;
-    vec_rebuild_segment_id_map(ctx);
+    vec_commit_topology(ctx);
   }
 
   if (!vec_meta_write_mem_seg_id(index, ctx->params,
@@ -841,11 +843,16 @@ bool vec_rotate_mem_index_bg(dict_index_t *index) {
   rotated_ok = vec_try_rotate_mem_index(nullptr, index, ctx);
   if (rotated_ok) {
     const std::string old_mem_id_str = vec_segment_id_from_u32(old_mem_id);
-    vec_index_segment_t* staging_seg = nullptr;
+    // Pin a shared owner of the just-sealed segment. Holding the shared_ptr
+    // keeps the segment object alive across the (unlocked) snapshot write and
+    // background build even if a concurrent merge removes it from the
+    // writer-side list in the meantime.
+    vec_segment_ptr staging_sp;
     {
       std::shared_lock<std::shared_mutex> lk(ctx->mu);
-      staging_seg = vec_find_segment_by_id(ctx, old_mem_id_str);
+      staging_sp = vec_find_segment_shared(ctx, old_mem_id_str);
     }
+    vec_index_segment_t* staging_seg = staging_sp.get();
     if (staging_seg != nullptr && staging_seg->immutable) {
       if (!vec_write_segment_snapshot(index, ctx, staging_seg, index->table->id,
                                       index->id)) {
@@ -853,17 +860,6 @@ bool vec_rotate_mem_index_bg(dict_index_t *index) {
                    << (index->name ? index->name : "(null)")
                    << " seg_id=" << staging_seg->vecindex_id;
       }
-    }
-  }
-
-  if (rotated_ok) {
-    const std::string old_mem_id_str = vec_segment_id_from_u32(old_mem_id);
-    vec_index_segment_t* staging_seg = nullptr;
-    {
-      std::lock_guard<std::shared_mutex> lk(ctx->mu);
-      staging_seg = vec_find_segment_by_id(ctx, old_mem_id_str);
-    }
-    if (staging_seg != nullptr && staging_seg->immutable) {
       bg_built = vec_bg_build_task(index, ctx, staging_seg);
     }
   }
@@ -1056,8 +1052,8 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
 
   vec_index_segment_t *seg = nullptr;
   for (auto &candidate : ctx->segments) {
-    if (!candidate.immutable) {
-      seg = &candidate;
+    if (candidate && !candidate->immutable) {
+      seg = candidate.get();
       break;
     }
   }
@@ -1081,7 +1077,7 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
   }
   seg->vecindex_id = vec_segment_id_from_u32(seg_id);
   ctx->max_vecindex_id = seg_id;
-  vec_rebuild_segment_id_map(ctx);
+  vec_commit_topology(ctx);
 
   if (seg->index->ntotal() != 0) {
     ib::warn() << "VECMETA: mutable index already populated, skipping MEM "
@@ -1946,8 +1942,8 @@ class VecMetaLoader {
           std::lock_guard<std::shared_mutex> lk(ctx->mu);
           const bool exists = std::any_of(
               ctx->segments.begin(), ctx->segments.end(),
-              [&seg_id_str](const vec_index_segment_t &s) {
-                return s.vecindex_id == seg_id_str && s.immutable;
+              [&seg_id_str](const vec_segment_ptr &s) {
+                return s && s->vecindex_id == seg_id_str && s->immutable;
               });
           if (exists) {
             continue;
@@ -1990,21 +1986,21 @@ class VecMetaLoader {
           continue;
         }
 
-        vec_index_segment_t loaded{};
-        loaded.index = std::move(target);
-        loaded.index_file_name = seg_path;
-        loaded.vecindex_id = seg_id_str;
-        loaded.immutable = true;
+        auto loaded = std::make_shared<vec_index_segment_t>();
+        loaded->index = std::move(target);
+        loaded->index_file_name = seg_path;
+        loaded->vecindex_id = seg_id_str;
+        loaded->immutable = true;
 
         const bool expect_pk_map = vec_meta_segment_has_pk_mapping(entry);
         const std::string map_path = vec_vid_pk_mapping_path(seg_path);
         if (!map_path.empty()) {
           const bool map_ok =
-              vec_vid_pk_mapping_load(map_path, &loaded.vid_pk_mapping);
+              vec_vid_pk_mapping_load(map_path, &loaded->vid_pk_mapping);
           if (map_ok) {
             ib::warn() << "VECMETA: restored PK mapping from '" << map_path
-                       << "' rows=" << loaded.vid_pk_mapping.size();
-            loaded.vid_pk_mapping.ready = true;
+                       << "' rows=" << loaded->vid_pk_mapping.size();
+            loaded->vid_pk_mapping.ready = true;
           } else if (expect_pk_map) {
             ib::warn() << "VECMETA: pk mapping flagged but not readable at '"
                        << map_path << "'";
@@ -2014,15 +2010,15 @@ class VecMetaLoader {
         std::lock_guard<std::shared_mutex> lk(ctx->mu);
         const bool dup = std::any_of(
             ctx->segments.begin(), ctx->segments.end(),
-            [&seg_id_str](const vec_index_segment_t &s) {
-              return s.vecindex_id == seg_id_str && s.immutable;
+            [&seg_id_str](const vec_segment_ptr &s) {
+              return s && s->vecindex_id == seg_id_str && s->immutable;
             });
         if (!dup) {
           ctx->segments.push_back(std::move(loaded));
           ctx->max_vecindex_id =
               std::max<uint32_t>(ctx->max_vecindex_id, seg_id_num);
-          inserted = &ctx->segments.back();
-          vec_rebuild_segment_id_map(ctx);
+          inserted = ctx->segments.back().get();
+          vec_commit_topology(ctx);
         }
 
         ib::warn() << "VECMETA: loaded segment " << seg_id_num

@@ -7,6 +7,11 @@
 #include "parameters.h"
 #include "pq_flash_index.h"
 #include "utils.h"
+// univ.i must precede ut0ut.h: ut0ut.h defines the ut_is_2pow macro only after
+// its include chain pulls in ut0byte.ic (which uses it). Including univ.i first
+// processes ut0ut.h fully before that point. (Pre-existing issue, unrelated to
+// the versioned-snapshot change.)
+#include "univ.i"
 #include "ut0ut.h"
 
 #ifndef _WINDOWS

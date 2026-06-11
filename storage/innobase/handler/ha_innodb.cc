@@ -11546,79 +11546,136 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
     runtime_ptr = &runtime_params;
   }
 
-  std::vector<float> distances(top_k);
-  std::vector<int64_t> labels(top_k);
-  std::vector<std::string> segments(top_k);
   const float *query_vec = reinterpret_cast<const float *>(query);
-  const int search_error =
-      vec_search(*ctx, query_vec, 1, top_k, distances.data(), labels.data(),
-                 segments.data(), nullptr, runtime_ptr);
-  if (search_error != 0) {
-    ib::warn() << "Vector search failed with error code: " << search_error;
-    return HA_ERR_INTERNAL_ERROR;
-  }
-
-  auto find_segment = [&](const std::string &seg_id) -> vec_index_segment_t * {
-    if (auto *seg = vec_find_segment_by_id(ctx, seg_id)) {
-      return seg;
-    }
-    return nullptr;
-  };
 
   THD *thd = ha_thd();
-  result->reserve(top_k);
-  for (size_t i = 0; i < top_k; ++i) {
-    if (labels[i] < 0) continue;
-    Vec_hit hit;
-    hit.faiss_id = static_cast<longlong>(labels[i]);
-    hit.segment = segments[i];
-    hit.distance = distances[i];
 
-    std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
-    vec_index_segment_t *seg = find_segment(hit.segment);
-    if (seg == nullptr || seg->index == nullptr) {
-      ib::warn() << "VECSEARCH[s01] stale segment id=" << hit.segment
-                 << " for faiss_id=" << hit.faiss_id;
-      continue;
+  // Iterative expansion: start with 2x overscan, double fetch_k each round
+  // until top_k MVCC-visible rows are found or the index is exhausted.
+  static constexpr size_t kMaxFetchK = 100000;
+  size_t fetch_k = top_k;
+
+  for (;;) {
+    // Pin one immutable version for this whole round. The search and the
+    // follow-up PK/MVCC validation below both read this same snapshot, so a
+    // concurrent flush/merge cannot change the segment set under us, and every
+    // segment we touch stays alive for as long as `ver` is held. No global
+    // index lock is taken on this read path.
+    vec_version_ptr ver = vec_pin_version(ctx);
+    if (!ver) {
+      ib::warn() << "VECSEARCH: no published version available for index "
+                 << (index->name ? index->name : "(null)");
+      return HA_ERR_INTERNAL_ERROR;
     }
 
-    if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
-      if (thd == nullptr ||
-          !vec_load_aux_cache_for_segment(index, ctx, seg, thd)) {
-        ib::warn() << "VECSEARCH[s02] auxiliary PK cache not ready for segment "
+    std::vector<float> distances(fetch_k);
+    std::vector<int64_t> labels(fetch_k);
+    std::vector<std::string> segments(fetch_k);
+
+    const int search_error =
+        vec_search(*ctx, *ver, query_vec, 1, fetch_k, distances.data(),
+                   labels.data(), segments.data(), nullptr, runtime_ptr);
+    if (search_error != 0) {
+      ib::warn() << "Vector search failed with error code: " << search_error;
+      return HA_ERR_INTERNAL_ERROR;
+    }
+
+    result->clear();
+    result->reserve(fetch_k);
+    for (size_t i = 0; i < fetch_k; ++i) {
+      if (labels[i] < 0) continue;
+      Vec_hit hit;
+      hit.faiss_id = static_cast<longlong>(labels[i]);
+      hit.segment = segments[i];
+      hit.distance = distances[i];
+
+      // Resolve the segment within the pinned version (no global lock). `ver`
+      // keeps the segment alive even if a concurrent merge has already removed
+      // it from the writer-side list.
+      vec_index_segment_t *seg = ver->find(hit.segment);
+      if (seg == nullptr || seg->index == nullptr) {
+        ib::warn() << "VECSEARCH[s01] stale segment id=" << hit.segment
+                   << " for faiss_id=" << hit.faiss_id;
+        continue;
+      }
+
+      if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
+        if (thd == nullptr ||
+            !vec_load_aux_cache_for_segment(index, ctx, seg, thd)) {
+          ib::warn() << "VECSEARCH[s02] auxiliary PK cache not ready for segment "
+                     << hit.segment << " faiss_id=" << hit.faiss_id;
+          continue;
+        }
+      }
+
+      std::shared_lock<std::shared_mutex> seg_lock;
+      if (seg->rw_lock) {
+        seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
+      }
+
+      if (!seg->vid_pk_mapping.ready) {
+        ib::warn() << "VECSEARCH[s03] PK cache still not ready for segment "
                    << hit.segment << " faiss_id=" << hit.faiss_id;
         continue;
       }
+
+      const size_t faiss_id = static_cast<size_t>(hit.faiss_id);
+      if (faiss_id >= seg->vid_pk_mapping.pk_values.size()) {
+        ib::warn() << "VECSEARCH[s04] faiss_id out of range for segment "
+                   << hit.segment << " faiss_id=" << hit.faiss_id;
+        continue;
+      }
+
+      const auto &pk_entry = seg->vid_pk_mapping.pk_values[faiss_id];
+      if (pk_entry.empty()) {
+        ib::warn() << "VECSEARCH[s05] missing PK entry for segment "
+                   << hit.segment << " faiss_id=" << hit.faiss_id;
+        continue;
+      }
+
+      hit.pk_entry.assign(pk_entry.begin(), pk_entry.end());
+      hit.trx_id = static_cast<ulonglong>(seg->vid_pk_mapping.get_trx_id(faiss_id));
+      result->push_back(std::move(hit));
     }
 
-    std::shared_lock<std::shared_mutex> seg_lock;
-    if (seg->rw_lock) {
-      seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
+    // Eagerly run MVCC validation so we know how many rows survive.
+    int pop_err = vec_populate_row_cache(*result);
+    if (pop_err != 0) return pop_err;
+
+    size_t visible = 0;
+    for (const auto &row : m_vec_row_cache_rows) {
+      if (!row.empty()) ++visible;
     }
 
-    if (!seg->vid_pk_mapping.ready) {
-      ib::warn() << "VECSEARCH[s03] PK cache still not ready for segment "
-                 << hit.segment << " faiss_id=" << hit.faiss_id;
-      continue;
+    if (visible >= top_k || fetch_k >= kMaxFetchK || result->empty()) {
+      // Compact: keep only the top_k visible hits and their cache rows (no
+      // holes), so ha_vec_fetch_rows reuses this pre-populated cache without
+      // triggering a second round of row_search_for_mysql calls.
+      std::vector<Vec_hit> final_hits;
+      std::vector<std::vector<uchar>> compact_cache;
+      final_hits.reserve(std::min(visible, top_k));
+      compact_cache.reserve(std::min(visible, top_k));
+
+      for (size_t i = 0; i < result->size() && final_hits.size() < top_k; ++i) {
+        if (i < m_vec_row_cache_rows.size() && !m_vec_row_cache_rows[i].empty()) {
+          compact_cache.push_back(std::move(m_vec_row_cache_rows[i]));
+          final_hits.push_back((*result)[i]);
+        }
+      }
+      m_vec_row_cache_rows = std::move(compact_cache);
+      // m_vec_row_cache_ready and m_vec_row_cache_reclength already set by
+      // vec_populate_row_cache above.
+      *result = std::move(final_hits);
+      break;
     }
 
-    const size_t faiss_id = static_cast<size_t>(hit.faiss_id);
-    if (faiss_id >= seg->vid_pk_mapping.pk_values.size()) {
-      ib::warn() << "VECSEARCH[s04] faiss_id out of range for segment "
-                 << hit.segment << " faiss_id=" << hit.faiss_id;
-      continue;
-    }
-
-    const auto &pk_entry = seg->vid_pk_mapping.pk_values[faiss_id];
-    if (pk_entry.empty()) {
-      ib::warn() << "VECSEARCH[s05] missing PK entry for segment "
-                 << hit.segment << " faiss_id=" << hit.faiss_id;
-      continue;
-    }
-
-    hit.pk_entry.assign(pk_entry.begin(), pk_entry.end());
-    hit.trx_id = static_cast<ulonglong>(seg->vid_pk_mapping.get_trx_id(faiss_id));
-    result->push_back(std::move(hit));
+    // Not enough visible rows yet — expand and retry.
+    ib::info() << "VECSEARCH[expand] visible=" << visible
+               << " < top_k=" << top_k
+               << ", expanding fetch_k=" << fetch_k
+               << " -> " << std::min(fetch_k * 2, kMaxFetchK);
+    fetch_k = std::min(fetch_k * 2, kMaxFetchK);
+    vec_clear_row_cache();
   }
 
   return 0;

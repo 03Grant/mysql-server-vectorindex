@@ -1862,22 +1862,22 @@ bool vec_collect_drop_resources(dict_table_t* table,
       vec_index_ctx_t* ctx = index->vec_runtime;
       std::lock_guard<std::shared_mutex> lk(ctx->mu);
       for (const auto& seg : ctx->segments) {
-        if (!seg.immutable || seg.vecindex_id.empty()) {
+        if (!seg || !seg->immutable || seg->vecindex_id.empty()) {
           continue;
         }
-        if (!seg.index_file_name.empty()) {
+        if (!seg->index_file_name.empty()) {
           std::vector<std::string> segment_files;
-          vec_diskann_collect_artifact_paths(seg.index_file_name,
+          vec_diskann_collect_artifact_paths(seg->index_file_name,
                                              &segment_files);
           if (segment_files.empty()) {
-            vec_append_unique(&info.segment_files, seg.index_file_name);
+            vec_append_unique(&info.segment_files, seg->index_file_name);
           } else {
             for (const auto& path : segment_files) {
               vec_append_unique(&info.segment_files, path);
             }
           }
           std::string pkmap_path =
-              vec_vid_pk_mapping_path(seg.index_file_name);
+              vec_vid_pk_mapping_path(seg->index_file_name);
           vec_append_unique(&info.pkmap_files, pkmap_path);
         }
       }

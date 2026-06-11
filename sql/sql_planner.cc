@@ -239,6 +239,19 @@ enum idx_type { CLUSTERED_PK, UNIQUE, NOT_UNIQUE, VECINDEX, FULLTEXT };
   */
   ha_rows distinct_keys_est = tab->records() / MATCHING_ROWS_IN_OTHER_TABLE;
 
+  // Pre-scan: does this table have a VECINDEX key?
+  // myvector_is_ann->val_int() only returns true when VectorSearchIterator ran,
+  // so if any VECINDEX key exists we must not break early on CLUSTERED_PK.
+  bool table_has_vecindex_key = false;
+  if (tab->keyuse()) {
+    for (Key_use *ku = tab->keyuse(); ku->table_ref == tab->table_ref; ku++) {
+      if (ku->keypart == VECINDEX_KEYPART) {
+        table_has_vecindex_key = true;
+        break;
+      }
+    }
+  }
+
   // Test how we can use keys
   for (Key_use *keyuse = tab->keyuse(); keyuse->table_ref == tab->table_ref;) {
     // keyparts that are usable for this index given the current partial plan
@@ -677,7 +690,10 @@ enum idx_type { CLUSTERED_PK, UNIQUE, NOT_UNIQUE, VECINDEX, FULLTEXT };
       trace_access_idx.add_alnum("access_type", is_vec ? "vecindex" : "fulltext")
           .add_utf8("index", keyinfo->name);
 
-      if (best_found_keytype < NOT_UNIQUE) {
+      // For vector indexes: myvector_is_ann->val_int() only returns true when the
+      // vector scan itself ran, so VECINDEX must always be selected when present.
+      // Fulltext keeps the original heuristic of yielding to eq-ref/unique.
+      if (best_found_keytype < NOT_UNIQUE && !is_vec) {
         trace_access_idx.add("chosen", false)
             .add_alnum("cause", "heuristic_eqref_already_found");
         // Ignore test_all_ref_keys, semijoin loosescan never uses these indexes
@@ -713,7 +729,17 @@ enum idx_type { CLUSTERED_PK, UNIQUE, NOT_UNIQUE, VECINDEX, FULLTEXT };
     */
     bool new_candidate = false;
 
-    if (best_found_keytype >= NOT_UNIQUE && cur_keytype >= NOT_UNIQUE)
+    // VECINDEX must always win: its val_int() returns the pre-computed
+    // m_last_result flag, which is only set to true by VectorSearchIterator.
+    // If any other index type is chosen instead, the condition silently
+    // evaluates to 0 for every row. Two VECINDEX keys compare by cost.
+    if (cur_keytype == VECINDEX && best_found_keytype != VECINDEX)
+      new_candidate = true;  // vec always beats any non-vec
+    else if (cur_keytype == VECINDEX && best_found_keytype == VECINDEX)
+      new_candidate = cur_ref_cost < best_ref_cost;  // lower cost wins
+    else if (best_found_keytype == VECINDEX)
+      new_candidate = false;  // nothing beats an already-chosen vec index
+    else if (best_found_keytype >= NOT_UNIQUE && cur_keytype >= NOT_UNIQUE)
       new_candidate = cur_ref_cost < best_ref_cost;  // 1
     else if (best_found_keytype == cur_keytype)
       new_candidate = cur_ref_cost < best_ref_cost;  // 2
@@ -730,7 +756,7 @@ enum idx_type { CLUSTERED_PK, UNIQUE, NOT_UNIQUE, VECINDEX, FULLTEXT };
 
     trace_access_idx.add("chosen", best_ref == start_key);
 
-    if (best_found_keytype == CLUSTERED_PK) {
+    if (best_found_keytype == CLUSTERED_PK && !table_has_vecindex_key) {
       trace_access_idx.add_alnum("cause", "clustered_pk_chosen_by_heuristics");
       if (unlikely(!test_all_ref_keys)) break;
     }

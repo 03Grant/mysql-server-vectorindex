@@ -322,17 +322,17 @@ static bool vec_pick_merge_segments(dict_index_t *index,
   {
     std::shared_lock<std::shared_mutex> lk(ctx->mu);
     for (const auto &seg : ctx->segments) {
-      if (!seg.immutable) {
+      if (!seg || !seg->immutable) {
         continue;
       }
-      const uint32_t seg_id = vec_segment_id_to_u32(seg.vecindex_id);
+      const uint32_t seg_id = vec_segment_id_to_u32(seg->vecindex_id);
       if (seg_id == 0) {
         continue;
       }
       if (seg_id == ctx->max_vecindex_id) {
         continue;
       }
-      candidates.push_back({seg_id, seg.vecindex_id});
+      candidates.push_back({seg_id, seg->vecindex_id});
     }
   }
 
@@ -580,22 +580,27 @@ void VecMergeManager::process_task(VecMergeTask task) {
   const std::string seg1_id = task.seg_left;
   const std::string seg2_id = task.seg_right;
 
-  vec_index_segment_t *seg1 = nullptr;
-  vec_index_segment_t *seg2 = nullptr;
+  // Pin shared owners of both source segments for the whole merge. The build
+  // phase below runs without ctx->mu, so holding these shared_ptrs guarantees
+  // the source segment objects stay alive even if another writer removes them
+  // from the writer-side list while we build.
+  vec_segment_ptr seg1_sp;
+  vec_segment_ptr seg2_sp;
   std::string seg1_path;
   std::string seg2_path;
 
   {
     std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
-    seg1 = vec_find_segment_by_id(ctx, seg1_id);
-    seg2 = vec_find_segment_by_id(ctx, seg2_id);
-    if (seg1 == nullptr || seg2 == nullptr ||
-        !seg1->immutable || !seg2->immutable) {
+    seg1_sp = vec_find_segment_shared(ctx, seg1_id);
+    seg2_sp = vec_find_segment_shared(ctx, seg2_id);
+    if (!seg1_sp || !seg2_sp || !seg1_sp->immutable || !seg2_sp->immutable) {
       return;
     }
-    seg1_path = seg1->index_file_name;
-    seg2_path = seg2->index_file_name;
+    seg1_path = seg1_sp->index_file_name;
+    seg2_path = seg2_sp->index_file_name;
   }
+  vec_index_segment_t *seg1 = seg1_sp.get();
+  vec_index_segment_t *seg2 = seg2_sp.get();
 
   if (seg1_path.empty() || seg2_path.empty()) {
     ib::warn() << "VECMERGE: missing segment file path, skip merge segs="
@@ -783,16 +788,21 @@ void VecMergeManager::process_task(VecMergeTask task) {
     }
   }
 
-  vec_index_segment_t merged{};
-  merged.index = std::move(target);
-  merged.immutable = true;
-  merged.vecindex_id = seg1_id;
-  merged.index_file_name = merge_path;
-  merged.vid_pk_mapping = std::move(merged_mapping);
-  merged.vid_pk_mapping.ready = true;
+  auto merged = std::make_shared<vec_index_segment_t>();
+  merged->index = std::move(target);
+  merged->immutable = true;
+  merged->vecindex_id = seg1_id;
+  merged->index_file_name = merge_path;
+  merged->vid_pk_mapping = std::move(merged_mapping);
+  merged->vid_pk_mapping.ready = true;
 
   bool swapped = false;
   {
+    // Atomic topology swap under the exclusive writer lock. We do NOT lock the
+    // source segments' rw_locks here: a concurrent search reads from a pinned
+    // version, and the shared_ptr keeps any erased source segment alive until
+    // the last reader holding that older version releases it. The swap is just
+    // a writer-side list edit followed by publishing the new version.
     std::unique_lock<std::shared_mutex> ctx_lock(ctx->mu);
     vec_index_segment_t *cur1 = vec_find_segment_by_id(ctx, seg1_id);
     vec_index_segment_t *cur2 = vec_find_segment_by_id(ctx, seg2_id);
@@ -800,17 +810,6 @@ void VecMergeManager::process_task(VecMergeTask task) {
         !cur1->immutable || !cur2->immutable) {
       vec_cleanup_segment_files(merge_path);
       return;
-    }
-
-    std::shared_ptr<std::shared_mutex> rw1 = cur1->rw_lock;
-    std::shared_ptr<std::shared_mutex> rw2 = cur2->rw_lock;
-    std::unique_lock<std::shared_mutex> lk1;
-    std::unique_lock<std::shared_mutex> lk2;
-    if (rw1) {
-      lk1 = std::unique_lock<std::shared_mutex>(*rw1);
-    }
-    if (rw2) {
-      lk2 = std::unique_lock<std::shared_mutex>(*rw2);
     }
 
     auto it1 = ctx->segment_id_map.find(seg1_id);
@@ -832,7 +831,7 @@ void VecMergeManager::process_task(VecMergeTask task) {
       ctx->segments.erase(ctx->segments.begin() + lo);
     }
     ctx->segments.push_back(std::move(merged));
-    vec_rebuild_segment_id_map(ctx);
+    vec_commit_topology(ctx);
     swapped = true;
   }
 

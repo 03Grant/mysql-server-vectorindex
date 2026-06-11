@@ -10,6 +10,7 @@
 #include "trx0types.h"
 
 struct vec_index_ctx_t;
+struct vec_index_version_t;
 struct dict_index_t;
 struct VecRuntimeSearchParams;
 class THD;
@@ -44,7 +45,11 @@ int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   
 
 int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n);
 
-int vec_search(vec_index_ctx_t& ctx, const float* q, size_t nq,
+// Search over a pinned, immutable version snapshot `ver` (see vec_pin_version).
+// The caller must keep `ver` pinned for the lifetime of the call and of any
+// follow-up that dereferences the returned segment ids.
+int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
+           const float* q, size_t nq,
            size_t k, float* distances, int64_t* labels, std::string* segments,
            trx_id_t* trx_ids,
            const VecRuntimeSearchParams* params = nullptr);                   // 召回
