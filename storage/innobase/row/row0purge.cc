@@ -34,6 +34,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0purge.h"
 
 #include <stddef.h>
+#include <cstring>
+#include <string>
 
 #include "current_thd.h"
 #include "debug_sync.h"
@@ -64,6 +66,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0rseg.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
+#include "storage/innobase/vec/vec_txn_buf.h"
 
 /*************************************************************************
 IMPORTANT NOTE: Any operation that generates redo MUST check that there
@@ -74,6 +77,7 @@ that we MUST not hold any synchronization objects when performing the
 check.
 If you make a change in this module make sure that no codepath is
 introduced where a call to log_free_check() is bypassed. */
+
 
 /** Create a purge node to a query graph.
 @param[in]      parent  parent node, i.e., a thr node
@@ -670,6 +674,11 @@ static inline void row_purge_remove_multi_sec_if_poss(purge_node_t *node,
       break;
     }
 
+    if (node->index->type & DICT_VECINDEX) {
+      node->index = node->index->next();
+      continue;
+    }
+
     if (node->index->type != DICT_FTS &&
         !(node->index->type & DICT_VECINDEX)) {
       if (node->index->is_multi_value()) {
@@ -719,6 +728,11 @@ static void row_purge_upd_exist_or_extern_func(IF_DEBUG(const que_thr_t *thr, )
 
     if (!node->index) {
       break;
+    }
+
+    if (node->index->type & DICT_VECINDEX) {
+      node->index = node->index->next();
+      continue;
     }
 
 #ifndef UNIV_DEBUG

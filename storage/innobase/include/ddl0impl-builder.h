@@ -38,6 +38,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0pread.h"
 #include "storage/innobase/vec/vec_txn_buf.h"
 
+#include <string>
+#include <vector>
+
 namespace ddl {
 
 // Forward declaration.
@@ -173,6 +176,10 @@ struct Builder {
   /** Flush the vector rows to global buffer. */
   [[nodiscard]] dberr_t flush_vector_rows() noexcept;
 
+  /** @return true if this builder should stream rows into a native DiskANN
+  build input instead of filling the mutable in-memory collector. */
+  [[nodiscard]] bool uses_direct_diskann_ddl_build() const noexcept;
+
   /** Non-FTS: Sort the rows read.
   @return DB_SUCCESS or error code. */
   [[nodiscard]] dberr_t setup_sort() noexcept;
@@ -270,12 +277,31 @@ struct Builder {
     /** For spatial/Rtree rows handling. */
     RTree_inserter *m_rtree_inserter{};
 
-    /** For vector index rows handling. */
-    std::vector<vec_item_t> m_vec_items;
+    /** Deferred vector payloads, flattened as contiguous dim-sized rows. */
+    std::vector<float> m_vec_values;
+
+    /** Deferred aux/cache metadata for vector index rows. */
+    std::vector<vec_ddl_aux_row_t> m_vec_aux_rows;
+
   };
 
   using Allocator = ut::allocator<Thread_ctx *>;
   using Thread_ctxs = std::vector<Thread_ctx *, Allocator>;
+
+  /** Flush deferred vector rows for a single thread state. */
+  [[nodiscard]] dberr_t flush_vector_rows(Thread_ctx *thread_ctx) noexcept;
+
+  /** Complete the native DiskANN build for rows streamed during DDL. */
+  [[nodiscard]] dberr_t finalize_direct_diskann_build() noexcept;
+
+  /** Streamed DDL build input for native DiskANN. */
+  std::string m_vec_diskann_input_path;
+
+  /** Deferred PK mapping aligned to streamed DiskANN rows. */
+  vid_pk_mapping_t m_vec_diskann_pk_mapping;
+
+  /** Number of rows streamed into the native DiskANN build input. */
+  uint64_t m_vec_diskann_rows{0};
 
   /** Create the tasks to merge Sort the file before we load the file into
   the Btree index.

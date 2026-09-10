@@ -162,11 +162,11 @@ inline dict_table_t *dd_table_open_on_id_in_mem(table_id_t table_id,
 
   if (table != nullptr) {
     table->acquire();
-    const char *name =
-        (table->name.m_name != nullptr &&
-         strstr(table->name.m_name, "/I_VEC_") != nullptr)
-            ? table->name.m_name
-            : nullptr;
+    // const char *name =
+    //     (table->name.m_name != nullptr &&
+    //      strstr(table->name.m_name, "/I_VEC_") != nullptr)
+    //         ? table->name.m_name
+    //         : nullptr;
     // if (name != nullptr) {
     //   ib::warn() << "VECREF: dd_table_open_on_id_in_mem '" << name
     //              << "' ref=" << table->get_ref_count();
@@ -202,11 +202,11 @@ inline dict_table_t *dd_table_open_on_name_in_mem(const char *name,
     }
 
     table->acquire_with_lock();
-    const char *aux_name =
-        (table->name.m_name != nullptr &&
-         strstr(table->name.m_name, "/I_VEC_") != nullptr)
-            ? table->name.m_name
-            : nullptr;
+    // const char *aux_name =
+    //     (table->name.m_name != nullptr &&
+    //      strstr(table->name.m_name, "/I_VEC_") != nullptr)
+    //         ? table->name.m_name
+    //         : nullptr;
     // if (aux_name != nullptr) {
     //   ib::warn() << "VECREF: dd_table_open_on_name_in_mem '" << aux_name
     //              << "' ref=" << table->get_ref_count();

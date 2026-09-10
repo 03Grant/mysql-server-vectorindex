@@ -5634,6 +5634,23 @@ bool JOIN::propagate_dependencies() {
 }
 
 /**
+  Return the table_map of all tables referenced by MYVECTOR_IS_ANN items in
+  the query block's vecfunc_list.  Those tables must not be const-folded:
+  val_int() returns false unless VectorSearchIterator ran, so evaluating it at
+  optimisation time would always produce "Impossible WHERE".
+*/
+static table_map collect_vec_searched_tables(Query_block *qb) {
+  table_map result = 0;
+  if (!qb || !qb->vecfunc_list) return result;
+  List_iterator_fast<Item_func_myvector_is_ann> it(*qb->vecfunc_list);
+  Item_func_myvector_is_ann *ann;
+  while ((ann = it++)) {
+    if (ann->table_ref()) result |= ann->table_ref()->map();
+  }
+  return result;
+}
+
+/**
   Extract const tables based on row counts.
 
   @returns false if success, true if error
@@ -5659,6 +5676,9 @@ bool JOIN::extract_const_tables() {
     extract_empty_table = 1,
     extract_const_table = 2
   };
+
+  // Tables with MYVECTOR_IS_ANN must not be const-folded.
+  const table_map vec_searched = collect_vec_searched_tables(query_block);
 
   JOIN_TAB *const tab_end = join_tab + tables;
   for (JOIN_TAB *tab = join_tab; tab < tab_end; tab++) {
@@ -5708,8 +5728,9 @@ bool JOIN::extract_const_tables() {
             !tab->dependent &&                                              // 1
             (table->file->ha_table_flags() & HA_STATS_RECORDS_IS_EXACT) &&  // 2
             !tl->is_fulltext_searched() &&                                  // 3
+            !(vec_searched & tl->map()) &&                                  // 4
             !(explain_mode && tl->is_view_or_derived() &&
-              tl->has_stored_program()))  // 4
+              tl->has_stored_program()))  // 5
           mark_const_table(tab, nullptr);
         break;
     }
@@ -5752,6 +5773,10 @@ bool JOIN::extract_const_tables() {
 */
 
 bool JOIN::extract_func_dependent_tables() {
+  // Tables with MYVECTOR_IS_ANN must not be const-folded (val_int() returns 0
+  // unless VectorSearchIterator ran).
+  const table_map vec_searched = collect_vec_searched_tables(query_block);
+
   // loop until no more const tables are found
   bool ref_changed;
   // Tables referenced by others; if they're const the others may be too.
@@ -5867,6 +5892,7 @@ bool JOIN::extract_func_dependent_tables() {
           */
           if (eq_part.is_prefix(table->key_info[key].user_defined_key_parts) &&
               !tl->is_fulltext_searched() &&                            // 1
+              !(vec_searched & tl->map()) &&                           // 1b
               !tl->outer_join_nest() &&                                 // 2
               !(tl->embedding && tl->embedding->is_sj_or_aj_nest()) &&  // 3
               !(tab->join_cond() &&
@@ -8002,21 +8028,18 @@ static bool add_vec_keys(Key_use_array *keyuse_array, Item *cond,
     }
     
 
-    // How about OR?
-    if (func->functype() == Item_func::COND_AND_FUNC) {
+    return false;
+  }
+
+  if (cond->type() == Item::COND_ITEM) {
+    // Only recurse into AND conditions. For OR, using the vector index would
+    // miss rows that satisfy the other OR branches but are not ANN results.
+    if (down_cast<Item_cond *>(cond)->functype() == Item_func::COND_AND_FUNC) {
       List_iterator_fast<Item> it(*down_cast<Item_cond *>(cond)->argument_list());
       Item *arg;
       while ((arg = it++))
         if (add_vec_keys(keyuse_array, arg, usable_tables)) return true;
     }
-    return false;
-  }
-
-  if (cond->type() == Item::COND_ITEM) {
-    List_iterator_fast<Item> it(*down_cast<Item_cond *>(cond)->argument_list());
-    Item *arg;
-    while ((arg = it++))
-      if (add_vec_keys(keyuse_array, arg, usable_tables)) return true;
   }
 
   return false;

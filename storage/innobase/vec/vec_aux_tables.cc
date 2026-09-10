@@ -13,16 +13,17 @@
 #include "ha_innodb.h"      // thd_to_trx
 #include "my_bitmap.h"      // bitmap_set_all
 #include "vec_index_runtime.h"
+#include "vec_diskann_factory.h"
 #include "vec_meta.h"
 #include "current_thd.h"    // current_thd
-#include "sql/sql_table.h"  // mysql_rename_table
-#include "sql/sql_base.h"   // tdc_remove_table
+#include "sql/sql_table.h"
 #include "sql/mysqld.h"     // innodb_hton
 #include "sql/dd/cache/dictionary_client.h"  // Dictionary_client::Auto_releaser
 #include "sql/key.h"        // key_copy
 #include "sql/dd/dd_schema.h"  // Schema_MDL_locker
 #include "sql/dd/dictionary.h"  // acquire_exclusive_table_mdl
 #include "sql/sql_class.h"  // THD, dd_client()
+#include "sql_string.h"     // String
 #include "sql/mdl.h"        // MDL_request
 #include "sql/sql_lex.h"    // lex_start / lex_end
 #include "sql/dd/string_type.h"  // dd::String_type
@@ -79,7 +80,7 @@ static std::string vec_make_aux_name(const char* parent, const std::string& suff
   return full;
 }
 
-static std::string vec_aux_full_name(const dict_index_t* index) {
+std::string vec_aux_full_name(const dict_index_t* index) {
   ut_ad(index && index->table && index->table->name.m_name);
 
   std::string suffix;
@@ -92,38 +93,6 @@ static std::string vec_aux_full_name(const dict_index_t* index) {
   return vec_make_aux_name(index->table->name.m_name, suffix);
 }
 
-std::string vec_aux_prefix(const dict_index_t *index) {
-  return vec_aux_full_name(index);
-}
-
-std::string vec_aux_segment_name(const std::string& prefix, uint32_t seg_id) {
-  std::string name = prefix;
-  name.append("_SEG_").append(std::to_string(static_cast<unsigned long long>(seg_id)));
-  return name;
-}
-
-std::string vec_aux_mem_name(const std::string& prefix) {
-  std::string name = prefix;
-  name.append("_MEM");
-  return name;
-}
-
-bool vec_aux_extract_seg_id(const std::string& full_name,
-                            const std::string& prefix,
-                            uint32_t* seg_id_out) {
-  if (seg_id_out == nullptr) return false;
-  const std::string suffix = "_SEG_";
-  if (full_name.size() <= prefix.size() + suffix.size()) return false;
-  if (full_name.compare(0, prefix.size(), prefix) != 0) return false;
-  if (full_name.compare(prefix.size(), suffix.size(), suffix) != 0) return false;
-  const std::string id_part = full_name.substr(prefix.size() + suffix.size());
-  if (id_part.empty()) return false;
-  char* endptr = nullptr;
-  unsigned long long val = std::strtoull(id_part.c_str(), &endptr, 10);
-  if (endptr == id_part.c_str() || *endptr != '\0') return false;
-  *seg_id_out = static_cast<uint32_t>(val);
-  return true;
-}
 
 bool vec_aux_table_exists(const std::string& full_name) {
   if (full_name.empty()) return false;
@@ -214,23 +183,6 @@ bool vec_dict_table_is_aux(const dict_table_t* table) {
   return vec_is_aux_table_name(table->name.m_name);
 }
 
-uint32_t vec_aux_scan_max_segment(const std::string& prefix,
-                                  uint32_t probe_limit) {
-  uint32_t max_id = 0;
-  uint32_t found = 0;
-  const uint32_t limit = std::max<uint32_t>(probe_limit, 1);
-
-  for (uint32_t seg = 1; seg <= limit; ++seg) {
-    const std::string name = vec_aux_segment_name(prefix, seg);
-    if (vec_aux_table_exists(name)) {
-      max_id = std::max(max_id, seg);
-      ++found;
-    }
-  }
-
-  // If none found, return 0 to indicate "start from 1".
-  return max_id;
-}
 
 static std::string vec_aux_suffix_from_full(const std::string& full_name) {
   const auto slash = full_name.find('/');
@@ -245,176 +197,11 @@ std::string vec_aux_active_name(const dict_index_t* index) {
     vec_index_ctx_t* ctx = index->vec_runtime;
     // unique lock?
     std::shared_lock<std::shared_mutex> lk(ctx->mu);
-    if (auto* seg = ctx->mutable_segment(); seg != nullptr) {
-      if (!seg->aux_table_name.empty()) {
-        return seg->aux_table_name;
-      }
+    if (!ctx->aux_table_name.empty()) {
+      return ctx->aux_table_name;
     }
   }
-  return vec_aux_mem_name(vec_aux_full_name(index));
-}
-
-/** Update DD metadata for a renamed VEC auxiliary table.
-@param[in]      old_name  original fully qualified name
-@param[in]      new_name  new fully qualified name
-@param[in]      table     dict table object after rename
-@return true on success */
-static bool vec_aux_update_dd_after_rename(const std::string& old_name,
-                                           const std::string& new_name,
-                                           const dict_table_t* table) {
-  if (table == nullptr || old_name.empty() || new_name.empty()) {
-    return false;
-  }
-
-  THD* thd = current_thd;
-  if (thd == nullptr) {
-    return false;
-  }
-
-  const ulonglong saved_options = thd->variables.option_bits;
-  const bool adjust_autocommit =
-      (saved_options & OPTION_AUTOCOMMIT) ||
-      !(saved_options & OPTION_NOT_AUTOCOMMIT);
-  if (adjust_autocommit) {
-    thd->variables.option_bits &= ~OPTION_AUTOCOMMIT;
-    thd->variables.option_bits |= OPTION_NOT_AUTOCOMMIT;
-  }
-
-  std::string old_db, old_tbl;
-  std::string new_db, new_tbl;
-  dict_name::get_table(old_name.c_str(), old_db, old_tbl);
-  dict_name::get_table(new_name.c_str(), new_db, new_tbl);
-
-  if (old_db.empty() || old_tbl.empty() || new_db.empty() || new_tbl.empty()) {
-    if (adjust_autocommit) {
-      thd->variables.option_bits = saved_options;
-    }
-    return false;
-  }
-
-  dd::Schema_MDL_locker mdl_locker(thd);
-  dd::cache::Dictionary_client* client = dd::get_dd_client(thd);
-  dd::cache::Dictionary_client::Auto_releaser releaser(client);
-
-  if (mdl_locker.ensure_locked(new_db.c_str())) {
-    if (adjust_autocommit) {
-      thd->variables.option_bits = saved_options;
-    }
-    return false;
-  }
-
-  MDL_ticket* mdl_old = nullptr;
-  if (dd::acquire_exclusive_table_mdl(thd, old_db.c_str(), old_tbl.c_str(),
-                                      false, &mdl_old)) {
-    if (adjust_autocommit) {
-      thd->variables.option_bits = saved_options;
-    }
-    return false;
-  }
-
-  MDL_ticket* mdl_new = nullptr;
-  if (dd::acquire_exclusive_table_mdl(thd, new_db.c_str(), new_tbl.c_str(),
-                                      false, &mdl_new)) {
-    if (adjust_autocommit) {
-      thd->variables.option_bits = saved_options;
-    }
-    return false;
-  }
-
-  dd::Table* dd_table = nullptr;
-  if (client->acquire_for_modification<dd::Table>(old_db.c_str(),
-                                                  old_tbl.c_str(),
-                                                  &dd_table) ||
-      dd_table == nullptr) {
-    if (adjust_autocommit) {
-      thd->variables.option_bits = saved_options;
-    }
-    return false;
-  }
-
-  const dd::Schema* schema = nullptr;
-  if (client->acquire<dd::Schema>(new_db.c_str(), &schema) ||
-      schema == nullptr) {
-    if (adjust_autocommit) {
-      thd->variables.option_bits = saved_options;
-    }
-    return false;
-  }
-
-  dd_table->set_schema_id(schema->id());
-  dd_table->set_name(new_tbl.c_str());
-
-  if (dict_table_is_file_per_table(table)) {
-    char* new_path = fil_space_get_first_path(table->space);
-    dberr_t err =
-        dd_tablespace_rename(table->dd_space_id, false, new_name.c_str(),
-                             new_path);
-    if (new_path != nullptr) {
-      ut::free(new_path);
-    }
-    if (err != DB_SUCCESS) {
-      if (adjust_autocommit) {
-        thd->variables.option_bits = saved_options;
-      }
-      return false;
-    }
-  }
-
-  if (client->update(dd_table)) {
-    if (adjust_autocommit) {
-      thd->variables.option_bits = saved_options;
-    }
-    return false;
-  }
-
-  // Ensure DD client registries are flushed so Auto_releaser destructor
-  // sees no pending uncommitted objects in non-transactional DDL path.
-  client->commit_modified_objects();
-
-  // Invalidate table definition cache entries for both names so SQL layer
-  // doesn't reuse stale TABLE_SHARE objects after internal rename.
-  tdc_remove_table(thd, TDC_RT_REMOVE_UNUSED, old_db.c_str(), old_tbl.c_str(),
-                   false);
-  tdc_remove_table(thd, TDC_RT_REMOVE_UNUSED, new_db.c_str(), new_tbl.c_str(),
-                   false);
-
-  if (adjust_autocommit) {
-    thd->variables.option_bits = saved_options;
-  }
-  return true;
-}
-
-dberr_t vec_aux_rename_table(trx_t* trx,
-                             const std::string& old_name,
-                             const std::string& new_name) {
-  if (trx == nullptr || old_name.empty() || new_name.empty()) {
-    return DB_ERROR;
-  }
-  if (old_name == new_name) {
-    return DB_SUCCESS;
-  }
-
-  trx_set_dict_operation(trx, TRX_DICT_OP_TABLE);
-
-  row_mysql_lock_data_dictionary(trx, UT_LOCATION_HERE);
-  dberr_t err = row_rename_table_for_mysql(old_name.c_str(), new_name.c_str(),
-                                           nullptr, trx, false);
-  row_mysql_unlock_data_dictionary(trx);
-
-  if (err != DB_SUCCESS) {
-    return err;
-  }
-
-  dict_table_t* table =
-      dd_table_open_on_name_in_mem(new_name.c_str(), false /*dict_locked*/);
-  if (table == nullptr) {
-    return DB_ERROR;
-  }
-
-  bool dd_ok = vec_aux_update_dd_after_rename(old_name, new_name, table);
-  dd_table_close(table, current_thd, nullptr, false);
-
-  return dd_ok ? DB_SUCCESS : DB_ERROR;
+  return vec_aux_full_name(index);
 }
 
 dberr_t vec_aux_create_table(trx_t* trx,
@@ -518,7 +305,7 @@ static dberr_t vec_aux_bind_pk_column_ids(pars_info_t* info,
 
   char key[8];
   snprintf(key, sizeof(key), "c%u", static_cast<unsigned>(meta.pk_cols));
-  pars_info_bind_id(info, true, key, "faiss_id");
+  pars_info_bind_id(info, true, key, "seg_id");
 
   return DB_SUCCESS;
 }
@@ -646,7 +433,7 @@ dberr_t vec_aux_insert_one(
     trx_t* trx,
     dict_index_t* index,
     const std::vector<vec_pk_column_t>& pk_columns,
-    uint64_t faiss_id){
+    const std::string& seg_id){
   pars_info_t *info = pars_info_create();
   const std::string aux_full = vec_aux_active_name(index);
   pars_info_bind_id(info, true, "index_table_name", aux_full.c_str());
@@ -670,12 +457,18 @@ dberr_t vec_aux_insert_one(
     return err;
   }
 
-  /* Store FAISS id as unsigned 64-bit. */
-  pars_info_add_ull_literal(info, "faiss_id", faiss_id);
+  if (seg_id.empty() || seg_id.size() > kVecSegmentIdMaxLen) {
+    ib::warn() << "VECINDEX: invalid seg_id length=" << seg_id.size();
+    pars_info_free(info);
+    return DB_ERROR;
+  }
+
+  /* Store segment id as string. */
+  pars_info_add_str_literal(info, "seg_id", seg_id.c_str());
 
   /* InnoDB's internal SQL parser (pars0grm.yy) only supports INSERT ... VALUES
   without a column list, so the aux table definition must keep PK columns first
-  followed by faiss_id. */
+  followed by seg_id. */
   std::ostringstream sql;
   sql << "BEGIN\nINSERT INTO $index_table_name VALUES (";
   for (ulint i = 0; i < meta.pk_cols; ++i) {
@@ -687,7 +480,7 @@ dberr_t vec_aux_insert_one(
   if (meta.pk_cols > 0) {
     sql << ", ";
   }
-  sql << ":faiss_id);";
+  sql << ":seg_id);";
 
   que_t* graph = vec_parse_sql(aux_full.c_str(), info, sql.str().c_str());
 
@@ -706,99 +499,17 @@ dberr_t vec_aux_insert_one(
                           
 }
 
-
-dberr_t vec_aux_insert_pk_null(trx_t* trx,
-    dict_index_t* index,
-    const std::vector<vec_pk_column_t>& pk_columns){
-  ib::warn() << "vec_aux_insert_pk_null called.";
-  pars_info_t *info = pars_info_create();
-  
-  ib::warn() << "vec_aux_insert_pk_null created pars_info.";
-
-  const std::string aux_full = vec_aux_active_name(index);
-  pars_info_bind_id(info, true, "index_table_name", aux_full.c_str());
-  ib::warn() << "vec_aux_insert_pk_null called for index: " << aux_full;
-
-  vec_aux_pk_meta_t meta;
-  dberr_t err = vec_aux_prepare_pk_meta(index, &meta);
-  if (err != DB_SUCCESS) {
-    pars_info_free(info);
-    ib::warn() << "vec_aux_insert_pk_null failed at prepare_pk_meta, error:" << err;
-    return err;
-  }
-  ib::warn() << "vec_aux_insert_pk_null prepare_pk_meta success.";
-
-  err = vec_aux_bind_pk_column_ids(info, meta);
-  if (err != DB_SUCCESS) {
-    pars_info_free(info);
-    ib::warn() << "vec_aux_insert_pk_null failed at bind_pk_column_ids, error:" << err;
-    return err;
-  }
-  ib::warn() << "vec_aux_insert_pk_null bind_pk_column_ids success.";
-
-  err = vec_aux_bind_pk_values(info, meta, pk_columns);
-  if (err != DB_SUCCESS) {
-    pars_info_free(info);
-    ib::warn() << "vec_aux_insert_pk_null failed at bind_pk_values, error:" << err;
-    return err;
-  }
-  ib::warn() << "vec_aux_insert_pk_null bind_pk_values success.";
-
-  /* Insert sentinel UINT64_MAX instead of NULL because the aux table column is
-  NONNULL and unsigned. */
-  const char *faiss_null_name = "faiss_id_null";
-  pars_info_add_ull_literal(info, faiss_null_name, UINT64_MAX);
-
-  /* Same parser restriction as vec_aux_insert_one(): rely on table column
-  order for the INSERT target list. */
-  std::ostringstream sql;
-  sql << "BEGIN\nINSERT INTO $index_table_name VALUES (";
-  for (ulint i = 0; i < meta.pk_cols; ++i) {
-    if (i != 0) {
-      sql << ", ";
-    }
-    sql << ":v" << i;
-  }
-  if (meta.pk_cols > 0) {
-    sql << ", ";
-  }
-  sql << ":" << faiss_null_name << ");";
-  ib::warn() << "vec_aux_insert_pk_null executing SQL: " << sql.str();
-  que_t* graph = vec_parse_sql(aux_full.c_str(), info, sql.str().c_str());
-  ib::warn() << "vec_aux_insert_pk_null parsed SQL into graph.";
-
-  dberr_t error = vec_eval_sql(trx, graph);
-  ib::warn() << "vec_aux_insert_pk_null vec_eval_sql returned: " << error;
-  if (error != DB_SUCCESS) {
-    ib::warn() << "vec_aux_insert_pk_null failed with error:" << error;
-    if (trx->error_state == DB_SUCCESS) {
-      trx->error_state = error;
-    }
-    que_graph_free(graph);
-    return error;
-  }
-
-  que_graph_free(graph);
-
-  /* Debug-only injection: pause/crash right after inserting the sentinel row,
-  before the caller continues (used to simulate crash during forward roll). */
-  DEBUG_SYNC_C("vec_aux_insert_pk_null_after");
-  DBUG_EXECUTE_IF("crash_vec_aux_insert_pk_null_after", DBUG_SUICIDE(););
-
-
-  return DB_SUCCESS;
-}
-
-dberr_t vec_aux_update_pk_vid(trx_t* trx,
+// Only update seg_id
+dberr_t vec_aux_update_pk_segid(trx_t* trx,
     dict_index_t* index,
     const std::vector<vec_pk_column_t>& pk_columns,
-    uint64_t faiss_id){
+    const std::string& seg_id){
   
-  DEBUG_SYNC_C("vec_aux_update_pk_vid_after");
-  DBUG_EXECUTE_IF("crash_vec_aux_update_pk_vid_after", DBUG_SUICIDE(););
+  DEBUG_SYNC_C("vec_aux_update_pk_segid_after");
+  DBUG_EXECUTE_IF("crash_vec_aux_update_pk_segid_after", DBUG_SUICIDE(););
 
 
-  ib::warn() << "vec_aux_update_pk_vid called.";
+  ib::warn() << "vec_aux_update_pk_segid called.";
   pars_info_t *info = pars_info_create();
   const std::string aux_full = vec_aux_active_name(index);
   pars_info_bind_id(info, true, "index_table_name", aux_full.c_str());
@@ -822,13 +533,19 @@ dberr_t vec_aux_update_pk_vid(trx_t* trx,
     return err;
   }
 
-  pars_info_add_ull_literal(info, "faiss_id", faiss_id);
+  if (seg_id.empty() || seg_id.size() > kVecSegmentIdMaxLen) {
+    ib::warn() << "VECINDEX: invalid seg_id length=" << seg_id.size();
+    pars_info_free(info);
+    return DB_ERROR;
+  }
 
-  ib::warn() << "vec_aux_update_pk_vid preparing SQL statement.";
+  pars_info_add_str_literal(info, "seg_id", seg_id.c_str());
+
+  ib::warn() << "vec_aux_update_pk_segid preparing SQL statement.";
 
   std::ostringstream sql;
   sql << "BEGIN\nUPDATE $index_table_name SET $c" << meta.pk_cols
-      << " = :faiss_id WHERE ";
+      << " = :seg_id WHERE ";
   for (ulint i = 0; i < meta.pk_cols; ++i) {
     if (i != 0) {
       sql << " AND ";
@@ -837,13 +554,13 @@ dberr_t vec_aux_update_pk_vid(trx_t* trx,
   }
   sql << ";";
 
-  ib::warn() << "vec_aux_update_pk_vid executing SQL: " << sql.str();
+  ib::warn() << "vec_aux_update_pk_segid executing SQL: " << sql.str();
   que_t* graph = vec_parse_sql(aux_full.c_str(), info, sql.str().c_str());
   
-  ib::warn() << "vec_aux_update_pk_vid parsed SQL into graph.";
+  ib::warn() << "vec_aux_update_pk_segid parsed SQL into graph.";
   dberr_t error = vec_eval_sql(trx, graph);
   if (error != DB_SUCCESS) {
-    ib::warn() << "vec_aux_update_pk_vid failed with error:" << error;
+    ib::warn() << "vec_aux_update_pk_segid failed with error:" << error;
     if (trx->error_state == DB_SUCCESS) {
       trx->error_state = error;
     }
@@ -851,7 +568,7 @@ dberr_t vec_aux_update_pk_vid(trx_t* trx,
     return error;
   }
 
-  ib::warn() << "vec_aux_update_pk_vid vec_eval_sql returned: " << error;
+  ib::warn() << "vec_aux_update_pk_segid vec_eval_sql returned: " << error;
 
   que_graph_free(graph);
   return DB_SUCCESS;
@@ -1018,13 +735,15 @@ static bool vec_apply_pk_columns_to_record(
   return true;
 }
 
+// Update contain pk.
 dberr_t vec_aux_handler_update(trx_t* trx,
                                const std::string& table_name,
                                dict_index_t* clust_index,
                                ulint pk_fields,
                                const std::vector<vec_pk_column_t>& old_pk_columns,
                                const std::vector<vec_pk_column_t>& new_pk_columns,
-                               uint64_t* out_vid) {
+                               const std::string& new_seg_id,
+                               std::string* out_sid) {
   ib::warn() << "vec_aux_handler_update called.";
   if (table_name.empty() || clust_index == nullptr || pk_fields == 0 ||
       old_pk_columns.size() < pk_fields || new_pk_columns.size() < pk_fields) {
@@ -1236,16 +955,31 @@ dberr_t vec_aux_handler_update(trx_t* trx,
     return err;
   }
 
-  Field* faiss_field =
+  Field* seg_field =
       (pk_fields < static_cast<ulint>(mysql_table->s->fields))
           ? mysql_table->field[pk_fields]
           : nullptr;
-  if (faiss_field == nullptr || faiss_field->is_null()) {
+  if (seg_field == nullptr || seg_field->is_null()) {
     return DB_RECORD_NOT_FOUND;
   }
 
-  const uint64_t vid =
-      static_cast<uint64_t>(static_cast<ulonglong>(faiss_field->val_int()));
+  if (new_seg_id.empty() || new_seg_id.size() > kVecSegmentIdMaxLen) {
+    ib::warn() << "vec_aux_handler_update: invalid seg_id length="
+               << new_seg_id.size();
+    return DB_ERROR;
+  }
+
+  String tmp;
+  String* val = seg_field->val_str(&tmp);
+  if (val == nullptr) {
+    return DB_RECORD_NOT_FOUND;
+  }
+  const char* seg_ptr = val->ptr();
+  const size_t seg_len = val->length();
+  std::string seg_id;
+  if (seg_ptr != nullptr && seg_len != 0) {
+    seg_id.assign(seg_ptr, seg_len);
+  }
 
   if (mysql_table->record[1] == nullptr ||
       mysql_table->s == nullptr) {
@@ -1264,10 +998,23 @@ dberr_t vec_aux_handler_update(trx_t* trx,
     return DB_SCHEMA_MISMATCH;
   }
 
+  if (seg_field == nullptr) {
+    ib::warn() << "vec_aux_handler_update: missing seg_id field";
+    return DB_ERROR;
+  }
+  const CHARSET_INFO* cs = seg_field->charset();
+  if (seg_field->store(new_seg_id.c_str(),
+                       static_cast<uint>(new_seg_id.size()),
+                       cs != nullptr ? cs : &my_charset_bin) != 0) {
+    ib::warn() << "vec_aux_handler_update: failed to store new seg_id="
+               << new_seg_id;
+    return DB_ERROR;
+  }
+
   rc = h->ha_update_row(mysql_table->record[1], mysql_table->record[0]);
   err = map_handler_err(rc);
-  if (err == DB_SUCCESS && out_vid != nullptr) {
-    *out_vid = vid;
+  if (err == DB_SUCCESS && out_sid != nullptr) {
+    *out_sid = seg_id;
   }
 
   return err;
@@ -1278,7 +1025,7 @@ dberr_t vec_aux_handler_delete(trx_t* trx,
                                dict_index_t* clust_index,
                                ulint pk_fields,
                                const std::vector<vec_pk_column_t>& pk_columns,
-                               uint64_t* out_vid) {
+                               std::string* out_sid) {
 
   ib::warn() << "vec_aux_handler_delete called.";
   if (table_name.empty() || clust_index == nullptr || pk_fields == 0 ||
@@ -1489,21 +1236,30 @@ dberr_t vec_aux_handler_delete(trx_t* trx,
     return err;
   }
 
-  Field* faiss_field =
+  Field* seg_field =
       (pk_fields < static_cast<ulint>(mysql_table->s->fields))
           ? mysql_table->field[pk_fields]
           : nullptr;
-  if (faiss_field == nullptr || faiss_field->is_null()) {
+  if (seg_field == nullptr || seg_field->is_null()) {
     return DB_RECORD_NOT_FOUND;
   }
 
-  const uint64_t vid =
-      static_cast<uint64_t>(static_cast<ulonglong>(faiss_field->val_int()));
+  String tmp;
+  String* val = seg_field->val_str(&tmp);
+  if (val == nullptr) {
+    return DB_RECORD_NOT_FOUND;
+  }
+  const char* seg_ptr = val->ptr();
+  const size_t seg_len = val->length();
+  std::string seg_id;
+  if (seg_ptr != nullptr && seg_len != 0) {
+    seg_id.assign(seg_ptr, seg_len);
+  }
 
   rc = h->ha_delete_row(mysql_table->record[0]);
   err = map_handler_err(rc);
-  if (err == DB_SUCCESS && out_vid != nullptr) {
-    *out_vid = vid;
+  if (err == DB_SUCCESS && out_sid != nullptr) {
+    *out_sid = seg_id;
   }
 
   return err;
@@ -1520,7 +1276,7 @@ static inline uint32_t vec_get_table_flags2_for_aux_tables(uint32_t flags2) {
   from the main table flags2 */
   return ((flags2 & DICT_TF2_USE_FILE_PER_TABLE) |
           (flags2 & DICT_TF2_ENCRYPTION_FILE_PER_TABLE) |
-          (flags2 & DICT_TF2_TEMPORARY) | DICT_TF2_VECINDEX);
+          (flags2 & DICT_TF2_TEMPORARY));
 }
 
 /** Create dict_table_t object for VEC Aux tables.
@@ -1562,18 +1318,7 @@ static dberr_t vec_create_one_index_dd_tables(const dict_index_t* index)
   // 如果你有 DICT_VECINDEX 标志，做个断言
   ut_ad(index->type & DICT_VECINDEX);
 
-  // Need to get the full name of the aux table, one is _NEXT, the other is _MEM
-  // Should receive name in parameter?
-  std::string full_name;
-  if (index->vec_runtime != nullptr) {
-    std::lock_guard<std::shared_mutex> lk(index->vec_runtime->mu);
-    if (!index->vec_runtime->pending_aux_name.empty()) {
-      full_name = index->vec_runtime->pending_aux_name;
-    }
-  }
-  if (full_name.empty()) {
-    full_name = vec_aux_mem_name(vec_aux_full_name(index));
-  }
+  std::string full_name = vec_aux_full_name(index);
 
   ib::warn() << "VECINDEX: DD register step 2! full_name=" << full_name;
   // 打开 InnoDB 内部已创建好的物理表（只在内存里用，不登记/修改）
@@ -1641,9 +1386,9 @@ inline bool vec_cache_read_u32(const unsigned char *&p, size_t &remain,
   return true;
 }
 
-static bool vec_bind_tuple_from_entry(const unsigned char *data, size_t len,
-                                      dict_index_t *clust_index,
-                                      dtuple_t *tuple) {
+bool vec_bind_tuple_from_entry_impl(const unsigned char *data, size_t len,
+                                    dict_index_t *clust_index,
+                                    dtuple_t *tuple) {
   if (data == nullptr || clust_index == nullptr || tuple == nullptr) {
     return false;
   }
@@ -1727,7 +1472,7 @@ static std::vector<unsigned char> vec_pack_pk_entry(
 }
 
 constexpr uint32_t VID_PK_MAPPING_MAGIC = 0x4D4B5056;  // "VPKM"
-constexpr uint16_t VID_PK_MAPPING_VERSION = 1;
+constexpr uint16_t VID_PK_MAPPING_VERSION = 2;
 
 #pragma pack(push, 1)
 struct VidPkMappingHeader {
@@ -1759,9 +1504,16 @@ inline bool vec_pk_flush(FILE *fp) {
 
 }  // namespace
 
+bool vec_aux_bind_tuple_from_entry(const unsigned char *data, size_t len,
+                                   dict_index_t *clust_index,
+                                   dtuple_t *tuple) {
+  return vec_bind_tuple_from_entry_impl(data, len, clust_index, tuple);
+}
+
 dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
                              dict_index_t *clust_index, uint64_t faiss_id,
-                             const std::vector<vec_pk_column_t> &pk_columns) {
+                             const std::vector<vec_pk_column_t> &pk_columns,
+                             trx_id_t creator_trx_id) {
   if (cache == nullptr || clust_index == nullptr) {
     return DB_ERROR;
   }
@@ -1791,7 +1543,11 @@ dberr_t vec_insert_aux_cache(vid_pk_mapping_t *cache,
   if (target >= cache->pk_values.size()) {
     cache->pk_values.resize(target + 1);
   }
+  if (target >= cache->trx_ids.size()) {
+    cache->trx_ids.resize(target + 1, 0);
+  }
   cache->pk_values[target] = std::move(packed);
+  cache->trx_ids[target] = creator_trx_id;
   cache->ready = true;
 
   return DB_SUCCESS;
@@ -1816,8 +1572,8 @@ bool vec_aux_cache_bind_tuple(const vid_pk_mapping_t *cache,
   }
 
   const std::vector<unsigned char> &entry = cache->pk_values[idx];
-  return vec_bind_tuple_from_entry(entry.data(), entry.size(), clust_index,
-                                   tuple);
+  return vec_aux_bind_tuple_from_entry(entry.data(), entry.size(), clust_index,
+                                       tuple);
 }
 
 bool vec_aux_cache_bind_tuple_copy(const vid_pk_mapping_t *cache,
@@ -1841,8 +1597,8 @@ bool vec_aux_cache_bind_tuple_copy(const vid_pk_mapping_t *cache,
 
   const std::vector<unsigned char> &entry = cache->pk_values[idx];
   entry_copy->assign(entry.begin(), entry.end());
-  return vec_bind_tuple_from_entry(entry_copy->data(), entry_copy->size(),
-                                   clust_index, tuple);
+  return vec_aux_bind_tuple_from_entry(entry_copy->data(), entry_copy->size(),
+                                       clust_index, tuple);
 }
 
 
@@ -1875,6 +1631,14 @@ bool vec_vid_pk_mapping_save(const vid_pk_mapping_t& mapping,
     }
   }
 
+  if (!mapping.trx_ids.empty() &&
+      mapping.trx_ids.size() != mapping.pk_values.size()) {
+    ib::warn() << "VECINDEX: pk mapping trx_ids size mismatch: "
+               << mapping.trx_ids.size() << " vs "
+               << mapping.pk_values.size();
+    return false;
+  }
+
   FILE* raw = std::fopen(path.c_str(), "wb");
   if (raw == nullptr) {
     ib::warn() << "VECINDEX: failed to open pk mapping file '" << path << "'";
@@ -1892,13 +1656,19 @@ bool vec_vid_pk_mapping_save(const vid_pk_mapping_t& mapping,
     return false;
   }
 
-  for (const auto& entry : mapping.pk_values) {
+  for (size_t i = 0; i < mapping.pk_values.size(); ++i) {
+    const auto& entry = mapping.pk_values[i];
     const uint32_t len = static_cast<uint32_t>(entry.size());
     if (std::fwrite(&len, sizeof(len), 1, fp.get()) != 1) {
       return false;
     }
     if (len > 0 &&
         std::fwrite(entry.data(), 1, len, fp.get()) != len) {
+      return false;
+    }
+    const trx_id_t trx_id =
+        mapping.trx_ids.empty() ? static_cast<trx_id_t>(0) : mapping.trx_ids[i];
+    if (std::fwrite(&trx_id, sizeof(trx_id), 1, fp.get()) != 1) {
       return false;
     }
   }
@@ -1931,7 +1701,7 @@ bool vec_vid_pk_mapping_load(const std::string& path,
   }
 
   if (header.magic != VID_PK_MAPPING_MAGIC ||
-      header.version != VID_PK_MAPPING_VERSION) {
+      (header.version != 1 && header.version != VID_PK_MAPPING_VERSION)) {
     ib::warn() << "VECINDEX: pk mapping header mismatch for '" << path << "'";
     return false;
   }
@@ -1954,15 +1724,16 @@ bool vec_vid_pk_mapping_load(const std::string& path,
   }
 
   const uint64_t header_bytes = sizeof(VidPkMappingHeader);
+  const uint64_t per_entry =
+      sizeof(uint32_t) + (header.version >= 2 ? sizeof(trx_id_t) : 0);
   if (entry_count >
-      (std::numeric_limits<uint64_t>::max() - header_bytes) /
-          sizeof(uint32_t)) {
+      (std::numeric_limits<uint64_t>::max() - header_bytes) / per_entry) {
     ib::warn() << "VECINDEX: pk mapping entry_count overflow in '" << path
                << "'";
     return false;
   }
 
-  const uint64_t min_size = header_bytes + entry_count * sizeof(uint32_t);
+  const uint64_t min_size = header_bytes + entry_count * per_entry;
   if (file_size > 0 && static_cast<uint64_t>(file_size) < min_size) {
     ib::warn() << "VECINDEX: pk mapping file truncated '" << path << "'";
     return false;
@@ -1970,31 +1741,62 @@ bool vec_vid_pk_mapping_load(const std::string& path,
 
   mapping->key_length = static_cast<size_t>(header.key_length);
   mapping->pk_values.resize(static_cast<size_t>(entry_count));
+  mapping->trx_ids.resize(static_cast<size_t>(entry_count), 0);
 
+  /* Bulk-read the payload and parse it in memory: the per-entry fread
+  variant issued three locked stdio calls per entry, which dominates load
+  time at 10M+ entries. */
+  const size_t payload_bytes =
+      (file_size > static_cast<off_t>(header_bytes))
+          ? static_cast<size_t>(file_size) - header_bytes
+          : 0;
+  std::vector<unsigned char> payload(payload_bytes);
+  size_t got = 0;
+  while (got < payload_bytes) {
+    const size_t n =
+        std::fread(payload.data() + got, 1, payload_bytes - got, fp.get());
+    if (n == 0) {
+      break;
+    }
+    got += n;
+  }
+  if (got != payload_bytes) {
+    mapping->clear();
+    return false;
+  }
+
+  size_t off = 0;
   for (size_t i = 0; i < mapping->pk_values.size(); ++i) {
     uint32_t len = 0;
-    if (std::fread(&len, sizeof(len), 1, fp.get()) != 1) {
+    if (off + sizeof(len) > payload_bytes) {
       mapping->clear();
       return false;
     }
-    if (len == 0) {
-      continue;
+    std::memcpy(&len, payload.data() + off, sizeof(len));
+    off += sizeof(len);
+    if (len > 0) {
+      if (off + len > payload_bytes) {
+        mapping->clear();
+        return false;
+      }
+      mapping->pk_values[i].assign(payload.data() + off,
+                                   payload.data() + off + len);
+      off += len;
     }
-    mapping->pk_values[i].resize(len);
-    if (std::fread(mapping->pk_values[i].data(), 1, len, fp.get()) != len) {
-      mapping->clear();
-      return false;
+    if (header.version >= 2) {
+      trx_id_t trx_id = 0;
+      if (off + sizeof(trx_id) > payload_bytes) {
+        mapping->clear();
+        return false;
+      }
+      std::memcpy(&trx_id, payload.data() + off, sizeof(trx_id));
+      off += sizeof(trx_id);
+      mapping->trx_ids[i] = trx_id;
     }
   }
 
   mapping->ready = true;
   return true;
-}
-
-static std::string vec_aux_next_name(const std::string& prefix) {
-  std::string name = prefix;
-  name.append("_NEXT");
-  return name;
 }
 
 static void vec_append_unique(std::vector<std::string>* out,
@@ -2033,10 +1835,9 @@ bool vec_collect_drop_resources(dict_table_t* table,
       info.index_name = index->name;
     }
 
-    info.prefix = vec_aux_prefix(index);
+    info.prefix = vec_aux_full_name(index);
     if (!info.prefix.empty()) {
-      info.mem_name = vec_aux_mem_name(info.prefix);
-      info.next_name = vec_aux_next_name(info.prefix);
+      info.mem_name = info.prefix;
     }else{
       ib::warn() << "VECINDEX: vec_collect_drop_resources: empty aux prefix for index "
                  << (index->name ? index->name : "(null)") << " on table "
@@ -2055,14 +1856,17 @@ bool vec_collect_drop_resources(dict_table_t* table,
       if (vec_meta_read_all(info.meta_path, &header, &entries)) {
         const std::string base_dir = vec_meta_dirname(info.meta_path);
         for (const auto& entry : entries) {
-          if (!info.prefix.empty() && entry.seg_id > 0) {
-            std::string seg_name = vec_aux_segment_name(
-                info.prefix, static_cast<uint32_t>(entry.seg_id));
-            vec_append_unique(&info.seg_names, seg_name);
-          }
           if (entry.file_name[0] != '\0') {
             std::string seg_path = vec_meta_join(base_dir, entry.file_name);
-            vec_append_unique(&info.segment_files, seg_path);
+            std::vector<std::string> segment_files;
+            vec_diskann_collect_artifact_paths(seg_path, &segment_files);
+            if (segment_files.empty()) {
+              vec_append_unique(&info.segment_files, seg_path);
+            } else {
+              for (const auto& path : segment_files) {
+                vec_append_unique(&info.segment_files, path);
+              }
+            }
             std::string pkmap_path = vec_vid_pk_mapping_path(seg_path);
             vec_append_unique(&info.pkmap_files, pkmap_path);
           }
@@ -2074,34 +1878,27 @@ bool vec_collect_drop_resources(dict_table_t* table,
                  << (table->name.m_name ? table->name.m_name : "(null)");
     }
 
-    if ((info.seg_names.empty() || info.segment_files.empty()) &&
-        index->vec_runtime != nullptr) {
+    if (info.segment_files.empty() && index->vec_runtime != nullptr) {
       vec_index_ctx_t* ctx = index->vec_runtime;
       std::lock_guard<std::shared_mutex> lk(ctx->mu);
       for (const auto& seg : ctx->segments) {
-        if (!seg.immutable || seg.vecindex_id == 0) {
+        if (!seg || !seg->immutable || seg->vecindex_id.empty()) {
           continue;
         }
-        std::string seg_name = seg.aux_table_name;
-        if (seg_name.empty() && !info.prefix.empty()) {
-          seg_name = vec_aux_segment_name(info.prefix, seg.vecindex_id);
-        }
-        vec_append_unique(&info.seg_names, seg_name);
-        if (!seg.index_file_name.empty()) {
-          vec_append_unique(&info.segment_files, seg.index_file_name);
+        if (!seg->index_file_name.empty()) {
+          std::vector<std::string> segment_files;
+          vec_diskann_collect_artifact_paths(seg->index_file_name,
+                                             &segment_files);
+          if (segment_files.empty()) {
+            vec_append_unique(&info.segment_files, seg->index_file_name);
+          } else {
+            for (const auto& path : segment_files) {
+              vec_append_unique(&info.segment_files, path);
+            }
+          }
           std::string pkmap_path =
-              vec_vid_pk_mapping_path(seg.index_file_name);
+              vec_vid_pk_mapping_path(seg->index_file_name);
           vec_append_unique(&info.pkmap_files, pkmap_path);
-        }
-      }
-    }
-
-    if (info.seg_names.empty() && !info.prefix.empty()) {
-      const uint32_t max_id = vec_aux_scan_max_segment(info.prefix);
-      for (uint32_t seg_id = 1; seg_id <= max_id; ++seg_id) {
-        std::string seg_name = vec_aux_segment_name(info.prefix, seg_id);
-        if (vec_aux_table_exists(seg_name)) {
-          vec_append_unique(&info.seg_names, seg_name);
         }
       }
     }
@@ -2122,14 +1919,6 @@ dberr_t vec_lock_all_aux_tables(THD* thd,
   for (const auto& info : resources->indexes) {
     if (!info.mem_name.empty()) {
       names.insert(info.mem_name);
-    }
-    if (!info.next_name.empty()) {
-      names.insert(info.next_name);
-    }
-    for (const auto& seg_name : info.seg_names) {
-      if (!seg_name.empty()) {
-        names.insert(seg_name);
-      }
     }
   }
 
@@ -2180,10 +1969,7 @@ static void vec_close_aux_dict_tables(vec_index_ctx_t* ctx) {
   };
 
   std::lock_guard<std::shared_mutex> lk(ctx->mu);
-  for (auto& seg : ctx->segments) {
-    close_table(seg.aux_dict_table);
-  }
-  close_table(ctx->staging_segment.aux_dict_table);
+  close_table(ctx->aux_dict_table);
   close_table(ctx->pending_aux_dict);
 }
 
@@ -2281,8 +2067,7 @@ dberr_t vec_drop_ancillary_tables(trx_t* trx, dict_table_t* table,
              << "' indexes=" << src->indexes.size();
   for (const auto& info : src->indexes) {
     ib::warn() << "VECINDEX: drop plan index_id=" << info.index_id
-               << " mem=" << info.mem_name << " next=" << info.next_name
-               << " segs=" << info.seg_names.size()
+               << " aux=" << info.mem_name
                << " files=" << info.segment_files.size()
                << " pkmap=" << info.pkmap_files.size()
                << " meta=" << info.meta_path;
@@ -2300,29 +2085,6 @@ dberr_t vec_drop_ancillary_tables(trx_t* trx, dict_table_t* table,
         return err;
       }
       vec_aux_push_name(aux_vec, info.mem_name);
-    }
-    if (!info.next_name.empty()) {
-      dberr_t err = row_drop_table_for_mysql(info.next_name.c_str(), trx, false,
-                                             nullptr);
-      if (err != DB_SUCCESS) {
-        ib::warn() << "VECINDEX: failed to drop aux table '"
-                   << info.next_name << "' err=" << err;
-        return err;
-      }
-      vec_aux_push_name(aux_vec, info.next_name);
-    }
-    for (const auto& seg_name : info.seg_names) {
-      if (seg_name.empty()) {
-        continue;
-      }
-      dberr_t err = row_drop_table_for_mysql(seg_name.c_str(), trx, false,
-                                             nullptr);
-      if (err != DB_SUCCESS) {
-        ib::warn() << "VECINDEX: failed to drop aux table '"
-                   << seg_name << "' err=" << err;
-        return err;
-      }
-      vec_aux_push_name(aux_vec, seg_name);
     }
   }
 
@@ -2415,7 +2177,7 @@ dberr_t vec_create_index_dd_tables(dict_table_t *table) {
 /** 按“基表聚簇索引复制列定义”的规则创建一张 VEC 附属表。
     - 显式主键：逐列复制 mtype/prtype/len/列名，作为 PRIMARY KEY 列集
     - 无显式主键（GEN_CLUST_INDEX）：使用 row_id BIGINT UNSIGNED 作为 PRIMARY KEY
-    - 额外加一列：faiss_id BIGINT UNSIGNED
+    - 额外加一列：seg_id VARCHAR(256)
     - 表的 flags 继承自基表（行格式/压缩策略一致）
   @return 成功返回新表指针；失败返回 nullptr（并设置 trx->error_state） */
 static dict_table_t* vec_create_one_index_table_pk_compatible(
@@ -2472,7 +2234,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
              << " clustered index name=" << (clust->name ? clust->name : "(null)");
 
   // 3) 准备 dict_mem_table_create() 所需参数
-  const ulint     n_cols       = pk_n_fields + 1;  // + faiss_id
+  const ulint     n_cols       = pk_n_fields + 1;  // + seg_id
 
 
   // 4) in-mem 创建表对象
@@ -2484,7 +2246,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     return nullptr;
   }
 
-  // 5) 加列：先按主键列拷贝，再追加 faiss_id
+  // 5) 加列：先按主键列拷贝，再追加 seg_id
   if (use_row_id) {
     // row_id BIGINT UNSIGNED NOT NULL
     dict_mem_table_add_col(new_table, heap,
@@ -2519,12 +2281,17 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     }
   }
 
-  // 追加 faiss_id BIGINT UNSIGNED NOT NULL（使用 UINT64_MAX 作为未赋值哨兵）
+  // 追加 seg_id VARCHAR(256) NOT NULL
+  const ulint seg_long =
+      (kVecSegmentIdMaxLen > 255) ? DATA_LONG_TRUE_VARCHAR : 0;
+  const ulint seg_prtype = dtype_form_prtype(
+      DATA_MYSQL_TRUE_VARCHAR | DATA_NOT_NULL | seg_long,
+      my_charset_latin1.number);
   dict_mem_table_add_col(new_table, heap,
-                         "faiss_id",
-                         DATA_INT,
-                         DATA_NOT_NULL | DATA_UNSIGNED,
-                         8 /* BIGINT */,
+                         "seg_id",
+                         DATA_VARCHAR,
+                         seg_prtype,
+                         static_cast<ulint>(kVecSegmentIdMaxLen),
                          true);
 
   // 6) 物理建表
@@ -2570,8 +2337,30 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     }
   }
 
-  // 8) u_faiss_id secondary index disabled (faiss_id is non-indexed).
-  
+  // 8) Secondary index on seg_id for faster recovery scans.
+  {
+    dict_index_t* seg_idx = dict_mem_index_create(
+        full_name.c_str(),
+        "VEC_SEG_ID",
+        new_table->space,
+        0,
+        1);
+
+    seg_idx->add_field("seg_id", 0, true);
+
+    trx_dict_op_t saved = trx_get_dict_operation(trx);
+    err = row_create_index_for_mysql(seg_idx, trx, nullptr, nullptr);
+    trx->dict_operation = saved;
+
+    if (err != DB_SUCCESS) {
+      ib::warn() << "VECINDEX: create seg_id index on " << full_name
+                 << " failed, err=" << static_cast<int>(err);
+      trx->error_state = err;
+      mem_heap_free(heap);
+      return nullptr;
+    }
+  }
+
   mem_heap_free(heap);
   return new_table;
 }
@@ -2586,29 +2375,28 @@ dberr_t vec_create_index_tables_low(trx_t* trx,
     if (!trx || !index || !table_name) return DB_FAIL;
 
     // 唯一且可追溯的附属表名：I_VEC_<table_id>_<index_id>
-    const std::string prefix = vec_aux_prefix(index);
-    const std::string mem_full = vec_aux_mem_name(prefix);
-    std::string aux = vec_aux_suffix_from_full(mem_full);
+    const std::string prefix = vec_aux_full_name(index);
+    std::string aux = vec_aux_suffix_from_full(prefix);
     if (aux.empty()) {
       std::ostringstream oss;
       oss << "I_VEC_" << static_cast<unsigned long long>(table_id)
-          << "_"      << static_cast<unsigned long long>(index->id) << "_MEM";
+          << "_"      << static_cast<unsigned long long>(index->id);
       aux = oss.str();
     }
 
     dict_table_t* t = vec_create_one_index_table_pk_compatible(
         trx, index, table_name, table_id, aux);
 
-    ib::warn() << "VECINDEX: creating aux table " << mem_full
+    ib::warn() << "VECINDEX: creating aux table " << prefix
                 << " for base=" << table_name
                     << " (index_id=" << (unsigned long long)index->id << ")";
     if (!t) return DB_FAIL;
 
     index->fill_dd = true; // 与 FTS 逻辑一致：请求填充 DD
 
-    ib::warn() << "VECINDEX: created aux table " << mem_full
+    ib::warn() << "VECINDEX: created aux table " << prefix
                 << " for base=" << table_name
-                << " (index_id=" << (unsigned long long)index->id << ")";
+                    << " (index_id=" << (unsigned long long)index->id << ")";
 
     return DB_SUCCESS;
 }

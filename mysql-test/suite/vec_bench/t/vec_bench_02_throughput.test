@@ -1,0 +1,26 @@
+# Vector benchmark: throughput vs recall.
+
+--source suite/vec_bench/include/vec_bench_common.inc
+
+--let $VEC_BENCH_TEST_DIR= $MYSQLTEST_VARDIR/tmp/vec_bench_throughput
+--error 0,1
+--mkdir $VEC_BENCH_TEST_DIR
+--error 0,1
+--remove_files_wildcard $VEC_BENCH_TEST_DIR *
+
+--let $VEC_BENCH_CSV= $VEC_BENCH_TEST_DIR/throughput_report.csv
+--let $VEC_BENCH_JSON= $VEC_BENCH_TEST_DIR/throughput_report.json
+--let $VEC_BENCH_MANIFEST= $VEC_BENCH_TEST_DIR/throughput_manifest.txt
+--let $VEC_BENCH_STDOUT= $VEC_BENCH_TEST_DIR/throughput.stdout
+
+let $bench_cmd= $PYTHON $MYSQL_TEST_DIR/suite/vec_bench/t/vec_bench_driver.py --mode=throughput --user=root --socket=$MYSQL_SOCKET --schema=$VEC_BENCH_SCHEMA --report-dir=$VEC_BENCH_TEST_DIR --report-prefix=throughput --topk=$VEC_BENCH_TOPK --query-count=$VEC_BENCH_QUERY_COUNT --ef-search=$VEC_BENCH_EF_LIST --latency-connections=$VEC_BENCH_LATENCY_CONNECTIONS --throughput-connections=$VEC_BENCH_THROUGHPUT_CONNECTIONS --build-threads=$VEC_BENCH_BUILD_THREADS --cleanup-after=1 --sift-base=$VEC_BENCH_SIFT_BASE --sift-query=$VEC_BENCH_SIFT_QUERY --sift-gt=$VEC_BENCH_SIFT_GT --deep-base=$VEC_BENCH_DEEP_BASE --deep-query=$VEC_BENCH_DEEP_QUERY --deep-gt=$VEC_BENCH_DEEP_GT;
+
+--exec $bench_cmd > $VEC_BENCH_STDOUT 2>&1
+
+--file_exists $VEC_BENCH_CSV
+--file_exists $VEC_BENCH_JSON
+--file_exists $VEC_BENCH_MANIFEST
+--file_exists $VEC_BENCH_STDOUT
+
+--replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR
+--cat_file $VEC_BENCH_MANIFEST

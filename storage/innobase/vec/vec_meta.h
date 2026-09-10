@@ -16,7 +16,9 @@ constexpr uint16_t VEC_META_VERSION = 1;
 enum class VecSegmentState : uint8_t {
   Preparing = 0,
   Committed = 1,
-  Tombstone = 2
+  Tombstone = 2,
+  BuiltIndex = 3,
+  PkmapSaved = 4
 };
 
 constexpr uint8_t VEC_SEG_FLAG_HAS_PK_MAPPING = 0x01;
@@ -68,6 +70,12 @@ class VecMetaFile {
 /* Helpers for reading a metadata file. */
 bool vec_meta_read_all(const std::string& path, VecMetaHeader* header_out,
                        std::vector<VecSegmentEntry>* entries_out);
+bool vec_meta_read_mem_seg_id(const dict_index_t* index,
+                              const vec_params_t& params,
+                              uint64_t* out_mem_seg_id);
+bool vec_meta_write_mem_seg_id(const dict_index_t* index,
+                               const vec_params_t& params,
+                               uint64_t mem_seg_id);
 
 /* Path helpers. */
 bool vec_meta_path_for_index(const dict_index_t* index, std::string* out);
@@ -85,6 +93,13 @@ void vec_meta_fill_entry(VecSegmentEntry* entry, uint64_t seg_id,
                          uint64_t count, VecSegmentState state,
                          const std::string& file_name,
                          uint8_t flags = 0);
+
+/* Append an event record to the vec meta file. */
+bool vec_meta_append_event(const dict_index_t* index, const vec_params_t& params,
+                           uint64_t seg_id, uint64_t count,
+                           VecSegmentState state,
+                           const std::string& file_name,
+                           bool has_pk_mapping);
 
 inline bool vec_meta_segment_has_pk_mapping(const VecSegmentEntry& entry) {
   return (entry.reserved[0] & VEC_SEG_FLAG_HAS_PK_MAPPING) != 0;

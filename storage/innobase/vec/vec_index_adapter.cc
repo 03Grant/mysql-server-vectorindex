@@ -4,7 +4,9 @@
 #include "vec_index_runtime.h"
 #include "vec_faiss_factory.h"
 #include "vec_hnswlib_factory.h"
+#include "vec_diskann_factory.h"
 #include "vec_aux_tables.h"
+#include "vec_meta.h"
 
 #include "dict0mem.h"
 #include "dict0dd.h"
@@ -26,6 +28,7 @@
 #include <algorithm>
 #include <limits>
 #include <shared_mutex>
+#include <vector>
 
 struct dict_index_t;
 
@@ -111,14 +114,17 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
   const std::string aux_name = vec_aux_table_name(idx);
 
   vec_params_t im_mem_p{};
-  im_mem_p.backend = p.backend;
+  // DiskANN uses a Faiss FLAT mutable collector and only builds its native
+  // immutable/PQFlash form during flush/rotation.
+  im_mem_p.backend = (p.backend == BackendType::Diskann) ? BackendType::Faiss
+                                                         : p.backend;
   im_mem_p.type_tag = VEC_T_FLAT;
   im_mem_p.metric_tag = p.metric_tag;
   im_mem_p.dim = p.dim;
   im_mem_p.size = 0;  // in-mem index has no size limit
   im_mem_p.build_threads = p.build_threads;
-  //im_mem_p.hnsw_m = 32;
-  //im_mem_p.efConstruction = 128;
+  im_mem_p.hnsw_m = 0;
+  im_mem_p.efConstruction = 0;
 
   std::unique_ptr<vec_index_ctx_t> new_ctx;
   vec_index_ctx_t *ctx = idx->vec_runtime;
@@ -150,18 +156,69 @@ dberr_t vec_create_index_low(dict_index_t* idx) {
   if (!aux_name.empty()) {
     ctx->index_name_prefix = aux_name;
   }
-  if (auto *mutable_seg = ctx->mutable_segment()) {
-    const std::string prefix = ctx->index_name_prefix.empty() ? aux_name
-                                                              : ctx->index_name_prefix;
-    std::string mem_name = vec_aux_mem_name(prefix);
-    if (!vec_aux_table_exists(mem_name)) {
-      mem_name = prefix;
-    }
-    mutable_seg->aux_table_name = mem_name;
-    if (ctx->max_vecindex_id == 0 && !prefix.empty()) {
-      ctx->max_vecindex_id = vec_aux_scan_max_segment(prefix);
+  vec_index_segment_t *mutable_seg = nullptr;
+  for (auto &seg : ctx->segments) {
+    if (seg && !seg->immutable) {
+      mutable_seg = seg.get();
+      break;
     }
   }
+  if (mutable_seg == nullptr) {
+    ib::warn() << "VECINDEX checkpoint: no mutable segment available for index "
+               << (idx->name ? idx->name : "(null)");
+    return DB_FAIL;
+  }
+
+  const std::string prefix =
+      ctx->index_name_prefix.empty() ? vec_aux_full_name(idx)
+                                     : ctx->index_name_prefix;
+  ctx->aux_table_name = prefix;
+  std::string meta_path;
+  VecMetaHeader header{};
+  std::vector<VecSegmentEntry> entries;
+  uint32_t meta_max = 0;
+  if (vec_meta_path_for_index(idx, &meta_path) &&
+      vec_meta_read_all(meta_path, &header, &entries)) {
+    const VecMetaHeader expected = vec_meta_make_header(idx, ctx->params);
+    if (header.magic == expected.magic &&
+        header.version == expected.version &&
+        header.index_id == expected.index_id &&
+        header.dimension == expected.dimension &&
+        header.index_type == expected.index_type &&
+        header.metric_type == expected.metric_type) {
+      for (const auto &entry : entries) {
+        meta_max = std::max<uint32_t>(meta_max,
+                                      static_cast<uint32_t>(entry.seg_id));
+      }
+    }
+  }
+
+  uint32_t mem_id = vec_segment_id_to_u32(mutable_seg->vecindex_id);
+  if (mem_id == 0) {
+    uint64_t persisted_id = 0;
+    if (vec_meta_read_mem_seg_id(idx, ctx->params, &persisted_id) &&
+        persisted_id > 0 &&
+        persisted_id <= static_cast<uint64_t>(
+                            std::numeric_limits<uint32_t>::max())) {
+      mem_id = static_cast<uint32_t>(persisted_id);
+    } else {
+      mem_id = (meta_max == 0) ? 1 : meta_max + 1;
+    }
+    mutable_seg->vecindex_id = vec_segment_id_from_u32(mem_id);
+  }
+  if (mem_id < meta_max) {
+    ib::warn() << "VECINDEX checkpoint: mutable seg_id=" << mem_id
+               << " is smaller than max immutable seg_id=" << meta_max
+               << " for index " << (idx->name ? idx->name : "(null)");
+    return DB_FAIL;
+  }
+
+  ctx->max_vecindex_id = mem_id;
+  if (mem_id != 0) {
+    (void)vec_meta_write_mem_seg_id(idx, ctx->params,
+                                    static_cast<uint64_t>(mem_id));
+  }
+  vec_commit_topology(ctx);
 
   if (new_ctx) {
     idx->vec_runtime = new_ctx.release();
@@ -188,12 +245,7 @@ dberr_t vec_open_aux_table(dict_index_t *idx) {
   }
 
   vec_index_ctx_t *ctx = idx->vec_runtime;
-  vec_index_segment_t *mutable_seg = ctx->mutable_segment();
-  if (mutable_seg == nullptr) {
-    return DB_ERROR;
-  }
-
-  if (mutable_seg->aux_dict_table != nullptr) {
+  if (ctx->aux_dict_table != nullptr) {
     return DB_SUCCESS;
   }
 
@@ -204,7 +256,7 @@ dberr_t vec_open_aux_table(dict_index_t *idx) {
     return DB_FAIL;
   }
 
-  if (mutable_seg->aux_dict_table == nullptr) {
+  if (ctx->aux_dict_table == nullptr) {
     dict_table_t *aux_table =
         dd_table_open_on_name_in_mem(aux_name.c_str(), false);
     if (aux_table == nullptr) {
@@ -229,10 +281,10 @@ dberr_t vec_open_aux_table(dict_index_t *idx) {
     }
     // ib::warn() << "VECREF: open aux dict table '" << aux_name
     //            << "' ref=" << aux_table->get_ref_count();
-    mutable_seg->aux_dict_table = aux_table;
-    mutable_seg->aux_table_name = aux_name;
-  } else if (mutable_seg->aux_table_name.empty()) {
-    mutable_seg->aux_table_name = aux_name;
+    ctx->aux_dict_table = aux_table;
+    ctx->aux_table_name = aux_name;
+  } else if (ctx->aux_table_name.empty()) {
+    ctx->aux_table_name = aux_name;
   }
 
   return DB_SUCCESS;
@@ -253,18 +305,13 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
   }
 
   vec_index_ctx_t *ctx = idx->vec_runtime;
-  vec_index_segment_t *mutable_seg = ctx->mutable_segment();
-  if (mutable_seg == nullptr) {
-    return DB_ERROR;
-  }
-
   dberr_t dict_err = vec_open_aux_table(idx);
   if (dict_err != DB_SUCCESS) {
     ib::warn() << "VECINDEX: unable to cache auxiliary dictionary table for index '"
                << (idx->name ? idx->name : "(null)")
                << "', err=" << dict_err << ". Continuing with per-THD open.";
   } else {
-    dict_table_t *dict_table = mutable_seg->aux_dict_table;
+    dict_table_t *dict_table = ctx->aux_dict_table;
     // ib::warn() << "VECINDEX: cached auxiliary dict table for index '"
     //            << (idx->name ? idx->name : "(null)")
     //            << "' ref_count="
@@ -349,7 +396,7 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t *idx, THD *thd,
   handle->mdl_ticket = mdl_request.ticket;
   mdl_request.ticket = nullptr;
 
-  dict_table_t *dict_table = mutable_seg->aux_dict_table;
+  dict_table_t *dict_table = ctx->aux_dict_table;
   // ib::warn() << "VECINDEX: open_aux_table_for_thd success idx='"
   //            << (idx->name ? idx->name : "(null)")
   //            << "' aux='" << aux_name << "' thd=" << thd
@@ -400,6 +447,9 @@ bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
     case BackendType::Hnswlib:
       index = vec_make_hnswlib_index(p);
       break;
+    case BackendType::Diskann:
+      index = vec_make_diskann_index(p);
+      break;
     default:
       break;
   }
@@ -410,12 +460,11 @@ bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p) {
     return false;
   }
 
-  vec_index_segment_t seg{};
-  seg.index = std::move(index);
-  seg.immutable = false;
-  seg.aux_table_name = ctx.index_name_prefix;
-  seg.vecindex_bitmap.clear();
+  auto seg = std::make_shared<vec_index_segment_t>();
+  seg->index = std::move(index);
+  seg->immutable = false;
   ctx.segments.push_back(std::move(seg));
+  vec_commit_topology(&ctx);
   ctx.inited = true;
   return true;
 }
@@ -425,18 +474,17 @@ bool vec_drop_index(vec_index_ctx_t& ctx, size_t seg_idx, bool allow_drop_mutabl
              << " allow_drop_mutable=" << allow_drop_mutable;
   std::lock_guard<std::shared_mutex> lk(ctx.mu);
   if (seg_idx >= ctx.segments.size()) return false;
-  if (seg_idx == 0 && !allow_drop_mutable) return false;
-
-  auto &seg = ctx.segments[seg_idx];
-  ib::warn() << "VECINDEX: vec_drop_index mid seg_idx=" << seg_idx
-             << " aux_table=" << seg.aux_table_name;
-  if (seg.aux_dict_table != nullptr) {
-    dd_table_close(seg.aux_dict_table, nullptr, nullptr, false);
-    seg.aux_dict_table = nullptr;
+  if (!allow_drop_mutable &&
+      (!ctx.segments[seg_idx] || !ctx.segments[seg_idx]->immutable)) {
+    return false;
   }
 
-  // erase to release the memory
+  ib::warn() << "VECINDEX: vec_drop_index mid seg_idx=" << seg_idx;
+
+  // Erase from the writer-side list. The segment object survives until the last
+  // reader that pinned a version containing it releases its reference.
   ctx.segments.erase(ctx.segments.begin() + seg_idx);
+  vec_commit_topology(&ctx);
   return true;
 
 }
@@ -450,11 +498,10 @@ void vec_destroy(vec_index_ctx_t* ctx) {
   };
 
   for (auto &seg : ctx->segments) {
-    close_table(seg.aux_dict_table);
-    seg.aux_dict_table = nullptr;
+    (void)seg;
   }
-  close_table(ctx->staging_segment.aux_dict_table);
-  ctx->staging_segment.aux_dict_table = nullptr;
+  close_table(ctx->aux_dict_table);
+  ctx->aux_dict_table = nullptr;
   if(ctx->pending_aux_dict != nullptr) {
     close_table(ctx->pending_aux_dict);
     ctx->pending_aux_dict = nullptr;
@@ -485,22 +532,27 @@ static inline bool is_min_better(const vec_params_t& params) {
   return !(params.metric_tag == VEC_M_IP || params.metric_tag == VEC_M_COSINE);
 }
 
-int vec_search(vec_index_ctx_t& ctx,
+int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
                const float* q, size_t nq, size_t k,
-               float* D_out, int64_t* I_out, uint32_t* S_out,
+               float* D_out, int64_t* I_out, std::string* S_out,
+               trx_id_t* T_out,
                const VecRuntimeSearchParams* params)
 {
-  std::shared_lock<std::shared_mutex> ctx_lock(ctx.mu);
-  if (!ctx.inited || ctx.segments.empty()) return -1;
+  // No global lock here. The caller has pinned `ver`, an immutable snapshot of
+  // the segment set; we read only that snapshot, so a concurrent flush/merge
+  // publishing a new version cannot change what we traverse. Per-segment
+  // rw_locks (shared) still synchronize each read against an in-place index
+  // swap or a mutable-segment append.
+  if (!ctx.inited || ver.segments.empty()) return -1;
 
   const bool prefer_small = is_min_better(ctx.params);
-  const size_t nseg = ctx.segments.size();
-  const uint32_t invalid_segment = 0;
+  const size_t nseg = ver.segments.size();
 
   struct Candidate {
     float distance;
     int64_t id;
-    uint32_t segment;
+    std::string segment;
+    trx_id_t trx_id;
   };
 
   // MVP：按“每个查询”循环，便于把各段结果做 k-way 合并
@@ -512,24 +564,33 @@ int vec_search(vec_index_ctx_t& ctx,
     const float* qvec = q + qi * ctx.params.dim;
 
     for (size_t s = 0; s < nseg; ++s) {
-      auto& seg_meta = ctx.segments[s];
-      auto* seg = seg_meta.index.get();
+      const vec_segment_ptr& seg_meta = ver.segments[s];
+      if (!seg_meta) continue;
+      std::shared_lock<std::shared_mutex> seg_lock(*seg_meta->rw_lock);
+      auto* seg = seg_meta->index.get();
       if (!seg) continue;
-      std::shared_lock<std::shared_mutex> seg_lock(*seg_meta.rw_lock);
-      const uint32_t seg_id =
-          seg_meta.vecindex_id != 0 ? seg_meta.vecindex_id
-                                    : static_cast<uint32_t>(s);
+      const std::string& seg_id = seg_meta->vecindex_id;
+      if (seg_id.empty()) {
+        continue;
+      }
 
       std::vector<float>  D(k);
       std::vector<int64_t> I(k);
 
       seg->search(1, qvec, k, I.data(), D.data(), params);
 
-      // 过滤掉无效 id（Faiss 可能返回 -1 表示候选不足）
+      // 可能返回 -1 表示候选不足
       for (size_t t = 0; t < k; ++t) {
-        if (I[t] >= 0 &&
-            !seg_meta.vecindex_bitmap.is_marked(static_cast<size_t>(I[t]))) {
-          cand.push_back({D[t], I[t], seg_id});
+        if (I[t] >= 0) {
+          trx_id_t trx_id = 0;
+          if (seg_meta->vid_pk_mapping.ready) {
+            const int64_t faiss_id = I[t];
+            if (faiss_id >= 0) {
+              trx_id = seg_meta->vid_pk_mapping.get_trx_id(
+                  static_cast<size_t>(faiss_id));
+            }
+          }
+          cand.push_back({D[t], I[t], seg_id, trx_id});
         }
       }
     }
@@ -541,7 +602,9 @@ int vec_search(vec_index_ctx_t& ctx,
                                                   : -std::numeric_limits<float>::infinity());
       std::fill_n(I_out + qi * k, k, int64_t(-1));
       if (S_out != nullptr) {
-        std::fill_n(S_out + qi * k, k, invalid_segment);
+        for (size_t t = 0; t < k; ++t) {
+          S_out[qi * k + t].clear();
+        }
       }
       continue;
     }
@@ -571,7 +634,8 @@ int vec_search(vec_index_ctx_t& ctx,
     // 写回输出
     float*       Dq = D_out + qi * k;
     int64_t* Iq = I_out + qi * k;
-    uint32_t* Sq = S_out != nullptr ? S_out + qi * k : nullptr;
+    std::string* Sq = S_out != nullptr ? S_out + qi * k : nullptr;
+    trx_id_t* Tq = T_out != nullptr ? T_out + qi * k : nullptr;
 
     size_t m = std::min(k, cand.size());
     for (size_t t = 0; t < m; ++t) {
@@ -580,6 +644,9 @@ int vec_search(vec_index_ctx_t& ctx,
       if (Sq != nullptr) {
         Sq[t] = cand[t].segment;
       }
+      if (Tq != nullptr) {
+        Tq[t] = cand[t].trx_id;
+      }
     }
     // 不足部分用“空”填充
     for (size_t t = m; t < k; ++t) {
@@ -587,7 +654,10 @@ int vec_search(vec_index_ctx_t& ctx,
                            : -std::numeric_limits<float>::infinity();
       Iq[t] = int64_t(-1);
       if (Sq != nullptr) {
-        Sq[t] = invalid_segment;
+        Sq[t].clear();
+      }
+      if (Tq != nullptr) {
+        Tq[t] = 0;
       }
     }
   }

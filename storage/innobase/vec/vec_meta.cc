@@ -32,6 +32,14 @@ inline bool flush_fd(FILE* fp) {
   return fsync(fd) == 0;
 }
 
+inline bool vec_meta_header_matches(const VecMetaHeader &lhs,
+                                    const VecMetaHeader &rhs) {
+  return lhs.magic == rhs.magic && lhs.version == rhs.version &&
+         lhs.index_id == rhs.index_id && lhs.dimension == rhs.dimension &&
+         lhs.index_type == rhs.index_type &&
+         lhs.metric_type == rhs.metric_type;
+}
+
 }  // namespace
 
 VecMetaFile::~VecMetaFile() {
@@ -169,6 +177,94 @@ bool vec_meta_read_all(const std::string& path, VecMetaHeader* header_out,
   return true;
 }
 
+bool vec_meta_read_mem_seg_id(const dict_index_t* index,
+                              const vec_params_t& params,
+                              uint64_t* out_mem_seg_id) {
+  if (index == nullptr || out_mem_seg_id == nullptr) {
+    return false;
+  }
+
+  *out_mem_seg_id = 0;
+  std::string path;
+  if (!vec_meta_path_for_index(index, &path) || path.empty()) {
+    return false;
+  }
+
+  FILE* fp = std::fopen(path.c_str(), "rb");
+  if (fp == nullptr) {
+    return false;
+  }
+
+  auto close_guard = std::unique_ptr<FILE, decltype(&std::fclose)>(
+      fp, &std::fclose);
+
+  VecMetaHeader on_disk{};
+  if (std::fread(&on_disk, sizeof(on_disk), 1, fp) != 1) {
+    return false;
+  }
+
+  VecMetaHeader expected = vec_meta_make_header(index, params);
+  if (!vec_meta_header_matches(on_disk, expected)) {
+    return false;
+  }
+
+  uint64_t val = 0;
+  std::memcpy(&val, on_disk.reserved, sizeof(val));
+  *out_mem_seg_id = val;
+  return true;
+}
+
+bool vec_meta_write_mem_seg_id(const dict_index_t* index,
+                               const vec_params_t& params,
+                               uint64_t mem_seg_id) {
+  if (index == nullptr) {
+    return false;
+  }
+
+  std::string path;
+  if (!vec_meta_path_for_index(index, &path) || path.empty()) {
+    return false;
+  }
+
+  VecMetaHeader expected = vec_meta_make_header(index, params);
+
+  FILE* fp = std::fopen(path.c_str(), "r+b");
+  bool created = false;
+  if (fp == nullptr) {
+    fp = std::fopen(path.c_str(), "w+b");
+    created = true;
+  }
+  if (fp == nullptr) {
+    return false;
+  }
+
+  auto close_guard = std::unique_ptr<FILE, decltype(&std::fclose)>(
+      fp, &std::fclose);
+
+  VecMetaHeader header{};
+  if (created) {
+    header = expected;
+  } else {
+    if (std::fread(&header, sizeof(header), 1, fp) != 1) {
+      return false;
+    }
+    if (!vec_meta_header_matches(header, expected)) {
+      return false;
+    }
+  }
+
+  std::memset(header.reserved, 0, sizeof(header.reserved));
+  std::memcpy(header.reserved, &mem_seg_id, sizeof(mem_seg_id));
+
+  if (std::fseek(fp, 0, SEEK_SET) != 0) {
+    return false;
+  }
+  if (std::fwrite(&header, sizeof(header), 1, fp) != 1) {
+    return false;
+  }
+  return flush_fd(fp);
+}
+
 bool vec_meta_path_for_index(const dict_index_t* index, std::string* out) {
   if (index == nullptr || index->table == nullptr || out == nullptr) {
     return false;
@@ -271,4 +367,26 @@ void vec_meta_fill_entry(VecSegmentEntry* entry, uint64_t seg_id,
     entry->file_name[sizeof(entry->file_name) - 1] = '\0';
   }
   entry->checksum = vec_meta_checksum(*entry);
+}
+
+bool vec_meta_append_event(const dict_index_t* index, const vec_params_t& params,
+                           uint64_t seg_id, uint64_t count,
+                           VecSegmentState state,
+                           const std::string& file_name,
+                           bool has_pk_mapping) {
+  std::string meta_path;
+  if (!vec_meta_path_for_index(index, &meta_path)) {
+    return false;
+  }
+
+  VecMetaHeader header = vec_meta_make_header(index, params);
+  VecMetaFile meta_file;
+  if (!meta_file.open_or_create(meta_path, header)) {
+    return false;
+  }
+
+  VecSegmentEntry entry{};
+  vec_meta_fill_entry(&entry, seg_id, count, state, file_name,
+                      has_pk_mapping ? VEC_SEG_FLAG_HAS_PK_MAPPING : 0);
+  return meta_file.append(&entry, nullptr);
 }

@@ -34,11 +34,13 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "storage/innobase/handler/i_s.h"
 
 #include <field.h>
+#include <algorithm>
 #include <sql_acl.h>
 #include <sql_show.h>
 #include <sql_time.h>
 #include <sys/types.h>
 #include <time.h>
+#include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
 
@@ -74,6 +76,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0i_s.h"
 #include "trx0trx.h"
 #include "ut0new.h"
+#include "dict0types.h"
+#include "storage/innobase/vec/vec_index_runtime.h"
+#include "storage/innobase/vec/vec_meta.h"
 
 #include "my_dbug.h"
 
@@ -388,6 +393,45 @@ static int field_store_index_name(
   field->set_notnull();
 
   return (ret);
+}
+
+static const char *vec_segment_state_str(uint8_t state) {
+  switch (static_cast<VecSegmentState>(state)) {
+    case VecSegmentState::Preparing:
+      return "PREPARING";
+    case VecSegmentState::Committed:
+      return "COMMITTED";
+    case VecSegmentState::Tombstone:
+      return "TOMBSTONE";
+    case VecSegmentState::BuiltIndex:
+      return "BUILT_INDEX";
+    case VecSegmentState::PkmapSaved:
+      return "PKMAP_SAVED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static std::string vec_segment_id_full_from_file(const char *file_name) {
+  if (file_name == nullptr || file_name[0] == '\0') {
+    return {};
+  }
+  std::string name(file_name);
+  if (name.rfind("vecseg_", 0) != 0) {
+    return {};
+  }
+  if (name.size() < 5 || name.substr(name.size() - 4) != ".vec") {
+    return {};
+  }
+  name.resize(name.size() - 4);  // strip ".vec"
+
+  size_t pos = name.find('_');
+  if (pos == std::string::npos) return {};
+  pos = name.find('_', pos + 1);
+  if (pos == std::string::npos) return {};
+  pos = name.find('_', pos + 1);
+  if (pos == std::string::npos) return {};
+  return name.substr(pos + 1);
 }
 
 /* Fields of the dynamic table INFORMATION_SCHEMA.innodb_trx
@@ -6189,6 +6233,274 @@ struct st_mysql_plugin i_s_innodb_indexes = {
 
     /* Plugin flags */
     /* unsigned long */
+    STRUCT_FLD(flags, 0UL),
+};
+
+/**  VECINDEX_STATS  ***************************************************/
+/* Fields of the dynamic table INFORMATION_SCHEMA.VECINDEX_STATS */
+static ST_FIELD_INFO vecindex_stats_fields_info[] = {
+#define VECINDEX_STATS_TABLE_SCHEMA 0
+    {STRUCT_FLD(field_name, "TABLE_SCHEMA"),
+     STRUCT_FLD(field_length, NAME_LEN + 1),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, 0), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_TABLE_NAME 1
+    {STRUCT_FLD(field_name, "TABLE_NAME"),
+     STRUCT_FLD(field_length, NAME_LEN + 1),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, 0), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_INDEX_NAME 2
+    {STRUCT_FLD(field_name, "INDEX_NAME"),
+     STRUCT_FLD(field_length, NAME_LEN + 1),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, 0), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_SEGMENT_ID 3
+    {STRUCT_FLD(field_name, "SEGMENT_ID"),
+     STRUCT_FLD(field_length, static_cast<uint>(kVecSegmentIdMaxLen)),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, 0), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_SEGMENT_ID_FULL 4
+    {STRUCT_FLD(field_name, "SEGMENT_ID_FULL"),
+     STRUCT_FLD(field_length, static_cast<uint>(kVecSegmentIdMaxLen)),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, 0), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_SEGMENT_TYPE 5
+    {STRUCT_FLD(field_name, "SEGMENT_TYPE"),
+     STRUCT_FLD(field_length, 16),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, 0), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_SEGMENT_STATE 6
+    {STRUCT_FLD(field_name, "SEGMENT_STATE"),
+     STRUCT_FLD(field_length, 32),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, 0), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_SEGMENT_VECTOR_COUNT 7
+    {STRUCT_FLD(field_name, "SEGMENT_VECTOR_COUNT"),
+     STRUCT_FLD(field_length, MY_INT64_NUM_DECIMAL_DIGITS),
+     STRUCT_FLD(field_type, MYSQL_TYPE_LONGLONG), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, MY_I_S_UNSIGNED), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+#define VECINDEX_STATS_SEGMENT_FILE 8
+    {STRUCT_FLD(field_name, "SEGMENT_FILE"),
+     STRUCT_FLD(field_length, 256),
+     STRUCT_FLD(field_type, MYSQL_TYPE_STRING), STRUCT_FLD(value, 0),
+     STRUCT_FLD(field_flags, MY_I_S_MAYBE_NULL), STRUCT_FLD(old_name, ""),
+     STRUCT_FLD(open_method, 0)},
+
+    END_OF_ST_FIELD_INFO};
+
+static int i_s_vecindex_stats_store_row(
+    THD *thd, TABLE *table, const std::string &schema_name,
+    const std::string &table_name, const dict_index_t *index,
+    const std::string &segment_id, const std::string &segment_id_full,
+    const char *segment_type, const char *segment_state, uint64_t vec_count,
+    const char *segment_file) {
+  Field **fields = table->field;
+
+  OK(field_store_string(fields[VECINDEX_STATS_TABLE_SCHEMA],
+                        schema_name.c_str()));
+  OK(field_store_string(fields[VECINDEX_STATS_TABLE_NAME], table_name.c_str()));
+  OK(field_store_index_name(fields[VECINDEX_STATS_INDEX_NAME],
+                            index->name ? index->name : ""));
+  OK(field_store_string(fields[VECINDEX_STATS_SEGMENT_ID],
+                        segment_id.c_str()));
+  OK(field_store_string(fields[VECINDEX_STATS_SEGMENT_ID_FULL],
+                        segment_id_full.c_str()));
+  OK(field_store_string(fields[VECINDEX_STATS_SEGMENT_TYPE], segment_type));
+  OK(field_store_string(fields[VECINDEX_STATS_SEGMENT_STATE], segment_state));
+  OK(fields[VECINDEX_STATS_SEGMENT_VECTOR_COUNT]->store(
+      static_cast<longlong>(vec_count), true));
+
+  if (segment_file != nullptr && segment_file[0] != '\0') {
+    OK(field_store_string(fields[VECINDEX_STATS_SEGMENT_FILE], segment_file));
+  } else {
+    fields[VECINDEX_STATS_SEGMENT_FILE]->set_null();
+  }
+
+  OK(schema_table_store_record(thd, table));
+  return 0;
+}
+
+static int i_s_vecindex_stats_fill_index(THD *thd, TABLE *table,
+                                         const dict_index_t *index,
+                                         const std::string &schema_name,
+                                         const std::string &table_name) {
+  std::string meta_path;
+  VecMetaHeader header{};
+  std::vector<VecSegmentEntry> entries;
+
+  if (vec_meta_path_for_index(index, &meta_path) &&
+      vec_meta_read_all(meta_path, &header, &entries)) {
+    std::unordered_map<uint64_t, VecSegmentEntry> last;
+    for (const auto &entry : entries) {
+      if (entry.seg_id == 0) {
+        continue;
+      }
+      last[entry.seg_id] = entry;
+    }
+
+    std::vector<VecSegmentEntry> dedup;
+    dedup.reserve(last.size());
+    for (const auto &kv : last) {
+      dedup.push_back(kv.second);
+    }
+    std::sort(dedup.begin(), dedup.end(),
+              [](const auto &a, const auto &b) { return a.seg_id < b.seg_id; });
+
+    for (const auto &entry : dedup) {
+      std::string seg_id =
+          std::to_string(static_cast<unsigned long long>(entry.seg_id));
+      std::string seg_id_full =
+          vec_segment_id_full_from_file(entry.file_name);
+      if (seg_id_full.empty()) {
+        seg_id_full = seg_id;
+      }
+
+      const char *seg_state = vec_segment_state_str(entry.state);
+      const char *seg_file =
+          (entry.file_name[0] != '\0') ? entry.file_name : nullptr;
+
+      i_s_vecindex_stats_store_row(
+          thd, table, schema_name, table_name, index, seg_id, seg_id_full,
+          "IMMUTABLE", seg_state, entry.count, seg_file);
+    }
+  }
+
+  vec_index_ctx_t *ctx = index->vec_runtime;
+  if (ctx != nullptr) {
+    std::string mem_id;
+    size_t mem_count = 0;
+
+    {
+      std::shared_lock<std::shared_mutex> lk(ctx->mu);
+      const vec_index_segment_t *mem_seg = ctx->mutable_segment();
+      if (mem_seg != nullptr) {
+        mem_id = mem_seg->vecindex_id;
+        if (mem_seg->index != nullptr) {
+          mem_count = mem_seg->index->ntotal();
+        }
+      }
+    }
+
+    if (!mem_id.empty()) {
+      i_s_vecindex_stats_store_row(
+          thd, table, schema_name, table_name, index, mem_id, mem_id, "MEM",
+          "MEM", static_cast<uint64_t>(mem_count), nullptr);
+    }
+  }
+
+  return 0;
+}
+
+/** Function to populate INFORMATION_SCHEMA.VECINDEX_STATS */
+static int i_s_vecindex_stats_fill_table(THD *thd, Table_ref *tables, Item *) {
+  btr_pcur_t pcur;
+  const rec_t *rec;
+  mem_heap_t *heap;
+  mtr_t mtr;
+  MDL_ticket *mdl = nullptr;
+  dict_table_t *dd_indexes;
+  bool ret;
+
+  DBUG_TRACE;
+
+  /* deny access to user without PROCESS_ACL privilege */
+  if (check_global_access(thd, PROCESS_ACL)) {
+    return 0;
+  }
+
+  heap = mem_heap_create(100, UT_LOCATION_HERE);
+  dict_sys_mutex_enter();
+  mtr_start(&mtr);
+
+  rec = dd_startscan_system(thd, &mdl, &pcur, &mtr, dd_indexes_name.c_str(),
+                            &dd_indexes);
+
+  while (rec) {
+    const dict_index_t *index_rec;
+    MDL_ticket *mdl_on_tab = nullptr;
+    dict_table_t *parent = nullptr;
+    MDL_ticket *mdl_on_parent = nullptr;
+
+    ret = dd_process_dd_indexes_rec(heap, rec, &index_rec, &mdl_on_tab, &parent,
+                                    &mdl_on_parent, dd_indexes, &mtr);
+
+    dict_sys_mutex_exit();
+
+    if (ret && index_rec != nullptr && dict_index_is_vector(index_rec)) {
+      std::string schema_name;
+      std::string table_name;
+      dict_name::get_table(index_rec->table->name.m_name, schema_name,
+                           table_name);
+      i_s_vecindex_stats_fill_index(thd, tables->table, index_rec, schema_name,
+                                    table_name);
+    }
+
+    mem_heap_empty(heap);
+
+    dict_sys_mutex_enter();
+
+    if (index_rec != nullptr) {
+      dd_table_close(index_rec->table, thd, &mdl_on_tab, true);
+      if (index_rec->table->is_fts_aux() && parent) {
+        dd_table_close(parent, thd, &mdl_on_parent, true);
+      }
+    }
+
+    mtr_start(&mtr);
+    rec = dd_getnext_system_rec(&pcur, &mtr);
+  }
+
+  mtr_commit(&mtr);
+  dd_table_close(dd_indexes, thd, &mdl, true);
+  dict_sys_mutex_exit();
+  mem_heap_free(heap);
+
+  return 0;
+}
+
+/** Bind the dynamic table INFORMATION_SCHEMA.VECINDEX_STATS */
+static int vecindex_stats_init(void *p) {
+  ST_SCHEMA_TABLE *schema;
+
+  DBUG_TRACE;
+
+  schema = (ST_SCHEMA_TABLE *)p;
+  schema->fields_info = vecindex_stats_fields_info;
+  schema->fill_table = i_s_vecindex_stats_fill_table;
+
+  return 0;
+}
+
+struct st_mysql_plugin i_s_vecindex_stats = {
+    STRUCT_FLD(type, MYSQL_INFORMATION_SCHEMA_PLUGIN),
+    STRUCT_FLD(info, &i_s_info),
+    STRUCT_FLD(name, "VECINDEX_STATS"),
+    STRUCT_FLD(author, plugin_author),
+    STRUCT_FLD(descr, "Vector index segment statistics"),
+    STRUCT_FLD(license, PLUGIN_LICENSE_GPL),
+    STRUCT_FLD(init, vecindex_stats_init),
+    STRUCT_FLD(check_uninstall, nullptr),
+    STRUCT_FLD(deinit, i_s_common_deinit),
+    STRUCT_FLD(version, i_s_innodb_plugin_version),
+    STRUCT_FLD(status_vars, nullptr),
+    STRUCT_FLD(system_vars, nullptr),
+    STRUCT_FLD(__reserved1, nullptr),
     STRUCT_FLD(flags, 0UL),
 };
 

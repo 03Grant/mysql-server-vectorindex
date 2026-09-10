@@ -34,4 +34,10 @@ public:
 
   // Optional runtime tuning knobs (ignored if backend/type does not support).
   virtual void set_search_params(const VecRuntimeSearchParams& params) = 0;
+
+  // True for the mutable-segment buffer (MutableFlatIndex), which stores each
+  // entry's creator transaction id and primary key inline alongside the vector
+  // so the read path can fetch them lock-free. Immutable indexes return false
+  // and expose this metadata through the segment's vid_pk_mapping instead.
+  virtual bool holds_inline_meta() const { return false; }
 };

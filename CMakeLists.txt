@@ -556,6 +556,12 @@ if (WITH_HNSWLIB)
   add_subdirectory(external/hnswlib)
 endif()
 
+option(WITH_DISKANN "Build DiskANN for InnoDB VECINDEX" ON)
+
+if (WITH_DISKANN)
+  add_subdirectory(external/DiskANN/mysql)
+endif()
+
 # Ninja only: List of available pools.
 SET_PROPERTY(GLOBAL PROPERTY JOB_POOLS one_job=1)
 
@@ -2914,4 +2920,3 @@ IF(HAVE_WITH_NDBCLUSTER)
   SET(WITH_NDBCLUSTER ${WITH_NDB} CACHE BOOL
     "Deprecated legacy option for MySQL Cluster")
 ENDIF()
-

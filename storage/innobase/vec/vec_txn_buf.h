@@ -25,37 +25,20 @@ struct vec_pk_column_t {
   std::vector<unsigned char> data;
 };
 
-// 一条待写入的数据（本事务内临时保存）
-struct vec_item_t {
-  std::vector<vec_pk_column_t> pk_columns;  // 聚簇主键逐列快照
-  std::vector<float>           vec;         // dim 个 float（不做任何预处理）
-  std::string                  pk_key;      // packed primary key bytes
-};
-
-enum class vec_aux_mode_t : uint8_t {
-  UNKNOWN = 0,
-  PREINSERT_NULL,   // DML path: PK inserted with NULL faiss_id during collect
-  DIRECT_INSERT     // DDL/builder path: insert final rows during commit
-};
-
-// 每个向量索引一个桶
-struct vec_trx_bucket_t {
-  dict_index_t* index{nullptr};        // 逻辑索引
-  uint32_t      dim{0};
-  vec_aux_mode_t aux_mode{vec_aux_mode_t::UNKNOWN};
-  std::vector<vec_item_t> items;       // 本事务要写的条目
-  std::unordered_set<std::string> inserted_keys; // dedupe pending inserts
+// DDL build path metadata for one deferred vector row.
+struct vec_ddl_aux_row_t {
+  std::vector<vec_pk_column_t> pk_columns;
+  trx_id_t creator_trx_id{0};
 };
 
 struct vec_index_ctx_t;
 
-// 记录 bitmap 改动，供回滚恢复
-struct vec_bitmap_undo_entry_t {
+// Record inserted vector IDs for rollback cleanup.
+struct vec_insert_undo_entry_t {
   vec_index_ctx_t* ctx{nullptr};
   dict_index_t*    index{nullptr};
-  uint32_t         segment_id{0};
+  std::string      segment_id;
   uint64_t         vid{0};
-  bool             old_val{false};
 };
 
 // Record update details for rollback logging.
@@ -70,15 +53,16 @@ struct vec_update_undo_entry_t {
 struct vec_trx_ctx_t {
   trx_t* owner{nullptr};
   std::mutex mu;
-  // 以 dict_index_t* 为 key 的桶
-  std::unordered_map<dict_index_t*, vec_trx_bucket_t> by_index;
-  // 删除请求的 pk（在本事务内收集）
+  /**/
+  // 2/18/2026 Not used now! 删除请求的 pk（在本事务内收集）
   std::unordered_map<dict_index_t*, std::unordered_set<std::string>>
       deleted_pks_in_trx;
-  // 提交前 bitmap 改动的回滚日志
-  std::vector<vec_bitmap_undo_entry_t> bitmap_changes;
+  // Inserted vector IDs to mark on rollback.
+  std::vector<vec_insert_undo_entry_t> inserted_vids;
   // Update rollback log entries (logging only).
   std::vector<vec_update_undo_entry_t> update_changes;
+  // Indexes touched by immediate inserts (for commit-time checks).
+  std::unordered_set<dict_index_t*> touched_indexes;
 };
 
 // ==== 对外 API ====
@@ -102,7 +86,7 @@ std::string vec_format_pk_columns_debug(
 // 保证事务上有一个 vec_trx_ctx，可复用
 vec_trx_ctx_t* vec_get_or_create_trx_ctx(trx_t* trx);
 
-// 在“插入/更新行”时调用：抽取向量 + 主键快照 + 放入桶
+// 在“插入/更新行”时调用：抽取向量 + 主键快照 + 立即写入向量索引与辅助表
 // 不检查度量前处理，不改动字节，只校验长度与维度。
 int vec_collect_one_row(trx_t*           trx,
                         dict_table_t*    table,
@@ -111,12 +95,45 @@ int vec_collect_one_row(trx_t*           trx,
                         const unsigned   dim,
                         const dtuple_t*  row_tuple);     // 当前行的 InnoDB tuple
 
-int vec_collect_one_row(std::vector<vec_item_t> &bucket, 
-                        dict_table_t*   table, 
-                        dict_index_t*   vindex,
-                        const dfield_t* vector_field,
-                        const unsigned  dim,
-                        const dtuple_t* row_tuple);
+// DDL path: extract vector + PK only. The caller batches rows and flushes them
+// into the mutable index later.
+int vec_collect_one_row_no_aux(trx_t*           trx,
+                               dict_table_t*    table,
+                               dict_index_t*    vindex,
+                               const dfield_t*  vector_field,
+                               const unsigned   dim,
+                               const dtuple_t*  row_tuple,
+                               std::vector<float>* out_vec_values,
+                               std::vector<vec_pk_column_t>* out_pk_columns,
+                               trx_id_t         creator_trx_id = 0);
+
+// Immediate insert path: add to vector index and aux table, record rollback info.
+dberr_t vec_insert_one_row(trx_t* trx,
+                           dict_table_t* table,
+                           dict_index_t* vindex,
+                           const std::vector<vec_pk_column_t>& pk_columns,
+                           const std::vector<float>& vec_values,
+                           uint64_t* out_vid);
+
+// Insert into vector index + aux cache, skip aux table insert (DDL use).
+dberr_t vec_insert_one_row_no_aux(
+    trx_t* trx,
+    dict_table_t* table,
+    dict_index_t* vindex,
+    const std::vector<vec_pk_column_t>& pk_columns,
+    const std::vector<float>& vec_values,
+    uint64_t* out_vid,
+    std::string* out_seg_id,
+    trx_id_t creator_trx_id = 0);
+
+// Batch insert into vector index + aux cache/table, used by DDL flush path.
+dberr_t vec_insert_rows_no_aux(
+    trx_t* trx,
+    dict_table_t* table,
+    dict_index_t* vindex,
+    const float* xb,
+    size_t n,
+    const std::vector<vec_ddl_aux_row_t>& rows);
 
 // 提交成功或回滚时清空
 void vec_trx_ctx_clear(vec_trx_ctx_t* ctx);

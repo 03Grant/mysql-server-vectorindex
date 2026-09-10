@@ -716,6 +716,7 @@ struct row_prebuilt_t {
                              to this heap */
   mem_heap_t *old_vers_heap; /*!< memory heap where a previous
                              version is built in consistent read */
+  trx_id_t last_vis_trx_id;  /*!< trx id of last visible clustered record */
   enum {
     LOCK_PCUR,
     LOCK_CLUST_PCUR,

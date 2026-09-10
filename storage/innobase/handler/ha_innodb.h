@@ -749,7 +749,14 @@ class ha_innobase : public handler {
   size_t m_vec_row_cache_reclength{0};
 
   int vec_fetch_row_into_buffer(const Vec_hit &hit, uchar *row_buf);
-  int vec_populate_row_cache(const std::vector<Vec_hit> &batch);
+  /** Validate a vector candidate batch against the reader's MVCC snapshot and
+  cache the surviving rows. When @p query is given, also recompute each
+  surviving candidate's distance against the vector stored in the visible row
+  version; the result is returned through @p recomputed_dist (aligned with
+  @p batch, NaN where no distance was recomputed). */
+  int vec_populate_row_cache(const std::vector<Vec_hit> &batch,
+                             const float *query = nullptr,
+                             std::vector<float> *recomputed_dist = nullptr);
   void vec_clear_row_cache();
 
   /** Thread handle of the user currently using the handler;

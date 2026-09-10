@@ -1936,25 +1936,6 @@ static inline ulint vec_pk_field_count(const dict_index_t *clust_index) {
   return clust_index->n_uniq;
 }
 
-static vec_index_segment_t *vec_find_segment(vec_index_ctx_t *ctx,
-                                             uint32_t seg_id) {
-  if (ctx == nullptr) {
-    return nullptr;
-  }
-
-  for (auto &seg : ctx->segments) {
-    if (seg.vecindex_id == seg_id) {
-      return &seg;
-    }
-  }
-
-  if (seg_id == 0) {
-    return ctx->mutable_segment();
-  }
-
-  return nullptr;
-}
-
 static inline bool vec_pk_columns_ready(const std::vector<vec_pk_column_t> &cols,
                                         ulint pk_fields) {
   return pk_fields > 0 && cols.size() >= pk_fields;
@@ -2100,67 +2081,37 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
       continue;
     }
 
-    bool canceled = false;
     {
       std::lock_guard<std::mutex> lock(trx_ctx->mu);
-      auto bucket_it = trx_ctx->by_index.find(vec_index);
-      if (bucket_it != trx_ctx->by_index.end()) {
-        auto &bucket = bucket_it->second;
-        auto it_item = std::remove_if(
-            bucket.items.begin(), bucket.items.end(),
-            [&](const vec_item_t &item) { return item.pk_key == pk_key; });
-        if (it_item != bucket.items.end()) {
-          bucket.inserted_keys.erase(pk_key);
-          bucket.items.erase(it_item, bucket.items.end());
-          canceled = true;
-          ib::warn() << "VEC Del: insert canceled because delete";
-        }
-      }
-      if (!canceled) {
-        trx_ctx->deleted_pks_in_trx[vec_index].insert(pk_key);
-      }
+      trx_ctx->deleted_pks_in_trx[vec_index].insert(pk_key);
     }
 
-    struct SegInfo {
-      uint32_t id;
-      std::string aux_name;
-    };
-    std::vector<SegInfo> candidates;
+    std::string aux_name;
     {
       std::shared_lock<std::shared_mutex> lock(ctx->mu);
-      const std::string prefix =
-          ctx->index_name_prefix.empty() ? vec_aux_prefix(vec_index)
-                                         : ctx->index_name_prefix;
-      for (auto &seg : ctx->segments) {
-        std::string aux_name = seg.aux_table_name;
-        if (aux_name.empty() && !prefix.empty()) {
-          aux_name = seg.immutable ? vec_aux_segment_name(prefix, seg.vecindex_id)
-                                   : vec_aux_mem_name(prefix);
-        }
-        candidates.push_back({seg.vecindex_id, aux_name});
-      }
+      aux_name = ctx->aux_table_name;
+    }
+    if (aux_name.empty()) {
+      aux_name = vec_aux_active_name(vec_index);
+    }
+    if (aux_name.empty()) {
+      ib::warn() << "VEC Del: missing aux table name for index "
+                 << (vec_index->name ? vec_index->name : "(null)");
+      continue;
     }
 
-    uint32_t target_seg_id = UINT32_MAX;
-    uint64_t target_vid = 0;
+    std::string target_seg_id;
     bool found = false;
     ib::warn() << "VEC Del: Delete vec_index loop.";
-    for (const auto &seg_info : candidates) {
-      uint64_t vid = 0;
-      ib::warn() << "VEC Del: Delete vec_index segment " << seg_info.aux_name;
-      dberr_t del_err = vec_aux_handler_delete(
-          trx, seg_info.aux_name, clust_index, pk_fields, pk_columns, &vid);
-      if (del_err == DB_SUCCESS) {
-        target_seg_id = seg_info.id;
-        target_vid = vid;
-        found = true;
-        ib::warn() << "VEC Del: Delete found in segment " << target_seg_id
-                   << " with vid " << target_vid;
-        break;
-      } else if (del_err == DB_DEADLOCK ||
-                 del_err == DB_LOCK_WAIT_TIMEOUT) {
-        return del_err;
-      }
+    ib::warn() << "VEC Del: Delete vec_index aux " << aux_name;
+    dberr_t del_err = vec_aux_handler_delete(
+        trx, aux_name, clust_index, pk_fields, pk_columns, &target_seg_id);
+    if (del_err == DB_SUCCESS) {
+      found = true;
+      ib::warn() << "VEC Del: Delete found in seg_id " << target_seg_id;
+    } else if (del_err == DB_DEADLOCK ||
+               del_err == DB_LOCK_WAIT_TIMEOUT) {
+      return del_err;
     }
 
     if (!found) {
@@ -2168,30 +2119,8 @@ static dberr_t row_vecindex_delete(row_prebuilt_t *prebuilt,
       continue;
     }
 
-    /* If this delete is only canceling an uncommitted insert, we still
-    delete the aux-row but skip bitmap marking to avoid touching a bogus
-    VID (e.g. UINT64_MAX). */
-    if (canceled || target_vid == std::numeric_limits<uint64_t>::max()) {
-      ib::warn() << "VEC Del: skip bitmap mark due to canceled insert or "
-                 << "sentinel vid=" << target_vid;
+    if (target_seg_id.empty()) {
       continue;
-    }
-
-    {
-      std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
-      ib::warn() << "VEC Del: vec_index mark bitmap.";
-      vec_index_segment_t *seg = vec_find_segment(ctx, target_seg_id);
-      if (seg != nullptr) {
-        std::unique_lock<std::shared_mutex> seg_lock(*seg->rw_lock);
-        const bool old_val =
-            seg->vecindex_bitmap.is_marked(static_cast<size_t>(target_vid));
-        seg->vecindex_bitmap.set(static_cast<size_t>(target_vid), true);
-        std::lock_guard<std::mutex> trx_lock(trx_ctx->mu);
-        trx_ctx->bitmap_changes.push_back(
-            {ctx, vec_index, target_seg_id, target_vid, old_val});
-      } else {
-        ctx->needs_aux_refresh = true;
-      }
     }
   }
 
@@ -2207,77 +2136,6 @@ static const std::vector<float> *vec_find_update_vec(
     }
   }
   return nullptr;
-}
-
-// TODO: move it to ./vec/vec_txn_buf.cc??
-static dberr_t vec_collect_one_row_cached(
-    trx_t *trx, dict_table_t *table, dict_index_t *vindex,
-    const std::vector<vec_pk_column_t> &pk_columns,
-    const std::string &pk_key, const std::vector<float> &vec_values) {
-  if (trx == nullptr || table == nullptr || vindex == nullptr ||
-      pk_key.empty()) {
-    return DB_ERROR;
-  }
-
-  ib::warn() << "VEC Update: vec_index collect_one_row_cached.";
-
-  const vec_params_t *params = vindex->vec_params;
-  const unsigned dim = params != nullptr ? params->dim : 0;
-  if (dim == 0 || vec_values.size() != dim) {
-    ib::warn() << "VEC Update: vec_index collect_one_row_cached dim mismatch";
-    return DB_ERROR;
-  }
-
-  if (!vec_pk_columns_ready(pk_columns, vec_pk_field_count(table->first_index()))) {
-    ib::warn() << "VEC Update: vec_index collect_one_row_cached pk_columns mismatch";
-    return DB_ERROR;
-  }
-
-  dberr_t aux_err = vec_aux_insert_pk_null(trx, vindex, pk_columns);
-  if (aux_err != DB_SUCCESS) {
-    ib::warn() << "VEC Update: vec_index collect_one_row_cached insert pk+null aux-row failed";
-    return aux_err;
-  }
-
-  ib::warn() << "VEC Update: vec_index collect_one_row_cached insert pk+null aux-row succeeded.";
-
-  vec_trx_ctx_t *tctx = vec_get_or_create_trx_ctx(trx);
-  if (tctx == nullptr) {
-    ib::warn() << "VEC Update: vec_index collect_one_row_cached trx_ctx nullptr";
-    return DB_ERROR;
-  }
-
-  {
-    std::lock_guard<std::mutex> lk(tctx->mu);
-    auto &bucket = tctx->by_index[vindex];
-    if (bucket.index == nullptr) {
-      bucket.index = vindex;
-      bucket.dim = dim;
-      bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
-    } else if (bucket.dim != dim) {
-      return DB_ERROR;
-    }
-
-    if (bucket.aux_mode == vec_aux_mode_t::UNKNOWN) {
-      bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
-    } else if (bucket.aux_mode != vec_aux_mode_t::PREINSERT_NULL) {
-      if (bucket.items.empty()) {
-        bucket.aux_mode = vec_aux_mode_t::PREINSERT_NULL;
-      } else {
-        return DB_ERROR;
-      }
-    }
-
-    vec_item_t item;
-    item.pk_columns = pk_columns;
-    item.vec = vec_values;
-    item.pk_key = pk_key;
-    bucket.inserted_keys.insert(item.pk_key);
-    bucket.items.emplace_back(std::move(item));
-    ib::warn() << "VEC Update: vec_index collect_one_row_cached insert item.";
-  }
-
-  return DB_SUCCESS;
 }
 
 static dberr_t row_vecindex_update(row_prebuilt_t *prebuilt) {
@@ -2378,67 +2236,19 @@ static dberr_t row_vecindex_update(row_prebuilt_t *prebuilt) {
     vec_indexes.push_back(vec_index);
   }
 
-  bool in_bucket = false;
   {
     std::lock_guard<std::mutex> lock(trx_ctx->mu);
-    for (auto *vec_index : vec_indexes) {
-      auto bucket_it = trx_ctx->by_index.find(vec_index);
-      if (bucket_it == trx_ctx->by_index.end()) {
-        continue;
-      }
-      for (const auto &item : bucket_it->second.items) {
-        if (item.pk_key == old_pk_key) {
-          in_bucket = true;
-          break;
-        }
-      }
-      if (in_bucket) {
-        break;
-      }
-    }
     for (auto *vec_index : vec_indexes) {
       vec_update_undo_entry_t entry;
       entry.index = vec_index;
       entry.old_pk_key = old_pk_key;
       entry.new_pk_key = new_pk_key;
-      entry.in_bucket = in_bucket;
+      entry.in_bucket = false;
       trx_ctx->update_changes.emplace_back(std::move(entry));
     }
   }
 
-  if (!in_bucket) {
-    if (node_ctx != nullptr) {
-      node_ctx->vec_delete_pk_columns = old_pk_columns;
-      node_ctx->vec_delete_pk_fields = pk_fields;
-    }
-    dberr_t del_err = row_vecindex_delete(prebuilt, nullptr);
-    if (del_err != DB_SUCCESS) {
-      return del_err;
-    }
-
-    for (auto *vec_index : vec_indexes) {
-      const std::vector<float> *vec_values =
-          vec_find_update_vec(vec_entries, vec_index);
-      if (vec_values == nullptr) {
-        ib::warn() << "VEC Upd: missing cached vector for index '"
-                   << (vec_index->name ? vec_index->name : "(null)") << "'";
-        return DB_ERROR;
-      }
-      dberr_t ins_err = vec_collect_one_row_cached(
-          trx, table, vec_index, new_pk_columns, new_pk_key, *vec_values);
-      if (ins_err != DB_SUCCESS) {
-        return ins_err;
-      }
-    }
-    return DB_SUCCESS;
-  }
-
   for (auto *vec_index : vec_indexes) {
-    vec_index_ctx_t *ctx = vec_index->vec_runtime;
-    if (ctx == nullptr) {
-      ib::warn() << "VEC Upd: ctx nullptr";
-    }
-
     const std::vector<float> *vec_values =
         vec_find_update_vec(vec_entries, vec_index);
     if (vec_values == nullptr) {
@@ -2447,67 +2257,46 @@ static dberr_t row_vecindex_update(row_prebuilt_t *prebuilt) {
       return DB_ERROR;
     }
 
-    bool updated_in_bucket = false;
-    {
-      std::lock_guard<std::mutex> lock(trx_ctx->mu);
-      auto bucket_it = trx_ctx->by_index.find(vec_index);
-      if (bucket_it != trx_ctx->by_index.end()) {
-        auto &bucket = bucket_it->second;
-        for (auto &item : bucket.items) {
-          if (item.pk_key == old_pk_key) {
-            if (bucket.dim != vec_values->size()) {
-              ib::warn() << "VEC Upd: bucket dim mismatch for index '"
-                         << (vec_index->name ? vec_index->name : "(null)")
-                         << "'";
-              return DB_ERROR;
-            }
-            item.pk_key = new_pk_key;
-            item.pk_columns = new_pk_columns;
-            item.vec = *vec_values;
-            updated_in_bucket = true;
-            break;
-          }
-        }
-        if (updated_in_bucket && old_pk_key != new_pk_key) {
-          bucket.inserted_keys.erase(old_pk_key);
-          bucket.inserted_keys.insert(new_pk_key);
-        }
-      }
+    std::string new_seg_id;
+    dberr_t ins_err =
+        vec_insert_one_row_no_aux(trx, table, vec_index, new_pk_columns,
+                                  *vec_values, nullptr, &new_seg_id, 0);
+    if (ins_err != DB_SUCCESS) {
+      return ins_err;
     }
 
-    if (!updated_in_bucket) {
-      ib::warn() << "VEC Upd: bucket item not found for in-bucket update";
+    vec_index_ctx_t *ctx = vec_index->vec_runtime;
+    if (ctx == nullptr) {
+      ib::warn() << "VEC Upd: ctx nullptr";
       return DB_ERROR;
     }
 
     std::string aux_name;
-    if (ctx != nullptr) {
+    {
       std::shared_lock<std::shared_mutex> lock(ctx->mu);
-      const std::string prefix =
-          ctx->index_name_prefix.empty() ? vec_aux_prefix(vec_index)
-                                         : ctx->index_name_prefix;
-      aux_name = vec_aux_mem_name(prefix);
-    } else {
-      aux_name = vec_aux_mem_name(vec_aux_prefix(vec_index));
+      aux_name = ctx->aux_table_name;
+    }
+    if (aux_name.empty()) {
+      aux_name = vec_aux_active_name(vec_index);
+    }
+    if (aux_name.empty()) {
+      ib::warn() << "VEC Upd: missing aux table name for index "
+                 << (vec_index->name ? vec_index->name : "(null)");
+      return DB_ERROR;
     }
 
-    const uint64_t sentinel_vid = std::numeric_limits<uint64_t>::max();
-    uint64_t vid = sentinel_vid;
+    std::string old_seg_id;
     dberr_t upd_err = vec_aux_handler_update(
         trx, aux_name, clust_index, pk_fields, old_pk_columns, new_pk_columns,
-        &vid);
-    if (upd_err == DB_SUCCESS) {
-      if (vid != sentinel_vid) {
-        ib::warn()
-            << "VEC Upd: expected sentinel vid for in-bucket update, got "
-            << vid;
-      }
-      ib::warn() << "VEC Upd: updated sentinel PK in aux table";
+        new_seg_id, &old_seg_id);
+    if (upd_err == DB_RECORD_NOT_FOUND) {
+      ib::warn() << "VEC Upd: AUX record not found for index '"
+                 << (vec_index->name ? vec_index->name : "(null)") << "'";
+      return upd_err;
     } else if (upd_err == DB_DEADLOCK ||
                upd_err == DB_LOCK_WAIT_TIMEOUT) {
       return upd_err;
-    } else {
-      ib::warn() << "VEC Upd: update sentinel PK failed err=" << upd_err;
+    } else if (upd_err != DB_SUCCESS) {
       return upd_err;
     }
   }

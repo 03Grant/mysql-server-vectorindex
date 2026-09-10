@@ -48,6 +48,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #endif /* !UNIV_HOTBACKUP */
 
 #include <cstdint>
+#include <shared_mutex>
 
 #include <auto_thd.h>
 #include <errno.h>
@@ -64,8 +65,12 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <time.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <iomanip>
+#include <limits>
 #include <memory>
+#include <set>
 #include <shared_mutex>
 #include <string>
 
@@ -165,13 +170,16 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0thread-create.h"
 #include "os0thread.h"
 #include "p_s.h"
+#include "page0page.h"
 #include "page0zip.h"
 #include "pars0pars.h"
+#include "rem0rec.h"
 #include "rem0types.h"
 #include "row0ext.h"
 #include "row0import.h"
 #include "row0ins.h"
 #include "row0mysql.h"
+#include "row0row.h"
 #include "row0quiesce.h"
 #include "row0sel.h"
 #include "row0upd.h"
@@ -11541,29 +11549,171 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
     runtime_ptr = &runtime_params;
   }
 
-  std::vector<float> distances(top_k);
-  std::vector<int64_t> labels(top_k);
-  std::vector<uint32_t> segments(top_k);
-
   const float *query_vec = reinterpret_cast<const float *>(query);
-  const int search_error =
-      vec_search(*ctx, query_vec, 1, top_k, distances.data(), labels.data(),
-                 segments.data(), runtime_ptr);
-  if (search_error != 0) {
-    ib::warn() << "Vector search failed with error code: " << search_error;
-    return HA_ERR_INTERNAL_ERROR;
-  }
 
-  // ib::warn() << "Vector search found " << top_k << " results.";
+  THD *thd = ha_thd();
 
-  result->reserve(top_k);
-  for (size_t i = 0; i < top_k; ++i) {
-    if (labels[i] < 0) continue;
-    Vec_hit hit;
-    hit.faiss_id = static_cast<longlong>(labels[i]);
-    hit.segment = segments[i];
-    hit.distance = distances[i];
-    result->push_back(hit);
+  // Iterative expansion: start with 2x overscan, double fetch_k each round
+  // until top_k MVCC-visible rows are found or the index is exhausted.
+  static constexpr size_t kMaxFetchK = 100000;
+  size_t fetch_k = top_k;
+
+  for (;;) {
+    // Pin one immutable version for this whole round. The search and the
+    // follow-up PK/MVCC validation below both read this same snapshot, so a
+    // concurrent flush/merge cannot change the segment set under us, and every
+    // segment we touch stays alive for as long as `ver` is held. No global
+    // index lock is taken on this read path.
+    vec_version_ptr ver = vec_pin_version(ctx);
+    if (!ver) {
+      ib::warn() << "VECSEARCH: no published version available for index "
+                 << (index->name ? index->name : "(null)");
+      return HA_ERR_INTERNAL_ERROR;
+    }
+
+    std::vector<float> distances(fetch_k);
+    std::vector<int64_t> labels(fetch_k);
+    std::vector<std::string> segments(fetch_k);
+
+    const int search_error =
+        vec_search(*ctx, *ver, query_vec, 1, fetch_k, distances.data(),
+                   labels.data(), segments.data(), nullptr, runtime_ptr);
+    if (search_error != 0) {
+      ib::warn() << "Vector search failed with error code: " << search_error;
+      return HA_ERR_INTERNAL_ERROR;
+    }
+
+    result->clear();
+    result->reserve(fetch_k);
+    for (size_t i = 0; i < fetch_k; ++i) {
+      if (labels[i] < 0) continue;
+      Vec_hit hit;
+      hit.faiss_id = static_cast<longlong>(labels[i]);
+      hit.segment = segments[i];
+      hit.distance = distances[i];
+
+      // Resolve the segment within the pinned version (no global lock). `ver`
+      // keeps the segment alive even if a concurrent merge has already removed
+      // it from the writer-side list.
+      vec_index_segment_t *seg = ver->find(hit.segment);
+      if (seg == nullptr || seg->index == nullptr) {
+        ib::warn() << "VECSEARCH[s01] stale segment id=" << hit.segment
+                   << " for faiss_id=" << hit.faiss_id;
+        continue;
+      }
+
+      if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
+        if (thd == nullptr ||
+            !vec_load_aux_cache_for_segment(index, ctx, seg, thd)) {
+          ib::warn() << "VECSEARCH[s02] auxiliary PK cache not ready for segment "
+                     << hit.segment << " faiss_id=" << hit.faiss_id;
+          continue;
+        }
+      }
+
+      std::shared_lock<std::shared_mutex> seg_lock;
+      if (seg->rw_lock) {
+        seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
+      }
+
+      if (!seg->vid_pk_mapping.ready) {
+        ib::warn() << "VECSEARCH[s03] PK cache still not ready for segment "
+                   << hit.segment << " faiss_id=" << hit.faiss_id;
+        continue;
+      }
+
+      const size_t faiss_id = static_cast<size_t>(hit.faiss_id);
+      if (faiss_id >= seg->vid_pk_mapping.pk_values.size()) {
+        ib::warn() << "VECSEARCH[s04] faiss_id out of range for segment "
+                   << hit.segment << " faiss_id=" << hit.faiss_id;
+        continue;
+      }
+
+      const auto &pk_entry = seg->vid_pk_mapping.pk_values[faiss_id];
+      if (pk_entry.empty()) {
+        ib::warn() << "VECSEARCH[s05] missing PK entry for segment "
+                   << hit.segment << " faiss_id=" << hit.faiss_id;
+        continue;
+      }
+
+      hit.pk_entry.assign(pk_entry.begin(), pk_entry.end());
+      hit.trx_id = static_cast<ulonglong>(seg->vid_pk_mapping.get_trx_id(faiss_id));
+      result->push_back(std::move(hit));
+    }
+
+    // Eagerly run MVCC validation so we know how many rows survive. The
+    // validation pass also recomputes each survivor's distance against the
+    // vector of its snapshot-visible row version.
+    std::vector<float> recomputed_dist;
+    int pop_err = vec_populate_row_cache(*result, query_vec, &recomputed_dist);
+    if (pop_err != 0) return pop_err;
+
+    // Rank survivors by the recomputed distance and collapse duplicate PKs:
+    // a transaction that inserts and then updates the same row leaves two
+    // entries with the same insertion TID, and both pass the TID equality
+    // check. Duplicates share the same visible row, hence the same recomputed
+    // distance, so keeping the first ranked occurrence is exact.
+    const bool rank_min = !(vec_params->metric_tag == VEC_M_IP ||
+                            vec_params->metric_tag == VEC_M_COSINE);
+    std::vector<size_t> ranked;
+    ranked.reserve(result->size());
+    for (size_t i = 0; i < result->size(); ++i) {
+      if (i < m_vec_row_cache_rows.size() &&
+          !m_vec_row_cache_rows[i].empty()) {
+        if (i < recomputed_dist.size() && !std::isnan(recomputed_dist[i])) {
+          (*result)[i].distance = recomputed_dist[i];
+        }
+        ranked.push_back(i);
+      }
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [&](size_t a, size_t b) {
+      const float da = (*result)[a].distance;
+      const float db = (*result)[b].distance;
+      return rank_min ? da < db : da > db;
+    });
+    {
+      std::set<std::vector<uchar>> seen_pks;
+      std::vector<size_t> deduped;
+      deduped.reserve(ranked.size());
+      for (size_t idx : ranked) {
+        if (seen_pks.insert((*result)[idx].pk_entry).second) {
+          deduped.push_back(idx);
+        }
+      }
+      ranked = std::move(deduped);
+    }
+    const size_t visible = ranked.size();
+
+    if (visible >= top_k || fetch_k >= kMaxFetchK || result->empty()) {
+      // Compact: keep only the top_k distinct visible hits, in ranked order,
+      // together with their cache rows (no holes), so ha_vec_fetch_rows
+      // reuses this pre-populated cache without triggering a second round of
+      // row_search_for_mysql calls.
+      const size_t keep = std::min(visible, top_k);
+      std::vector<Vec_hit> final_hits;
+      std::vector<std::vector<uchar>> compact_cache;
+      final_hits.reserve(keep);
+      compact_cache.reserve(keep);
+
+      for (size_t r = 0; r < keep; ++r) {
+        const size_t idx = ranked[r];
+        compact_cache.push_back(std::move(m_vec_row_cache_rows[idx]));
+        final_hits.push_back(std::move((*result)[idx]));
+      }
+      m_vec_row_cache_rows = std::move(compact_cache);
+      // m_vec_row_cache_ready and m_vec_row_cache_reclength already set by
+      // vec_populate_row_cache above.
+      *result = std::move(final_hits);
+      break;
+    }
+
+    // Not enough visible rows yet — expand and retry.
+    ib::info() << "VECSEARCH[expand] visible=" << visible
+               << " < top_k=" << top_k
+               << ", expanding fetch_k=" << fetch_k
+               << " -> " << std::min(fetch_k * 2, kMaxFetchK);
+    fetch_k = std::min(fetch_k * 2, kMaxFetchK);
+    vec_clear_row_cache();
   }
 
   return 0;
@@ -11628,28 +11778,37 @@ int ha_innobase::ha_vec_fetch_row(const Vec_hit &) {
   return HA_ERR_WRONG_COMMAND;
 }
 
-/** Locate vector segment by its runtime ID. */
-static vec_index_segment_t *vec_find_segment(vec_index_ctx_t *ctx,
-                                             uint32_t segment_id) {
-  if (ctx == nullptr) {
-    return nullptr;
+static inline bool vec_is_visible(trx_id_t vec_trx_id,
+                                  trx_id_t visible_trx_id) {
+  if (visible_trx_id == 0) {
+    return false;
   }
-  std::shared_lock<std::shared_mutex> ctx_lock(ctx->mu);
-
-  for (auto &seg : ctx->segments) {
-    if (seg.vecindex_id == segment_id) {
-      return &seg;
-    }
-  }
-
-  if (segment_id < ctx->segments.size()) {
-    return &ctx->segments[segment_id];
-  }
-
-  return nullptr;
+  return vec_trx_id == visible_trx_id;
 }
 
-int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
+/** Distance between the query vector and a row vector, using the same
+conventions as the segment backends (see MutableFlatIndex): squared L2 for
+VEC_M_L2 (smaller is better), inner product for VEC_M_IP / VEC_M_COSINE
+(larger is better; cosine relies on externally normalized vectors). */
+static float vec_row_distance(uint8_t metric_tag, uint32_t dim, const float *q,
+                              const float *v) {
+  float s = 0.0f;
+  if (metric_tag == VEC_M_IP || metric_tag == VEC_M_COSINE) {
+    for (uint32_t i = 0; i < dim; ++i) {
+      s += q[i] * v[i];
+    }
+    return s;
+  }
+  for (uint32_t i = 0; i < dim; ++i) {
+    const float d = q[i] - v[i];
+    s += d * d;
+  }
+  return s;
+}
+
+int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch,
+                                        const float *query,
+                                        std::vector<float> *recomputed_dist) {
   vec_clear_row_cache();
 
   const size_t reclength = (table != nullptr && table->s != nullptr)
@@ -11670,10 +11829,6 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
     return HA_ERR_WRONG_COMMAND;
   }
 
-  vec_index_ctx_t *ctx = vec_index->vec_runtime;
-  if (ctx == nullptr) {
-    return HA_ERR_WRONG_COMMAND;
-  }
   dict_table_t *dict_table = vec_index->table;
   if (dict_table == nullptr) {
     return HA_ERR_WRONG_COMMAND;
@@ -11707,6 +11862,34 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
 
   m_vec_row_cache_rows.resize(batch.size());
 
+  /* Resolve the MySQL field of the indexed vector column so the distance can
+  be recomputed against the vector stored in the snapshot-visible row version
+  (not the possibly stale copy materialized in the index entry). */
+  Field *vec_mysql_field = nullptr;
+  const vec_params_t *vparams = vec_index->vec_params;
+  if (query != nullptr && recomputed_dist != nullptr && vparams != nullptr &&
+      vparams->dim > 0) {
+    const char *vec_col_name = vec_index->get_field(0)->name;
+    for (uint fi = 0; fi < table->s->fields; ++fi) {
+      if (my_strcasecmp(system_charset_info, table->field[fi]->field_name,
+                        vec_col_name) == 0) {
+        vec_mysql_field = table->field[fi];
+        break;
+      }
+    }
+    if (vec_mysql_field == nullptr) {
+      ib::warn() << "VECFETCH[c13] vector column '" << vec_col_name
+                 << "' not found in MySQL table definition; keeping index-side "
+                    "distances";
+    }
+  }
+  if (recomputed_dist != nullptr) {
+    recomputed_dist->assign(batch.size(),
+                            std::numeric_limits<float>::quiet_NaN());
+  }
+  std::vector<float> row_vec_buf;
+  String row_vec_str;
+
   auto restore_index_guard = create_scope_guard([&]() {
     m_prebuilt->index = vec_index;
     if (vec_index != nullptr) {
@@ -11722,38 +11905,9 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   m_prebuilt->init_search_tuples_types();
   build_template(true);
 
-  auto ensure_segment_ready = [&](const Vec_hit &hit) -> vec_index_segment_t * {
-    vec_index_segment_t *seg =
-        vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
-    if (seg == nullptr || seg->index == nullptr) {
-      ib::warn() << "VECFETCH[c02] unknown segment id=" << hit.segment;
-      return nullptr;
-    }
-    if (seg->index->ntotal() > 0 && !seg->vid_pk_mapping.ready) {
-      if (!vec_load_aux_cache_for_segment(vec_index, ctx, seg, thd) ||
-          !seg->vid_pk_mapping.ready) {
-        ib::warn() << "VECFETCH[c01] auxiliary PK cache not ready for segment "
-                   << hit.segment;
-        return nullptr;
-      }
-    }
-    return seg;
-  };
-
-  for (const auto &hit : batch) {
-    if (hit.faiss_id < 0) {
-      ib::warn() << "VECFETCH[c03] negative faiss_id in batch";
-      vec_clear_row_cache();
-      return HA_ERR_INTERNAL_ERROR;
-    }
-    if (ensure_segment_ready(hit) == nullptr) {
-      vec_clear_row_cache();
-      return HA_ERR_WRONG_COMMAND;
-    }
-  }
-
   dtuple_t *tuple = m_prebuilt->search_tuple;
   if (tuple == nullptr) {
+    ib::warn() << "VECFETCH[c05] search tuple is null";
     vec_clear_row_cache();
     return HA_ERR_WRONG_COMMAND;
   }
@@ -11761,32 +11915,19 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   dict_index_copy_types(tuple, clust_index, clust_field_count);
   dtuple_set_n_fields(tuple, clust_field_count);
   dtuple_set_n_fields_cmp(tuple, pk_field_count);
-
-  std::vector<unsigned char> pk_entry_copy;
   for (size_t i = 0; i < batch.size(); ++i) {
     const Vec_hit &hit = batch[i];
-    vec_index_segment_t *seg =
-        vec_find_segment(ctx, static_cast<uint32_t>(hit.segment));
-
-    bool bound = false;
-    {
-      std::shared_lock<std::shared_mutex> seg_lock;
-      if (seg != nullptr && seg->rw_lock) {
-        seg_lock = std::shared_lock<std::shared_mutex>(*seg->rw_lock);
-      }
-      if (seg != nullptr) {
-        bound = vec_aux_cache_bind_tuple_copy(&seg->vid_pk_mapping,
-                                              static_cast<uint64_t>(hit.faiss_id),
-                                              clust_index, tuple,
-                                              &pk_entry_copy);
-      }
+    if (hit.pk_entry.empty()) {
+      ib::warn() << "VECFETCH[c10] missing PK entry for "
+                 << "segment=" << hit.segment << " faiss_id=" << hit.faiss_id;
+      continue;
     }
-    if (!bound) {
-      ib::warn() << "VECFETCH[c10] missing or corrupt cache entry for "
-                 << "segment=" << hit.segment
-                 << " faiss_id=" << hit.faiss_id;
-      vec_clear_row_cache();
-      return HA_ERR_WRONG_COMMAND;
+
+    if (!vec_aux_bind_tuple_from_entry(hit.pk_entry.data(), hit.pk_entry.size(),
+                                       clust_index, tuple)) {
+      ib::warn() << "VECFETCH[c10] corrupt PK entry for "
+                 << "segment=" << hit.segment << " faiss_id=" << hit.faiss_id;
+      continue;
     }
 
     restore_record(table, s->default_values);
@@ -11796,14 +11937,46 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
       return convert_error_code_to_mysql(enter_err, 0, thd);
     }
 
+    m_prebuilt->last_vis_trx_id = 0;
     dberr_t search_err = row_search_for_mysql(
         table->record[0], PAGE_CUR_GE, m_prebuilt, ROW_SEL_EXACT, 0);
 
     innobase_srv_conc_exit_innodb(m_prebuilt);
 
+    if (search_err == DB_RECORD_NOT_FOUND) {
+      continue;
+    }
     if (search_err != DB_SUCCESS) {
+      ib::warn() << "VECFETCH[c11] row search failed for segment=" << hit.segment
+                 << " faiss_id=" << hit.faiss_id
+                 << " with error code: " << search_err;
       vec_clear_row_cache();
       return convert_error_code_to_mysql(search_err, 0, thd);
+    }
+
+    const trx_id_t t_vis = m_prebuilt->last_vis_trx_id;
+    const trx_id_t t_r = static_cast<trx_id_t>(hit.trx_id);
+    if (!vec_is_visible(t_r, t_vis)) {
+      ib::warn() << "VECFETCH[c12] row not visible for hit with segment="
+                 << hit.segment << " faiss_id=" << hit.faiss_id
+                 << " trx_id=" << t_r << " visible_trx_id=" << t_vis;
+      continue;
+    }
+
+    /* The TID equality check alone cannot tell apart two entries created by
+    the same transaction for the same PK (insert followed by update): both
+    carry the same insertion TID. The refetched row is the authority, so the
+    ranking distance is recomputed here from the visible version's vector;
+    the caller collapses remaining duplicate PKs. */
+    if (vec_mysql_field != nullptr) {
+      String *val = vec_mysql_field->val_str(&row_vec_str);
+      const size_t expected = vparams->dim * sizeof(float);
+      if (val != nullptr && val->length() == expected) {
+        row_vec_buf.resize(vparams->dim);
+        std::memcpy(row_vec_buf.data(), val->ptr(), expected);
+        (*recomputed_dist)[i] = vec_row_distance(
+            vparams->metric_tag, vparams->dim, query, row_vec_buf.data());
+      }
     }
 
     auto &row = m_vec_row_cache_rows[i];
@@ -11846,6 +12019,9 @@ int ha_innobase::ha_vec_fetch_rows(const std::vector<Vec_hit> &batch,
   }
 
   const auto &row = m_vec_row_cache_rows[read_no];
+  if (row.empty()) {
+    return HA_ERR_KEY_NOT_FOUND;
+  }
   if (row.size() != table->s->reclength) {
     return HA_ERR_INTERNAL_ERROR;
   }
@@ -24537,8 +24713,8 @@ mysql_declare_plugin(innobase){
     i_s_innodb_ft_being_deleted, i_s_innodb_ft_config,
     i_s_innodb_ft_index_cache, i_s_innodb_ft_index_table, i_s_innodb_tables,
     i_s_innodb_tablestats, i_s_innodb_indexes, i_s_innodb_tablespaces,
-    i_s_innodb_columns, i_s_innodb_virtual, i_s_innodb_cached_indexes,
-    i_s_innodb_session_temp_tablespaces
+    i_s_vecindex_stats, i_s_innodb_columns, i_s_innodb_virtual,
+    i_s_innodb_cached_indexes, i_s_innodb_session_temp_tablespaces
 
     mysql_declare_plugin_end;
 

@@ -6,7 +6,8 @@
 
 enum class BackendType {
     Faiss,
-    Hnswlib
+    Hnswlib,
+    Diskann
 };
 
 enum : uint8_t {
