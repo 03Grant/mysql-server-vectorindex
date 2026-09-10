@@ -7122,15 +7122,15 @@ static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
   const bool not_null = (c->prtype & DATA_NOT_NULL) != 0;
   out->set_nullable(!not_null);
 
-  // 是否 unsigned（整数）
+  // Whether the integer column is unsigned.
   const bool is_unsigned = (c->prtype & DATA_UNSIGNED) != 0;
   out->set_unsigned(is_unsigned);
 
   out->set_default_value_null(true);
-  // —— 类型映射：依据 InnoDB dict 列类型，生成 DD 列定义 ——
+  // --- Map InnoDB dictionary column types to DD column definitions ---
   switch (c->mtype) {
     case DATA_INT:
-      /* len 为存储字节数：1/2/3/4/8 分别对应 TINY/SMALL/MEDIUM/INT/BIGINT */
+      /* len is the storage size in bytes: 1/2/3/4/8 map to TINY/SMALL/MEDIUM/INT/BIGINT. */
       switch (c->len) {
         case 1:
           out->set_type(dd::enum_column_types::TINY);
@@ -7164,8 +7164,8 @@ static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
         out->set_collation_id(my_charset_bin.number);
       } else {
         out->set_type(dd::enum_column_types::VARCHAR);
-        // TODO: 为非 binary 的字符列设置合适的 collation_id
-        out->set_collation_id(my_charset_latin1.number); // 或来自原列字符集
+        // TODO: Set the appropriate collation_id for non-binary character columns.
+        out->set_collation_id(my_charset_latin1.number); // Or use the original column's character set.
       }
       out->set_char_length(static_cast<uint>(c->len));
       break;
@@ -7183,7 +7183,7 @@ static void vec_dd_fill_column_from_dict_col(const dict_col_t* c,
       break;
 
     default:
-      // 兜底：按 VAR_STRING 处理，防止 DD/物理不一致
+      // Fallback to VAR_STRING to avoid a mismatch between DD and physical metadata.
       out->set_type(dd::enum_column_types::VAR_STRING);
       out->set_char_length(static_cast<uint>(c->len));
       out->set_collation_id(my_charset_bin.number);
@@ -7207,7 +7207,7 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
   dd::cache::Dictionary_client* client = dd::get_dd_client(thd);
   dd::cache::Dictionary_client::Auto_releaser releaser(client);
 
-  // 锁库 & 拿 schema
+  // Lock the database and obtain its schema.
   const dd::Schema* schema = nullptr;
   if (mdl_locker.ensure_locked(db_name.c_str()) ||
       client->acquire<dd::Schema>(db_name.c_str(), &schema) ||
@@ -7216,25 +7216,25 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
     return false;
   }
 
-  // 创建 dd::Table 占位对象
+  // Create a placeholder dd::Table object.
   std::unique_ptr<dd::Table> dd_table_up(schema->create_table(thd));
   dd::Table* dd_table = dd_table_up.get();
   dd_table->set_name(tbl_name.c_str());
   dd_table->set_schema_id(schema->id());
 
-  // 1) 设隐藏/引擎等（直接复用 FTS 的 helper；里面会 set_hidden(HT_HIDDEN_SE)）
+  // 1) Set visibility, engine, etc. using the FTS helper, which calls set_hidden(HT_HIDDEN_SE).
   dd_set_vec_table_options(dd_table, table);
-  // 如果不想用 FTS 名称，可以包一层 dd_set_vec_table_options() 调 dd_set_fts_table_options()
+  // A dd_set_vec_table_options() wrapper can call dd_set_fts_table_options() to avoid an FTS-specific name.
 
-  // 2) 添加列（顺序必须与物理表一致：你建表时先 PK 列，再 faiss_id）
-  //    这里从物理 aux 的 dict_table_t 复制列定义到 DD
+  // 2) Add columns in physical table order: primary key columns, then faiss_id.
+  //    Copy column definitions from the physical auxiliary table's dict_table_t into DD.
   const ulint n_user = table->get_n_user_cols();
   std::vector<dd::Column*> dd_cols;
   dd_cols.reserve(n_user);
 
-  for (ulint i = 0; i < n_user; ++i) {             // 只遍历用户列
+  for (ulint i = 0; i < n_user; ++i) {             // Iterate over user columns only.
     dd::Column* col = dd_table->add_column();
-    const char* name = table->get_col_name(i);     // 这里才有合法列名
+    const char* name = table->get_col_name(i);     // Obtain the valid column name here.
     const dict_col_t* dc = table->get_col(i);
     ut_ad(name != nullptr && dc != nullptr);
     vec_dd_fill_column_from_dict_col(dc, name, col);
@@ -7247,8 +7247,8 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
     return false;
   }
 
-  // 3) 添加索引：PRIMARY（聚簇），列集/顺序/前缀/升降序与物理一致
-  //    基于你创建物理表时的规则：若基表无显式 PK，则第一列是 row_id
+  // 3) Add PRIMARY (clustered), matching physical columns, order, prefixes, and sort directions.
+  //    Follow physical table creation rules: without an explicit base-table PK, the first column is row_id.
   dd::Index* dd_pk = dd_table->add_index();
   dd_pk->set_name("PRIMARY");
   dd_pk->set_algorithm(dd::Index::IA_BTREE);
@@ -7298,7 +7298,7 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
                << table->name.m_name;
   }
 
-  // 5) 确定/分配 dd_space_id（强烈建议复用 FTS helper：它涵盖各种空间情况）
+  // 5) Determine/allocate dd_space_id; reuse the FTS helper to handle the different tablespace cases.
   dd::Object_id dd_space_id = dd::INVALID_OBJECT_ID;
   if (!dd_get_or_assign_fts_tablespace_id(parent_table, table, dd_space_id)) {
     ib::warn() << "VECINDEX: dd_get_or_assign_fts_tablespace_id failed for "
@@ -7307,10 +7307,10 @@ bool dd_create_vec_index_table(const dict_table_t* parent_table,
   }
   table->dd_space_id = dd_space_id;
 
-  // 6) 把 dict_table_t 的 SE 私有数据写入 dd::Table（列/索引我们已填充）
+  // 6) Copy SE-private data from dict_table_t into dd::Table; columns and indexes are already populated.
   dd_write_table(dd_space_id, dd_table, table);
 
-  // 7) 申请表级 MDL 并持久化
+  // 7) Acquire table-level MDL and persist the table.
   MDL_ticket* mdl_ticket = nullptr;
   if (dd::acquire_exclusive_table_mdl(thd, db_name.c_str(), tbl_name.c_str(),
                                       false /* is_temp */, &mdl_ticket)) {

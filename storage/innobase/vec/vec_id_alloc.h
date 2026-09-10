@@ -7,54 +7,54 @@
 #include "trx0trx.h"
 
 
-// 前置声明（来自 InnoDB）
+// Forward declarations from InnoDB
 struct trx_t;
 struct dict_index_t;
 
 /**
- * 向量索引的单调 ID 分配器（每个 dict_index_t 一份）
- * - 懒恢复：首次调用 recover_from_aux() 时，从 aux 表读 MAX(faiss_id)。
- * - 分配：reserve(k, &start) 预留一段 [start, start+k-1]。
+ * Monotonic ID allocator for a vector index, one per dict_index_t.
+ * - Lazy recovery: read MAX(faiss_id) from the auxiliary table on the first recover_from_aux() call.
+ * - Allocation: reserve(k, &start) reserves the range [start, start+k-1].
  */
 struct vec_id_allocator_t {
-  // 运行态
+  // Runtime state
   std::mutex mu{};
   uint64_t   next{0};
   bool       inited{false};
 
-  // === 生命周期 ===
+  // === Lifecycle ===
 
   /**
-   * 懒恢复：从辅助表读取 MAX(faiss_id)，把 next 设为 max+1。
-   * 可多次调用，内部只会在未初始化时生效。
+   * Lazy recovery: read MAX(faiss_id) from the auxiliary table and set next to max+1.
+   * May be called repeatedly; only takes effect when not initialized.
    *
-   * @param trx   事务句柄（读 aux 表用）
-   * @param index 哪个向量索引（用于定位 aux 表名）
-   * @return DB_SUCCESS / 其他错误
+   * @param trx   Transaction handle for reading the auxiliary table
+   * @param index Vector index used to locate the auxiliary table
+   * @return DB_SUCCESS or another error code
    */
   dberr_t recover_from_aux(trx_t* trx, dict_index_t* index);
 
   /**
-   * 预留 k 个 ID，返回起始 ID（线程安全）。
-   * 调用者应在提交阶段调用，用于 add_with_ids。
+   * Reserve k IDs and return the starting ID (thread-safe).
+   * Call during commit for use with add_with_ids.
    *
-   * @param k      需要预留的数量
-   * @param start  输出本次分配的起始 ID
-   * @return DB_SUCCESS / DB_ERROR（溢出或未初始化且恢复失败）
+   * @param k      Number of IDs to reserve
+   * @param start  Output: starting ID of this allocation
+   * @return DB_SUCCESS / DB_ERROR (overflow, or uninitialized with failed recovery)
    */
   dberr_t reserve(uint64_t k, uint64_t* start);
 
   /**
-   * （可选）窥视下一号（仅调试/日志）。
+   * Optionally peek at the next ID for debugging/logging only.
    */
   uint64_t peek_next_unsafe() const noexcept { return next; }
 };
 
-/** —— 需要你实现/打通的钩子 —— 
- * 从该索引的辅助表读取 MAX(faiss_id)，写入 *out_max。
- * 若表为空，则返回 0（把 *out_max 设 0）。
- * 需要保证在快照一致或可重复读下读取，避免并发抖动。
+/** --- Hooks to implement or integrate ---
+ * Read MAX(faiss_id) from the index's auxiliary table into *out_max.
+ * For an empty table, report a maximum of 0 by setting *out_max to 0.
+ * Use a consistent snapshot or repeatable read to avoid inconsistent concurrent reads.
  *
- * @return DB_SUCCESS / 其他错误
+ * @return DB_SUCCESS or another error code
  */
 dberr_t vec_aux_select_max_id(trx_t* trx, dict_index_t* index, uint64_t* out_max, bool* empty);

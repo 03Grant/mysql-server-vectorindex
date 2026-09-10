@@ -18,7 +18,7 @@
   #include "ut0dbg.h"     // ut_ad
 #endif
 
-// 你可换成自己的日志设施
+// Replace with another logging facility if needed.
 namespace { inline void log_info(const char* msg)  { ib::info() << msg;  }
            inline void log_warn(const char* msg)  { ib::warn() << msg; } }
 
@@ -90,7 +90,7 @@ inline bool vec_index_last_uint64(dict_index_t *sec_index, uint64_t *value_out) 
 
 }  // namespace
 
-// ==================== 对外方法 ====================
+// ==================== Public methods ====================
 
 dberr_t vec_id_allocator_t::recover_from_aux(trx_t* trx, dict_index_t* index) {
   if (inited) return DB_SUCCESS;
@@ -106,7 +106,7 @@ dberr_t vec_id_allocator_t::recover_from_aux(trx_t* trx, dict_index_t* index) {
     return e;
   }
 
-  // next = max；若表空（max=0）也安全（初始从 0 开始）
+  // next = max; safe for an empty table (max=0), since allocation starts at 0.
   if (max_id == std::numeric_limits<uint64_t>::max()) {
     log_warn("VECINDEX: aux MAX(faiss_id) at UINT64_MAX; cannot continue");
     return DB_ERROR;
@@ -126,13 +126,13 @@ dberr_t vec_id_allocator_t::reserve(uint64_t k, uint64_t* start) {
 
   std::lock_guard<std::mutex> lk(mu);
   if (!inited) {
-    // 你也可以在这里直接返回错误，或触发一次 recover_from_aux(nullptr, index)
-    // 为了稳妥，这里返回错误，让上层确保先 recover。
+    // Either return an error here or call recover_from_aux(nullptr, index).
+    // Return an error here so the caller must ensure recovery runs first.
     log_warn("VECINDEX: reserve() called before recover_from_aux()");
     return DB_ERROR;
   }
 
-  // 溢出防护：next + k - 1 <= UINT64_MAX
+  // Overflow guard: next + k - 1 <= UINT64_MAX
   if (k > std::numeric_limits<uint64_t>::max() - next) {
     log_warn("VECINDEX: reserve() overflow");
     return DB_ERROR;
@@ -143,7 +143,7 @@ dberr_t vec_id_allocator_t::reserve(uint64_t k, uint64_t* start) {
   return DB_SUCCESS;
 }
 
-// ==================== 需要你打通的钩子（占位） ====================
+// ==================== Hooks to integrate (placeholders) ====================
 
 dberr_t vec_aux_select_max_id(trx_t* /*trx*/, dict_index_t* index, uint64_t* out_max,
                               bool* empty) {

@@ -225,7 +225,7 @@ dberr_t vec_aux_create_table(trx_t* trx,
 }
 
 static inline uint64_t rowid6_to_u64(const byte rowid6[6]) {
-  // InnoDB storage 用 big-endian。手动拼或先放入8字节buffer高位为0。
+  // InnoDB uses big-endian storage. Assemble the value or use an 8-byte buffer with zeroed high bytes.
   uint64_t v = 0;
   v |= (uint64_t)rowid6[0] << 40;
   v |= (uint64_t)rowid6[1] << 32;
@@ -236,9 +236,9 @@ static inline uint64_t rowid6_to_u64(const byte rowid6[6]) {
   return v;
 }
 
-// 把 u64 写成 InnoDB storage 序的 8 字节（用于绑定 BIGINT）
+// Write a u64 as 8 bytes in InnoDB storage order for BIGINT binding.
 static inline void u64_to_storage8(uint64_t v, byte out[8]) {
-  mach_write_to_8(out, (ulonglong)v); // InnoDB自带：写 big-endian 8B
+  mach_write_to_8(out, (ulonglong)v); // InnoDB helper: write 8 big-endian bytes.
 }
 
 
@@ -1315,13 +1315,13 @@ static dberr_t vec_create_one_index_dd_tables(const dict_index_t* index)
   ut_ad(index != nullptr);
   ut_ad(index->table != nullptr);
   ib::warn() << "VECINDEX: DD register step 1! ";
-  // 如果你有 DICT_VECINDEX 标志，做个断言
+  // Assert the DICT_VECINDEX flag if available.
   ut_ad(index->type & DICT_VECINDEX);
 
   std::string full_name = vec_aux_full_name(index);
 
   ib::warn() << "VECINDEX: DD register step 2! full_name=" << full_name;
-  // 打开 InnoDB 内部已创建好的物理表（只在内存里用，不登记/修改）
+  // Open the physical table already created by InnoDB, for in-memory use without registration or modification.
   dict_table_t* aux = dd_table_open_on_name_in_mem(full_name.c_str(), false);
   if (aux == nullptr) {
       ib::warn() << "VECINDEX: DD register failed; cannot open aux table in mem: "
@@ -1329,7 +1329,7 @@ static dberr_t vec_create_one_index_dd_tables(const dict_index_t* index)
       return DB_FAIL;
   }
   ib::warn() << "VECINDEX: DD register step 3! ";
-  // 把 aux 的定义写进 SQL-DD（实现应仿 dd_create_fts_index_table）
+  // Write the auxiliary table definition to SQL-DD, following dd_create_fts_index_table.
   bool ok = dd_create_vec_index_table(index->table, aux);
   if (!ok) {
       ib::warn() << "VECINDEX: dd_create_vec_index_table() failed for " << full_name;
@@ -2174,17 +2174,17 @@ dberr_t vec_create_index_dd_tables(dict_table_t *table) {
 }
 
 
-/** 按“基表聚簇索引复制列定义”的规则创建一张 VEC 附属表。
-    - 显式主键：逐列复制 mtype/prtype/len/列名，作为 PRIMARY KEY 列集
-    - 无显式主键（GEN_CLUST_INDEX）：使用 row_id BIGINT UNSIGNED 作为 PRIMARY KEY
-    - 额外加一列：seg_id VARCHAR(256)
-    - 表的 flags 继承自基表（行格式/压缩策略一致）
-  @return 成功返回新表指针；失败返回 nullptr（并设置 trx->error_state） */
+/** Create a VEC auxiliary table by copying the base table's clustered index column definitions.
+    - Explicit primary key: copy each column's mtype/prtype/len/name into the PRIMARY KEY.
+    - No explicit primary key (GEN_CLUST_INDEX): use row_id BIGINT UNSIGNED as the PRIMARY KEY.
+    - Add one extra column: seg_id VARCHAR(256).
+    - Inherit flags from the base table to preserve row format and compression settings.
+  @return The new table on success, or nullptr on failure with trx->error_state set. */
 static dict_table_t* vec_create_one_index_table_pk_compatible(
     trx_t*              trx,
-    const dict_index_t* vec_index,         // 该向量索引（含指向基表的 table*）
+    const dict_index_t* vec_index,         // The vector index, including a table* pointing to the base table
     const char*         base_table_name,   // "db/table"
-    table_id_t          /*table_id*/,      // 未直接使用；表名由 aux_name 唯一化
+    table_id_t          /*table_id*/,      // Not used directly; aux_name makes the table name unique.
     const std::string&  aux_name)          // "I_VEC_<tid>_<iid>"
 {
   ut_ad(trx != nullptr);
@@ -2205,7 +2205,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
 
   mem_heap_t* heap = mem_heap_create(2048, UT_LOCATION_HERE);
 
-  // 1) 计算附属表内部全名：db/aux
+  // 1) Compute the auxiliary table's full internal name: db/aux.
   ib::warn() << "vec_create_one_index_table_pk_compatible: compute full name";
 
   const std::string full_name = vec_make_aux_name(base_table_name, aux_name);
@@ -2216,7 +2216,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     return nullptr;
   }
 
-  // 2) 计算主键列数 / 是否使用 row_id
+  // 2) Determine the primary key column count and whether to use row_id.
   ib::warn() << "vec_create_one_index_table_pk_compatible: compute PK columns";
   bool use_row_id = false;
   ulint pk_n_fields = 0;
@@ -2225,7 +2225,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     pk_n_fields  = 1;                  // row_id
   } else {
     use_row_id   = false;
-    pk_n_fields  = clust->n_uniq;    // 显式主键列数
+    pk_n_fields  = clust->n_uniq;    // Number of explicit primary key columns
   }
 
   ib::warn() << "VECINDEX: creating aux table " << full_name
@@ -2233,11 +2233,11 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
              << " as PRIMARY KEY, pk_n_fields=" << pk_n_fields
              << " clustered index name=" << (clust->name ? clust->name : "(null)");
 
-  // 3) 准备 dict_mem_table_create() 所需参数
+  // 3) Prepare arguments for dict_mem_table_create().
   const ulint     n_cols       = pk_n_fields + 1;  // + seg_id
 
 
-  // 4) in-mem 创建表对象
+  // 4) Create the in-memory table object.
   dict_table_t* new_table = vec_create_in_mem_aux_table(full_name.c_str(), base, n_cols);
 
   if (!new_table) {
@@ -2246,7 +2246,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     return nullptr;
   }
 
-  // 5) 加列：先按主键列拷贝，再追加 seg_id
+  // 5) Copy primary key columns, then append seg_id.
   if (use_row_id) {
     // row_id BIGINT UNSIGNED NOT NULL
     dict_mem_table_add_col(new_table, heap,
@@ -2276,12 +2276,12 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
                              colname,
                              c->mtype,   // DATA_INT / DATA_VARMYSQL / ...
                              c->prtype,  // NOT_NULL / BINARY / charset bits
-                             c->len,     // 变长用最大长度
+                             c->len,     // Use the maximum length for variable-length columns.
                              true);
     }
   }
 
-  // 追加 seg_id VARCHAR(256) NOT NULL
+  // Append seg_id VARCHAR(256) NOT NULL.
   const ulint seg_long =
       (kVecSegmentIdMaxLen > 255) ? DATA_LONG_TRUE_VARCHAR : 0;
   const ulint seg_prtype = dtype_form_prtype(
@@ -2294,7 +2294,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
                          static_cast<ulint>(kVecSegmentIdMaxLen),
                          true);
 
-  // 6) 物理建表
+  // 6) Create the physical table.
   dberr_t err = row_create_table_for_mysql(new_table, nullptr, nullptr, trx, nullptr);
   if (err != DB_SUCCESS) {
     ib::warn() << "VECINDEX: row_create_table_for_mysql failed for " << full_name
@@ -2304,7 +2304,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     return nullptr;
   }
 
-  // 7) 建 PRIMARY（聚簇索引）
+  // 7) Create PRIMARY (the clustered index).
   {
     dict_index_t* pk = dict_mem_index_create(
         full_name.c_str(),
@@ -2318,8 +2318,8 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
     } else {
       for (ulint i = 0; i < pk_n_fields; ++i) {
         dict_field_t* f = clust->get_field(i);
-        ulint prefix = f->prefix_len;          // 复制原前缀长度
-        bool asc     = f->is_ascending;      // 复制升降序（若你版本没有该方法，按字段 flag 取）
+        ulint prefix = f->prefix_len;          // Copy the original prefix length.
+        bool asc     = f->is_ascending;      // Copy sort direction; use field flags if the accessor is unavailable.
         pk->add_field(f->name, prefix, asc);
       }
     }
@@ -2365,7 +2365,7 @@ static dict_table_t* vec_create_one_index_table_pk_compatible(
   return new_table;
 }
 
-// --- 入口 ---
+// --- Entry point ---
 
 dberr_t vec_create_index_tables_low(trx_t* trx,
                                     dict_index_t* index,
@@ -2374,7 +2374,7 @@ dberr_t vec_create_index_tables_low(trx_t* trx,
 {
     if (!trx || !index || !table_name) return DB_FAIL;
 
-    // 唯一且可追溯的附属表名：I_VEC_<table_id>_<index_id>
+    // Unique, traceable auxiliary table name: I_VEC_<table_id>_<index_id>
     const std::string prefix = vec_aux_full_name(index);
     std::string aux = vec_aux_suffix_from_full(prefix);
     if (aux.empty()) {
@@ -2392,7 +2392,7 @@ dberr_t vec_create_index_tables_low(trx_t* trx,
                     << " (index_id=" << (unsigned long long)index->id << ")";
     if (!t) return DB_FAIL;
 
-    index->fill_dd = true; // 与 FTS 逻辑一致：请求填充 DD
+    index->fill_dd = true; // Request DD population, following the FTS logic.
 
     ib::warn() << "VECINDEX: created aux table " << prefix
                 << " for base=" << table_name

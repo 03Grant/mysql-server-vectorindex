@@ -46,7 +46,7 @@ inline bool vec_pk_columns_ready(const std::vector<vec_pk_column_t> &cols,
   return pk_fields > 0 && cols.size() >= pk_fields;
 }
 
-// —— 抽取向量字节并校验 ——
+// --- Extract and validate vector bytes ---
 static bool vec_extract_and_validate(const dfield_t *field, unsigned dim,
                                      std::vector<float> &out) {
   if (field == nullptr || dim == 0 || dfield_is_null(field)) {
@@ -76,7 +76,7 @@ static bool vec_extract_and_validate(const dfield_t *field, unsigned dim,
 
 }  // namespace
 
-// —— 聚簇主键逐列拷贝 ——
+// --- Copy the clustered primary key column by column ---
 bool vec_capture_pk_columns(dict_table_t *table, const dtuple_t *row,
                             std::vector<vec_pk_column_t> &out) {
   if (table == nullptr || row == nullptr) {
@@ -274,7 +274,7 @@ std::string vec_format_pk_columns_debug(const std::vector<vec_pk_column_t>& cols
   return os.str();
 }
 
-// —— 事务 ctx 管理 ——
+// --- Transaction context management ---
 vec_trx_ctx_t *vec_get_or_create_trx_ctx(trx_t *trx) {
   if (trx == nullptr) {
     return nullptr;
@@ -403,7 +403,7 @@ dberr_t vec_insert_one_row(trx_t *trx, dict_table_t *table,
   return DB_SUCCESS;
 }
 
-// —— 单行立即写入向量索引与辅助表 ——
+// --- Immediately write a row to the vector index and auxiliary tables ---
 int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
                         const dfield_t *vector_field, const unsigned dim,
                         const dtuple_t *row_tuple) {
@@ -436,7 +436,7 @@ int vec_collect_one_row(trx_t *trx, dict_table_t *table, dict_index_t *vindex,
   std::vector<float> vec_values;
   if (!vec_extract_and_validate(vector_field, dim, vec_values)) {
     trx->error_state = DB_ERROR;
-    return -2;  // 长度/数据非法
+    return -2;  // Invalid length or data
   }
 
   std::vector<vec_pk_column_t> pk_columns;
@@ -632,7 +632,7 @@ dberr_t vec_insert_rows_no_aux(
 
 
 
-// —— DDL 路径：只抽取向量与主键，延后统一 flush ——
+// --- DDL path: extract vectors and primary keys, deferring the combined flush ---
 int vec_collect_one_row_no_aux(trx_t *trx, dict_table_t *table,
                                dict_index_t *vindex,
                                const dfield_t *vector_field,
@@ -670,7 +670,7 @@ int vec_collect_one_row_no_aux(trx_t *trx, dict_table_t *table,
   std::vector<float> vec_values;
   if (!vec_extract_and_validate(vector_field, dim, vec_values)) {
     trx->error_state = DB_ERROR;
-    return -2;  // 长度/数据非法
+    return -2;  // Invalid length or data
   }
 
   std::vector<vec_pk_column_t> pk_columns;

@@ -48,10 +48,10 @@ que_t* vec_parse_sql(const char* table_name_or_null,
   MDL_ticket* mdl = nullptr;
   dict_table_t* pre = nullptr;
 
-  // 1) 包装 SQL
-  char* full = ut_str3cat(vec_sql_begin, sql_body, vec_sql_end); // 或加你自己的 end
+  // 1) Wrap the SQL.
+  char* full = ut_str3cat(vec_sql_begin, sql_body, vec_sql_end); // Or supply a custom SQL suffix.
 
-  // 2) 预开表（可选，但强烈推荐）
+  // 2) Pre-open tables (optional but strongly recommended).
   if (table_name_or_null) {
     pre = dd_table_open_on_name_in_mem(table_name_or_null, false);
     if (!pre) {
@@ -59,15 +59,15 @@ que_t* vec_parse_sql(const char* table_name_or_null,
     }
   }
 
-  // 3) 解析（串行化）
+  // 3) Parse with serialized access.
   mutex_enter(&pars_mutex);
   que_t* graph = pars_sql(info, full);
   mutex_exit(&pars_mutex);
 
-  // 4) 收尾
+  // 4) Clean up.
   if (pre) dd_table_close(pre, thd, &mdl, false);
   ut::free(full);
-  return graph; // 之后用 fts_eval_sql(trx, graph) 执行；不用时 que_graph_free(graph)
+  return graph; // Execute with fts_eval_sql(trx, graph); release with que_graph_free(graph).
 }
 
 
@@ -75,7 +75,7 @@ que_t* vec_parse_sql(const char* table_name_or_null,
     Returns DB_SUCCESS or an error code. */
 dberr_t vec_eval_sql(trx_t* trx, que_t* graph) {
   ut_ad(graph != nullptr);
-  ut_ad(trx != nullptr);               // 调用方负责提供事务
+  ut_ad(trx != nullptr);               // The caller must provide a transaction.
 
   if (trx->error_state != DB_SUCCESS &&
       trx->error_state != DB_LOCK_WAIT_TIMEOUT) {
@@ -90,18 +90,18 @@ dberr_t vec_eval_sql(trx_t* trx, que_t* graph) {
 
     trx->error_state = DB_SUCCESS;
 
-    graph->trx = trx;                  // 用哪个事务执行
+    graph->trx = trx;                  // Set the transaction used for execution.
     graph->fork_type = QUE_FORK_MYSQL_INTERFACE;
 
     que_thr_t* thr = que_fork_start_command(graph);
-    ut_a(thr);                         // 入口线程必须建好
+    ut_a(thr);                         // The entry thread must exist.
 
-    que_run_threads(thr);              // 同步执行直至完成/报错
+    que_run_threads(thr);              // Run synchronously until completion or error.
     err = trx->error_state;
     if (err != DB_LOCK_WAIT_TIMEOUT) {
       break;
     }
   }
 
-  return err;                          // 成败看事务的 error_state
+  return err;                          // The transaction's error_state determines success or failure.
 }

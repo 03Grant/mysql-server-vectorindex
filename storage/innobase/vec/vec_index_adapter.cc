@@ -513,7 +513,7 @@ int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n) {
   std::lock_guard<std::shared_mutex> lk(ctx.mu);
   vec_index_segment_t *seg = ctx.mutable_segment();
   if (!ctx.inited || seg == nullptr || !seg->index) return -1;
-  // 假设 dim 匹配，由你在外面保证；FAISS 可能会抛异常，后续你可以做 try/catch
+  // The caller must ensure matching dimensions; FAISS may throw, so exception handling may be needed.
   seg->index->add(n, xb, nullptr);
   return n;
 }
@@ -555,9 +555,9 @@ int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
     trx_id_t trx_id;
   };
 
-  // MVP：按“每个查询”循环，便于把各段结果做 k-way 合并
+  // MVP: iterate over queries to simplify k-way merging of segment results.
   for (size_t qi = 0; qi < nq; ++qi) {
-    // 收集所有段的候选
+    // Collect candidates from all segments.
     std::vector<Candidate> cand;
     cand.reserve(nseg * k);
 
@@ -579,7 +579,7 @@ int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
 
       seg->search(1, qvec, k, I.data(), D.data(), params);
 
-      // 可能返回 -1 表示候选不足
+      // May return -1 when there are not enough candidates.
       for (size_t t = 0; t < k; ++t) {
         if (I[t] >= 0) {
           trx_id_t trx_id = 0;
@@ -595,9 +595,9 @@ int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
       }
     }
 
-    // cand 可能 < k（所有段都少），也可能 > k（段数多）
+    // cand may be < k with too few candidates, or > k with many segments.
     if (cand.empty()) {
-      // 全部填充为 “空”
+      // Fill all entries with empty values.
       std::fill_n(D_out + qi * k, k, prefer_small ? std::numeric_limits<float>::infinity()
                                                   : -std::numeric_limits<float>::infinity());
       std::fill_n(I_out + qi * k, k, int64_t(-1));
@@ -609,7 +609,7 @@ int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
       continue;
     }
 
-    // 取全局 top-K
+    // Select the global top-K.
     if (cand.size() > k) {
       if (prefer_small) {
         std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
@@ -631,7 +631,7 @@ int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
       // if cand.size() < k，fill others with invalid values
     }
 
-    // 写回输出
+    // Write the output.
     float*       Dq = D_out + qi * k;
     int64_t* Iq = I_out + qi * k;
     std::string* Sq = S_out != nullptr ? S_out + qi * k : nullptr;
@@ -648,7 +648,7 @@ int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
         Tq[t] = cand[t].trx_id;
       }
     }
-    // 不足部分用“空”填充
+    // Pad missing entries with empty values.
     for (size_t t = m; t < k; ++t) {
       Dq[t] = prefer_small ? std::numeric_limits<float>::infinity()
                            : -std::numeric_limits<float>::infinity();

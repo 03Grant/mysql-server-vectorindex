@@ -17,7 +17,7 @@ struct dtuple_t;
 #include "vec_index_runtime.h"   // vec_index_ctx_t / params
 #include "vec_params.h"
 
-// 聚簇主键的单列快照（按原始字节存储）
+// Snapshot of one clustered primary key column, stored as raw bytes.
 struct vec_pk_column_t {
   bool is_null{false};
   ulint mtype{0};
@@ -49,12 +49,12 @@ struct vec_update_undo_entry_t {
   bool          in_bucket{false};
 };
 
-// 事务级上下文（挂到 trx_t；你可以用 trx->user_thd() 侧链保存）
+// Transaction context attached to trx_t; may be stored via trx->user_thd().
 struct vec_trx_ctx_t {
   trx_t* owner{nullptr};
   std::mutex mu;
   /**/
-  // 2/18/2026 Not used now! 删除请求的 pk（在本事务内收集）
+  // 2/18/2026 Not used now! Primary keys of delete requests collected in this transaction.
   std::unordered_map<dict_index_t*, std::unordered_set<std::string>>
       deleted_pks_in_trx;
   // Inserted vector IDs to mark on rollback.
@@ -65,7 +65,7 @@ struct vec_trx_ctx_t {
   std::unordered_set<dict_index_t*> touched_indexes;
 };
 
-// ==== 对外 API ====
+// ==== Public API ====
 
 bool vec_capture_pk_columns(dict_table_t* table,
                             const dtuple_t* row,
@@ -83,17 +83,17 @@ std::string vec_format_pk_columns_debug(
     ulint pk_fields,
     size_t preview_bytes = 32);
 
-// 保证事务上有一个 vec_trx_ctx，可复用
+// Ensure the transaction has a reusable vec_trx_ctx.
 vec_trx_ctx_t* vec_get_or_create_trx_ctx(trx_t* trx);
 
-// 在“插入/更新行”时调用：抽取向量 + 主键快照 + 立即写入向量索引与辅助表
-// 不检查度量前处理，不改动字节，只校验长度与维度。
+// Called on row insert/update: extract the vector and primary key snapshot, then write to the vector index and auxiliary tables immediately.
+// Only validate length and dimensions; do not check metric preprocessing or modify bytes.
 int vec_collect_one_row(trx_t*           trx,
                         dict_table_t*    table,
                         dict_index_t*    vindex,
-                        const dfield_t*  vector_field,   // 该索引对应列的 dfield
+                        const dfield_t*  vector_field,   // The dfield for this index's column
                         const unsigned   dim,
-                        const dtuple_t*  row_tuple);     // 当前行的 InnoDB tuple
+                        const dtuple_t*  row_tuple);     // The current row's InnoDB tuple
 
 // DDL path: extract vector + PK only. The caller batches rows and flushes them
 // into the mutable index later.
@@ -135,7 +135,7 @@ dberr_t vec_insert_rows_no_aux(
     size_t n,
     const std::vector<vec_ddl_aux_row_t>& rows);
 
-// 提交成功或回滚时清空
+// Clear after a successful commit or rollback.
 void vec_trx_ctx_clear(vec_trx_ctx_t* ctx);
 
 

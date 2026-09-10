@@ -8,20 +8,20 @@
 
 namespace {
 
-// 去两端空白
+// Trim leading and trailing whitespace.
 inline void trim(std::string& x) {
   auto not_space = [](int ch){ return !std::isspace(ch); };
   x.erase(x.begin(), std::find_if(x.begin(), x.end(), not_space));
   x.erase(std::find_if(x.rbegin(), x.rend(), not_space).base(), x.end());
 }
 
-// 转小写（就地）
+// Convert to lowercase in place.
 inline void to_lower(std::string& x) {
   std::transform(x.begin(), x.end(), x.begin(),
                  [](unsigned char c){ return std::tolower(c); });
 }
 
-// 解析整数（支持十进制）。失败返回 false
+// Parse a decimal integer; return false on failure.
 template <typename IntT>
 bool parse_int(const std::string& s, IntT& out) {
   if (s.empty()) return false;
@@ -36,7 +36,7 @@ bool parse_int(const std::string& s, IntT& out) {
     } else {
       long long t = std::stoll(s, &pos, 10);
       if (pos != s.size()) return false;
-      // 简单边界
+      // Basic bounds check
       if constexpr (std::is_unsigned_v<IntT>) {
         if (t < 0) return false;
       }
@@ -55,11 +55,11 @@ dberr_t vec_params_from_string(const std::string& s,
                                std::string* err)
 {
   if (!out) return DB_FAIL;
-  *out = vec_params_t{};  // 默认：type=FLAT, metric=L2, threads=16
+  *out = vec_params_t{};  // Defaults: type=FLAT, metric=L2, threads=16
 
   if (s.empty()) {
     if (err) *err = "empty parameter string";
-    return DB_FAIL;  // 你要求 type/dim/size 必填
+    return DB_FAIL;  // type/dim/size are required.
   }
 
   std::string line = s;
@@ -184,13 +184,13 @@ dberr_t vec_params_from_string(const std::string& s,
       out->hnsw_m = v;
 
     } else if (key_l == "nlist-search" || key_l == "nprobe") {
-      // 先忽略（运行期搜索参数），不影响 DDL
+      // Ignore runtime search parameters here; they do not affect DDL.
     } else {
-      // 未知键忽略（可选：累计 warning）
+      // Ignore unknown keys; warnings could be collected here.
     }
   }
 
-  // 必填校验
+  // Validate required parameters.
   if (!seen_type || !seen_dim || !seen_size) {
     if (err) {
       *err = "required fields missing:"
@@ -202,13 +202,13 @@ dberr_t vec_params_from_string(const std::string& s,
   }
   static_cast<void>(seen_backend);
 
-  // 默认值
+  // Defaults
   if (out->build_threads <= 0) out->build_threads = 16;
 
-  // 类型特定校验/默认
+  // Type-specific validation and defaults
   switch (out->type_tag) {
     case VEC_T_FLAT:
-      // 无附加要求
+      // No additional requirements.
       break;
 
     case VEC_T_HNSW:
@@ -229,7 +229,7 @@ dberr_t vec_params_from_string(const std::string& s,
         return DB_FAIL;
       }
       {
-        // 你要求：nbits * m 必须整除 dim
+        // nbits * m must divide dim exactly.
         const uint64_t prod = static_cast<uint64_t>(out->nbits) *
                               static_cast<uint64_t>(out->m);
         if (prod == 0 || (out->dim % prod) != 0) {
