@@ -30,7 +30,7 @@ dberr_t vec_open_aux_table_for_thd(dict_index_t* idx, THD *thd,
                                    vec_aux_table_handle *handle);
 void vec_close_aux_table_for_thd(THD *thd, vec_aux_table_handle *handle);
 
-// 创建/销毁（只 new，不加向量）
+// Create/destroy the index; creation does not add vectors.
 bool vec_create(vec_index_ctx_t& ctx, const vec_params_t& p);
 
 // Drop some index in the context(maybe because of index merge), drop in_mem_index is not allowed unless allow_drop_mutable is true.
@@ -40,8 +40,8 @@ bool vec_drop_index(vec_index_ctx_t& ctx, size_t seg_idx, bool allow_drop_mutabl
 
 void vec_destroy(vec_index_ctx_t* ctx);
 
-// 最小检索/插入（后面你再接入 InnoDB 行数据）
-int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   // 添加 n 向量
+// Basic search/insertion API; InnoDB row integration can be added later.
+int vec_add(vec_index_ctx_t& ctx, const float* xb, size_t n);                   // Add n vectors
 
 int vec_add_with_ids(vec_index_ctx_t& ctx, const float* xb, const int64_t* ids, size_t n);
 
@@ -52,4 +52,4 @@ int vec_search(vec_index_ctx_t& ctx, const vec_index_version_t& ver,
            const float* q, size_t nq,
            size_t k, float* distances, int64_t* labels, std::string* segments,
            trx_id_t* trx_ids,
-           const VecRuntimeSearchParams* params = nullptr);                   // 召回
+           const VecRuntimeSearchParams* params = nullptr);                   // Search

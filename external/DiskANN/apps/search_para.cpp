@@ -76,7 +76,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const std::vector<std::string> &query_filters, const uint32_t segments, const bool use_reorder_data = false)
 {
 
-    // 要修改为对第i个索引能加载第i个索引的信息
+    // TODO: Load the corresponding metadata for each index i.
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
         diskann::cout << "beamwidth to be optimized for each L value" << std::flush;
@@ -333,7 +333,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 //         std::vector<uint64_t> query_result_ids_64(recall_at * query_num);
 //         auto s = std::chrono::high_resolution_clock::now();
 
-//         // 需要对总共n个索引进行两种策略的搜索
+//         // Search all n indexes using both strategies.
 
 // #pragma omp parallel for schedule(dynamic, 1)
 //         for (int64_t i = 0; i < (int64_t)query_num; i++)

@@ -8,7 +8,7 @@
 #include <vector>
 #include <shared_mutex>
 
-// 事务提交钩子里调用：清理事务上下文并触发必要的 rotate 任务
+// Called from the commit hook: clear the transaction context and trigger any required rotation tasks.
 dberr_t vec_on_trx_commit(trx_t* trx) {
   if (trx == nullptr) {
     ib::warn() << "VECINDEX: vec_on_trx_commit called with null trx_t";
@@ -28,7 +28,7 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
 
   std::vector<dict_index_t*> flushed_indexes;
 
-  // 成功后清空缓冲
+  // Clear the buffer on success.
   vec_trx_ctx_clear(tctx);
 
   // If exceed size, then submit tasks.
@@ -71,7 +71,7 @@ dberr_t vec_on_trx_commit(trx_t* trx) {
   return DB_SUCCESS;
 }
 
-// 回滚路径
+// Rollback path
 void vec_on_trx_rollback(trx_t* trx) {
   auto* tctx = vec_lookup_trx_ctx(trx);
   if (tctx != nullptr) {

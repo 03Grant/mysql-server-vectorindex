@@ -9,7 +9,7 @@
 static inline faiss::MetricType vec_to_faiss_metric(uint8_t metric_tag) {
   switch (metric_tag) {
     case VEC_M_IP:     return faiss::METRIC_INNER_PRODUCT;
-    case VEC_M_COSINE: return faiss::METRIC_INNER_PRODUCT; // 训练/查询时自行单位化；构造仍用 IP
+    case VEC_M_COSINE: return faiss::METRIC_INNER_PRODUCT; // Normalize during training/querying; construct with inner product.
     case VEC_M_L2:
     default:           return faiss::METRIC_L2;
   }
@@ -133,11 +133,11 @@ std::unique_ptr<IVectorIndex> vec_make_faiss_index(const vec_params_t& p) {
     }
 
     case VEC_T_IVFFLAT: {
-      // 注意：IVF 构造函数不会接管 unique_ptr 所有权；
-      // 若让 IVF 负责销毁量化器，需传 raw* 并设置 own_fields=true。
+      // The IVF constructor does not take ownership of a unique_ptr;
+      // pass a raw pointer and set own_fields=true to let IVF delete the quantizer.
       auto* quant = new faiss::IndexFlat(p.dim, metric);
       auto ivf = std::make_unique<faiss::IndexIVFFlat>(quant, p.dim, p.nlist, metric);
-      ivf->own_fields = true; // IVF 负责 delete quant
+      ivf->own_fields = true; // IVF owns and deletes quant.
       index = std::move(ivf);
       break;
     }
@@ -159,7 +159,7 @@ std::unique_ptr<IVectorIndex> vec_make_faiss_index(const vec_params_t& p) {
     }
 
     default:
-      // fallback：给个 FLAT，保证不崩
+      // Fallback to FLAT to avoid failure.
       index = std::make_unique<faiss::IndexFlat>(p.dim, metric);
       break;
   }

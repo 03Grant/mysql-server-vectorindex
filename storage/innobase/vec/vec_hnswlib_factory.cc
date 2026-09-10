@@ -589,7 +589,7 @@ class HnswlibVectorIndex : public IVectorIndex {
 
 std::unique_ptr<IVectorIndex> vec_make_hnswlib_index(const vec_params_t& p) {
   if (p.type_tag != VEC_T_HNSW && p.type_tag != VEC_T_FLAT) {
-    return nullptr; // hnswlib 只支持 HNSW 或 Flat (bruteforce)
+    return nullptr; // hnswlib only supports HNSW or Flat (brute force).
   }
   auto space = make_space(p);
   if (p.type_tag == VEC_T_FLAT) {

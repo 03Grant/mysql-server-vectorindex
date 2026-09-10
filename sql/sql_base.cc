@@ -10476,8 +10476,8 @@ int setup_is_ann_funcs(const THD *thd, Query_block *select){
     TABLE *table = ann_func->table();
     const uint keyno = ann_func->keyno();
 
-    // 解析阶段应该已经绑定好了表/索引。如果此处为空，说明语义校验出了问题，
-    // 直接报错并终止准备流程。
+    // The parser should have bound the table/index. A null value indicates
+    // a semantic validation failure; report an error and abort preparation.
     if (table_ref == nullptr || table == nullptr || table->s == nullptr) {
       sql_print_warning("setup_is_ann_funcs: table is nullptr");
       my_error(ER_WRONG_ARGUMENTS, MYF(0), ann_func->func_name());
@@ -10497,8 +10497,8 @@ int setup_is_ann_funcs(const THD *thd, Query_block *select){
       return 1;
     }
 
-    // 如果你后来实现了更精细的准备逻辑（例如 ann_func->fix_index(thd)），
-    // 可以在这里调用：
+    // If more detailed preparation is implemented (e.g. ann_func->fix_index(thd)),
+    // call it here:
     // if (ann_func->fix_index(thd)) return 1;
   }
 

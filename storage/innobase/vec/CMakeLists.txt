@@ -87,7 +87,7 @@ if (NOT _VECINDEX_LIBRARIES)
   message(FATAL_ERROR "No vector backend target was found for linking.")
 endif()
 
-# 链接所有收集到的库
+# Link all collected libraries.
 target_link_libraries(innobase_vec PUBLIC ${_VECINDEX_LIBRARIES})
 add_dependencies(innobase_vec GenError)
 

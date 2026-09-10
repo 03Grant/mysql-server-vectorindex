@@ -23,11 +23,11 @@ enum : uint8_t {
   VEC_M_COSINE = 2
 };
 
-// 纯 POD，适合放到 mem_heap 里；不要 std::string
+// Plain POD for allocation on mem_heap; do not use std::string.
 struct vec_params_t {
   BackendType backend{BackendType::Faiss};
-  uint8_t   type_tag{VEC_T_FLAT};   // 上面枚举
-  uint8_t   metric_tag{VEC_M_L2};   // 上面枚举
+  uint8_t   type_tag{VEC_T_FLAT};   // Enum defined above
+  uint8_t   metric_tag{VEC_M_L2};   // Enum defined above
   uint32_t  dim{0};
   uint64_t  size{0};             // Size to flush, build immutable index when exceeded
 
@@ -38,7 +38,7 @@ struct vec_params_t {
   int32_t   m{0}, nbits{0};  // PQ
   int32_t   hnsw_m{32}, efConstruction{128}; // HNSW
 };
-// 简单占位（你后面可改成从 DD / JSON 解析）
+// Placeholder; may later parse parameters from DD / JSON.
 dberr_t vec_params_from_string(const std::string& s,
                                vec_params_t* out,
                                std::string* err = nullptr);
