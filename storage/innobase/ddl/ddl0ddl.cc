@@ -40,6 +40,7 @@ Created 2020-11-01 by Sunny Bains. */
 #include "storage/innobase/vec/vec_params.h"
 #include "storage/innobase/vec/vec_txn_buf.h"
 #include "storage/innobase/vec/vec_ingest.h"
+#include "storage/innobase/vec/vec_tasks.h"
 
 /* Ignore posix_fadvise() on those platforms where it does not exist */
 #if defined _WIN32
@@ -615,7 +616,15 @@ dberr_t Cursor::finish(dberr_t err) noexcept {
 
   if (vec_trx_has_work(m_ctx.m_trx)) {
     err = vec_on_trx_commit(m_ctx.m_trx);
-    if (err != DB_SUCCESS) return err;  
+    if (err != DB_SUCCESS) return err;
+    /* Make ADD VECINDEX durable before the statement returns: block until
+    the initial rotation/flush (if any was triggered) reaches its Committed
+    manifest state. A crash before this point aborts the DDL, so the index
+    never becomes visible half-built. */
+    vec_wait_table_builds_idle(m_ctx.new_table());
+    if (m_ctx.old_table() != m_ctx.new_table()) {
+      vec_wait_table_builds_idle(m_ctx.old_table());
+    }
   }
   
   if (m_ctx.m_fts.m_ptr != nullptr) {

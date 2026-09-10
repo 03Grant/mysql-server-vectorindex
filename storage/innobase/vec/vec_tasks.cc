@@ -2,19 +2,24 @@
 #include "vec_tasks.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <future>
 #include <limits>
+#include <set>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "trx0trx.h"
@@ -524,6 +529,21 @@ class VecBgThdGuard {
   bool owns_trx_{false};
 };
 
+/* Flush a finished segment artifact to stable storage before its Committed
+manifest record is written. Best effort: an unreadable path is skipped (the
+aux-table recovery path remains the safety net). */
+static void vec_fsync_path(const std::string &path) {
+  if (path.empty()) {
+    return;
+  }
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return;
+  }
+  (void)::fsync(fd);
+  (void)::close(fd);
+}
+
 bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
                        vec_index_segment_t *seg) {
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Building index segment in bg.";
@@ -660,7 +680,35 @@ bool vec_bg_build_task(dict_index_t *index, vec_index_ctx_t *ctx,
     }
   }
 
+  /* The Committed manifest record is the flush's commit point: recovery
+  trusts a Committed segment's files, so they must be durable first. */
+  vec_fsync_path(index_path);
+  if (pk_mapping_saved) {
+    vec_fsync_path(mapping_path);
+  }
+
   log_event(VecSegmentState::Committed, pk_mapping_saved);
+
+  /* Entries adopted from segments lost in a previous crash are durable in
+  this committed segment now; retire their manifest entries so future
+  recoveries stop re-ingesting them. Ordered after the Committed record: a
+  crash in between merely re-adopts rows that also exist here, which the
+  query-time PK deduplication tolerates. */
+  std::vector<uint64_t> adopted;
+  {
+    std::unique_lock<std::shared_mutex> seg_lock;
+    if (seg->rw_lock) {
+      seg_lock = std::unique_lock<std::shared_mutex>(*seg->rw_lock);
+    }
+    adopted.swap(seg->adopted_seg_ids);
+  }
+  for (const uint64_t adopted_id : adopted) {
+    if (!vec_meta_append_event(index, ctx->params, adopted_id, 0,
+                               VecSegmentState::Tombstone, "", false)) {
+      ib::warn() << "VECMETA: failed to append Tombstone for adopted seg_id="
+                 << adopted_id;
+    }
+  }
 
   clear_build_flag();
   ib::warn() << "VECINDEX: function::vec_bg_build_task() Finished building index segment.";
@@ -1040,8 +1088,25 @@ void VecTaskManager::process_task(VecBuildTask task) {
   vec_rotate_mem_index_bg(task.index);
 }
 
+/** Rebuild the mutable segment from the auxiliary table after a restart.
+
+Recovers not only the rows born in the persisted mutable segment but also the
+rows of every "lost" birth segment: a segment id below the mutable id whose
+latest manifest state is neither Committed (its flush never completed, so the
+segment file on disk, if any, must be ignored) nor Tombstone (its entries were
+already carried into a committed successor by a flush or merge). Such rows
+survive only in the auxiliary table, and are re-ingested here into the mutable
+segment; the lost ids are recorded as adopted_seg_ids and tombstoned once the
+adopting segment's own flush commits.
+
+@param covered_seg_ids birth ids whose latest manifest state is Committed or
+Tombstone (their entries are durable elsewhere).
+@param manifest_lost_ids non-covered ids that appear in the manifest; adopted
+even when they contribute no rows, so their stale entries get retired. */
 bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
-                                   THD *thd) {
+                                   THD *thd,
+                                   const std::set<uint32_t> &covered_seg_ids,
+                                   const std::vector<uint64_t> &manifest_lost_ids) {
   ib::warn() << "VECMETA: attempting mutable MEM recovery for index "
              << (index != nullptr && index->name ? index->name : "(null)");
 
@@ -1540,6 +1605,9 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
   std::vector<float> xb;
   std::vector<int64_t> ids;
   size_t matched_rows = 0;
+  /* Segment id currently targeted by the indexed aux scan below; starts as
+  the mutable segment and then iterates over the lost birth segments. */
+  std::string scan_target = mem_seg_id;
 
   auto handle_aux_row = [&]() -> bool {
     if (seg_field->is_null()) {
@@ -1556,7 +1624,7 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
     if (row_ptr != nullptr && row_len != 0) {
       row_seg.assign(row_ptr, row_len);
     }
-    if (row_seg != mem_seg_id) {
+    if (row_seg != scan_target) {
       return true;
     }
 
@@ -1628,6 +1696,22 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
     return -1;
   };
 
+  /* Scan targets: the persisted mutable segment id first, then every birth
+  id below it that no Committed or Tombstone manifest entry covers. The
+  latter includes ids with a stale non-Committed entry (flush interrupted by
+  the crash) and ids with no entry at all (crash between the rotation and
+  the first manifest append of the build task). */
+  std::vector<std::string> scan_targets;
+  scan_targets.push_back(mem_seg_id);
+  for (uint32_t cand = 1; cand < seg_id; ++cand) {
+    if (covered_seg_ids.count(cand) == 0) {
+      scan_targets.push_back(vec_segment_id_from_u32(cand));
+    }
+  }
+
+  std::unordered_set<uint64_t> adopted_ids(manifest_lost_ids.begin(),
+                                           manifest_lost_ids.end());
+
   bool used_index = false;
   int seg_key = find_seg_index();
   if (seg_key >= 0) {
@@ -1645,40 +1729,56 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
         } index_guard{aux_h};
 
         const CHARSET_INFO* cs = seg_field->charset();
-        if (seg_field->store(mem_seg_id.c_str(),
-                             static_cast<uint>(mem_seg_id.size()),
-                             cs != nullptr ? cs : &my_charset_bin) != 0) {
-          ib::warn() << "VECMETA: failed to store seg_id key for MEM table '"
-                     << mem_name << "'";
-          return false;
-        }
         std::vector<uchar> seg_key_buf(seg_key_info->key_length);
-        key_copy(seg_key_buf.data(), aux_table->record[0], seg_key_info, 0);
 
-        int rc = aux_h->ha_index_read_map(
-            aux_table->record[0], seg_key_buf.data(),
-            make_prev_keypart_map(seg_key_info->user_defined_key_parts),
-            HA_READ_KEY_EXACT);
-        if (rc == 0) {
-          while (rc == 0) {
-            if (!handle_aux_row()) {
-              return false;
-            }
-            rc = aux_h->ha_index_next_same(aux_table->record[0],
-                                           seg_key_buf.data(),
-                                           seg_key_info->key_length);
-          }
-          if (rc != HA_ERR_KEY_NOT_FOUND && rc != HA_ERR_END_OF_FILE &&
-              rc != HA_ERR_RECORD_IS_THE_SAME) {
-            ib::warn()
-                << "VECMETA: index scan failed for MEM table '" << mem_name
-                << "' rc=" << rc;
+        for (const std::string &target : scan_targets) {
+          scan_target = target;
+          const size_t rows_before = matched_rows;
+
+          if (seg_field->store(target.c_str(),
+                               static_cast<uint>(target.size()),
+                               cs != nullptr ? cs : &my_charset_bin) != 0) {
+            ib::warn() << "VECMETA: failed to store seg_id key for MEM table '"
+                       << mem_name << "'";
             return false;
           }
-        } else if (rc != HA_ERR_KEY_NOT_FOUND && rc != HA_ERR_END_OF_FILE) {
-          ib::warn() << "VECMETA: index read failed for MEM table '"
-                     << mem_name << "' rc=" << rc;
-          return false;
+          key_copy(seg_key_buf.data(), aux_table->record[0], seg_key_info, 0);
+
+          int rc = aux_h->ha_index_read_map(
+              aux_table->record[0], seg_key_buf.data(),
+              make_prev_keypart_map(seg_key_info->user_defined_key_parts),
+              HA_READ_KEY_EXACT);
+          if (rc == 0) {
+            while (rc == 0) {
+              if (!handle_aux_row()) {
+                return false;
+              }
+              rc = aux_h->ha_index_next_same(aux_table->record[0],
+                                             seg_key_buf.data(),
+                                             seg_key_info->key_length);
+            }
+            if (rc != HA_ERR_KEY_NOT_FOUND && rc != HA_ERR_END_OF_FILE &&
+                rc != HA_ERR_RECORD_IS_THE_SAME) {
+              ib::warn()
+                  << "VECMETA: index scan failed for MEM table '" << mem_name
+                  << "' rc=" << rc;
+              return false;
+            }
+          } else if (rc != HA_ERR_KEY_NOT_FOUND && rc != HA_ERR_END_OF_FILE) {
+            ib::warn() << "VECMETA: index read failed for MEM table '"
+                       << mem_name << "' rc=" << rc;
+            return false;
+          }
+
+          if (target != mem_seg_id && matched_rows > rows_before) {
+            const uint32_t adopted_num = vec_segment_id_to_u32(target);
+            if (adopted_num != 0) {
+              adopted_ids.insert(adopted_num);
+              ib::warn() << "VECMETA: adopted " << (matched_rows - rows_before)
+                         << " aux rows from lost seg_id=" << target
+                         << " into mutable segment " << mem_seg_id;
+            }
+          }
         }
         used_index = true;
       } else {
@@ -1692,6 +1792,11 @@ bool vec_recover_mutable_mem_index(dict_index_t *index, vec_index_ctx_t *ctx,
     ib::warn() << "VECMETA: seg_id index unavailable for MEM table '"
                << mem_name << "', aborting MEM recovery";
     return false;
+  }
+
+  {
+    std::lock_guard<std::shared_mutex> lk(ctx->mu);
+    seg->adopted_seg_ids.assign(adopted_ids.begin(), adopted_ids.end());
   }
 
   if (matched_rows == 0) {
@@ -1898,6 +2003,13 @@ class VecMetaLoader {
       ok = false;
     }
 
+    /* Birth ids whose entries are durable elsewhere (Committed segment file
+    or Tombstone after flush/merge carried them forward), and manifest ids
+    whose flush never committed — the latter are recovered from the auxiliary
+    table together with the mutable segment. */
+    std::set<uint32_t> covered_seg_ids;
+    std::vector<uint64_t> manifest_lost_ids;
+
     const std::string base_dir = vec_meta_dirname(meta_path);
     const std::string prefix =
       ctx->index_name_prefix.empty() ? vec_aux_full_name(index)
@@ -1930,12 +2042,19 @@ class VecMetaLoader {
                    << " with state " << static_cast<int>(entry.state)
                    << " and file name '" << entry.file_name << "'";
         if (entry.state == static_cast<uint8_t>(VecSegmentState::Tombstone)) {
+          covered_seg_ids.insert(static_cast<uint32_t>(entry.seg_id));
           continue;
         }
         if (entry.state != static_cast<uint8_t>(VecSegmentState::Committed)) {
+          /* Interrupted flush or merge: any file for this segment may be
+          torn and is never read. A merge target contributes no auxiliary
+          rows under its own id (its sources stay Committed until the target
+          commits), so re-ingesting by birth id is always safe. */
+          manifest_lost_ids.push_back(entry.seg_id);
           continue;
         }
         const uint32_t seg_id_num = static_cast<uint32_t>(entry.seg_id);
+        covered_seg_ids.insert(seg_id_num);
         const std::string seg_id_str = vec_segment_id_from_u32(seg_id_num);
 
         {
@@ -1977,26 +2096,51 @@ class VecMetaLoader {
         }
         
         ib::warn() << "VECMETA: loading segment " << seg_id_num;
-        try {
-          target->load(seg_path);
-        } catch (const std::exception &e) {
-          ok = false;
-          ib::warn() << "VECMETA: failed to load segment file '" << seg_path
-                     << "' error=" << e.what();
-          continue;
-        }
+        const auto load_t0 = std::chrono::steady_clock::now();
 
         auto loaded = std::make_shared<vec_index_segment_t>();
-        loaded->index = std::move(target);
         loaded->index_file_name = seg_path;
         loaded->vecindex_id = seg_id_str;
         loaded->immutable = true;
 
+        /* The PK mapping and the index file deserialize into disjoint
+        objects, so overlap them. */
         const bool expect_pk_map = vec_meta_segment_has_pk_mapping(entry);
         const std::string map_path = vec_vid_pk_mapping_path(seg_path);
+        std::future<bool> pkmap_future;
         if (!map_path.empty()) {
-          const bool map_ok =
-              vec_vid_pk_mapping_load(map_path, &loaded->vid_pk_mapping);
+          vid_pk_mapping_t *map_out = &loaded->vid_pk_mapping;
+          pkmap_future = std::async(std::launch::async, [map_path, map_out]() {
+            return vec_vid_pk_mapping_load(map_path, map_out);
+          });
+        }
+
+        bool index_ok = true;
+        try {
+          target->load(seg_path);
+        } catch (const std::exception &e) {
+          index_ok = false;
+          ib::warn() << "VECMETA: failed to load segment file '" << seg_path
+                     << "' error=" << e.what();
+        }
+
+        bool map_ok = false;
+        if (pkmap_future.valid()) {
+          map_ok = pkmap_future.get();
+        }
+        if (!index_ok) {
+          ok = false;
+          continue;
+        }
+        loaded->index = std::move(target);
+        ib::warn() << "VECMETA: segment " << seg_id_num
+                   << " index+pkmap loaded in "
+                   << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - load_t0)
+                          .count()
+                   << " ms";
+
+        if (!map_path.empty()) {
           if (map_ok) {
             ib::warn() << "VECMETA: restored PK mapping from '" << map_path
                        << "' rows=" << loaded->vid_pk_mapping.size();
@@ -2036,7 +2180,8 @@ class VecMetaLoader {
     }
 
     if (guard.thd() != nullptr &&
-        !vec_recover_mutable_mem_index(index, ctx, guard.thd())) {
+        !vec_recover_mutable_mem_index(index, ctx, guard.thd(),
+                                       covered_seg_ids, manifest_lost_ids)) {
       ib::warn() << "VECMETA: MEM recovery failed for index "
                  << (index->name ? index->name : "(null)");
       ok = false;
@@ -2084,4 +2229,21 @@ void vec_schedule_bootstrap_load(dict_index_t *index) {
   }
   ctx->bootstrap_loaded.store(false, std::memory_order_release);
   VecMetaLoader::instance().schedule(index);
+}
+
+void vec_wait_table_builds_idle(dict_table_t *table) {
+  if (table == nullptr) {
+    return;
+  }
+  for (dict_index_t *index = table->first_index(); index != nullptr;
+       index = index->next()) {
+    vec_index_ctx_t *ctx = index->vec_runtime;
+    if (ctx == nullptr) {
+      continue;
+    }
+    while (ctx->is_rotation_pending.load(std::memory_order_acquire) ||
+           ctx->build_in_progress.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
 }

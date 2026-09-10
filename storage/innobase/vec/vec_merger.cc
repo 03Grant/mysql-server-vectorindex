@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,7 @@
 #include "dict0mem.h"
 #include "ha_innodb.h"
 #include "lob0lob.h"
+#include "lob0undo.h"
 #include "mtr0mtr.h"
 #include "mem0mem.h"
 #include "my_sys.h"
@@ -30,6 +32,7 @@
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 #include "sql/sql_thd_internal_api.h"
+#include "trx0rec.h"
 #include "trx0trx.h"
 #include "ut0ut.h"
 
@@ -135,9 +138,19 @@ inline bool vec_cache_read_u32(const unsigned char *&p, size_t &remain,
   return true;
 }
 
+// Upper bound on how far the version-chain walk descends before it gives up
+// and reports an error. Chains are bounded by the purge lag in practice; the
+// cap only protects the merge thread against a pathologically long chain.
+constexpr size_t kVecMergeMaxVersionSteps = 100000;
+
 class VecBaseRowReader {
  public:
-  enum class Status { kOk, kNotFound, kInvalidVec, kError };
+  // kKeep : the entry materializes a row version that some read view may still
+  //         resolve; out_vec holds that version's vector.
+  // kDrop : no read view can ever admit the entry, so merge may discard it.
+  // kError: the decision could not be made; the caller must abort the merge
+  //         rather than risk dropping a live entry.
+  enum class Status { kKeep, kDrop, kError };
 
   VecBaseRowReader(dict_index_t *clust_index,
                    ulint vec_field_no,
@@ -177,11 +190,31 @@ class VecBaseRowReader {
 
   bool ok() const { return ready_; }
 
-  Status read(const unsigned char *pk_entry,
-              size_t pk_len,
-              trx_id_t *out_trx_id,
-              std::vector<float> &out_vec) {
-    if (!ready_ || pk_entry == nullptr || pk_len == 0 || tuple_ == nullptr) {
+  // Decide whether the index entry <pk_entry, tid_ins> must be carried into the
+  // merged segment, and if so return the vector of the row version it
+  // materializes.
+  //
+  // Query-time validation admits an entry only when the entry's TID equals the
+  // creator TID of the version visible under the reader's snapshot and the two
+  // vectors agree. InnoDB decides visibility per transaction rather than per
+  // version, so among the versions of one primary key created by one
+  // transaction only the newest can ever be the visible version; every older
+  // one is invisible to every snapshot. Furthermore, a version that any active
+  // read view can still resolve is still reachable from the clustered index
+  // record through the undo chain, because purge removes nothing that the
+  // oldest active read view may still need.
+  //
+  // Walking the surviving chain newest-first and stopping at the first version
+  // created by tid_ins therefore either returns the exact version the entry has
+  // to materialize, or proves that no snapshot, present or future, can admit
+  // the entry. The walk consults no read view of its own: its horizon is the
+  // undo history that purge has chosen to retain.
+  Status resolve_live_version(const unsigned char *pk_entry,
+                              size_t pk_len,
+                              trx_id_t tid_ins,
+                              std::vector<float> &out_vec) {
+    if (!ready_ || pk_entry == nullptr || pk_len == 0 || tuple_ == nullptr ||
+        tid_ins == 0) {
       return Status::kError;
     }
 
@@ -195,36 +228,123 @@ class VecBaseRowReader {
     const bool found = row_search_on_row_ref(
         &pcur, BTR_SEARCH_LEAF, clust_index_->table, tuple_, &mtr);
     if (!found) {
+      // The clustered index record is gone, so the row was deleted and purge
+      // has already reclaimed every version of it: no snapshot can see it.
       pcur.close();
       mtr_commit(&mtr);
-      return Status::kNotFound;
+      return Status::kDrop;
     }
 
-    const rec_t *rec = pcur.get_rec();
-    if (rec == nullptr || !page_rec_is_user_rec(rec) ||
-        rec_get_deleted_flag(rec, dict_table_is_comp(clust_index_->table))) {
+    const rec_t *index_rec = pcur.get_rec();
+    if (index_rec == nullptr || !page_rec_is_user_rec(index_rec)) {
       pcur.close();
       mtr_commit(&mtr);
-      return Status::kNotFound;
+      return Status::kDrop;
     }
 
-    Rec_offsets offsets_holder;
-    const ulint *offsets = offsets_holder.compute(rec, clust_index_);
+    const bool comp = dict_table_is_comp(clust_index_->table);
+    mem_heap_t *offset_heap = nullptr;
+    mem_heap_t *vers_heap = nullptr;
+    lob::undo_vers_t lob_undo;
+    ulint *offsets = rec_get_offsets(index_rec, clust_index_, nullptr,
+                                     ULINT_UNDEFINED, UT_LOCATION_HERE,
+                                     &offset_heap);
 
-    if (out_trx_id != nullptr) {
-      *out_trx_id = row_get_rec_trx_id(rec, clust_index_, offsets);
+    const rec_t *version = index_rec;
+    Status status = Status::kDrop;
+
+    for (size_t step = 0;; ++step) {
+      if (step >= kVecMergeMaxVersionSteps) {
+        // Cannot prove the entry dead within the step budget: keep the merge
+        // from dropping something that may still be live.
+        status = Status::kError;
+        break;
+      }
+      const trx_id_t ver_trx = row_get_rec_trx_id(version, clust_index_,
+                                                  offsets);
+      if (ver_trx == tid_ins) {
+        // Newest version created by this transaction. If it removes the row,
+        // every snapshot that sees the transaction sees no row at all.
+        if (rec_get_deleted_flag(version, comp)) {
+          status = Status::kDrop;
+        } else {
+          status = extract_vector(version, offsets, &lob_undo, out_vec)
+                       ? Status::kKeep
+                       : Status::kDrop;
+        }
+        break;
+      }
+
+      mem_heap_t *prev_heap = vers_heap;
+      vers_heap = mem_heap_create(1024, UT_LOCATION_HERE);
+      // lob_undo is never reset inside the loop: it accumulates the undo
+      // records of the whole descent so that an off-page vector can be rolled
+      // back to the version we stop at.
+      rec_t *prev_version = nullptr;
+      const bool history_intact = trx_undo_prev_version_build(
+          index_rec, &mtr, version, clust_index_, offsets, vers_heap,
+          &prev_version, nullptr, nullptr, 0, &lob_undo);
+      if (prev_heap != nullptr) {
+        mem_heap_free(prev_heap);
+      }
+
+      if (prev_version == nullptr || !history_intact) {
+        // Either the chain ends here, or purge has already discarded the rest
+        // of the history. Purge only discards versions that no active read view
+        // can still resolve, so in both cases the entry is dead.
+        status = Status::kDrop;
+        break;
+      }
+
+      offsets = rec_get_offsets(prev_version, clust_index_, offsets,
+                                ULINT_UNDEFINED, UT_LOCATION_HERE,
+                                &offset_heap);
+      version = prev_version;
     }
 
+    if (vers_heap != nullptr) {
+      mem_heap_free(vers_heap);
+    }
+    if (offset_heap != nullptr) {
+      mem_heap_free(offset_heap);
+    }
+    pcur.close();
+    mtr_commit(&mtr);
+    return status;
+  }
+
+ private:
+  bool extract_vector(const rec_t *rec,
+                      const ulint *offsets,
+                      lob::undo_vers_t *lob_undo,
+                      std::vector<float> &out_vec) {
     const byte *data = nullptr;
     ulint len = 0;
     mem_heap_t *ext_heap = nullptr;
 
     if (rec_offs_nth_extern(clust_index_, offsets, vec_field_no_)) {
       ext_heap = mem_heap_create(1, UT_LOCATION_HERE);
+      size_t lob_version = 0;
       data = lob::btr_rec_copy_externally_stored_field(
           trx_, clust_index_, rec, offsets,
           dict_table_page_size(clust_index_->table), vec_field_no_, &len,
-          nullptr, dict_index_is_sdi(clust_index_), ext_heap);
+          &lob_version, dict_index_is_sdi(clust_index_), ext_heap);
+      // The off-page image belongs to the newest LOB version; replay the undo
+      // records collected while descending so it matches the version we are
+      // reading, exactly as the consistent-read path does.
+      if (data != nullptr && lob_undo != nullptr) {
+        ulint local_len = 0;
+        const byte *field_data = rec_get_nth_field_instant(
+            rec, offsets, vec_field_no_, clust_index_, &local_len);
+        if (field_data != nullptr && local_len >= BTR_EXTERN_FIELD_REF_SIZE) {
+          const byte *field_ref =
+              field_data + local_len - BTR_EXTERN_FIELD_REF_SIZE;
+          lob::ref_t ref(const_cast<byte *>(field_ref));
+          lob_undo->apply(clust_index_, vec_field_no_,
+                          const_cast<byte *>(data), len, lob_version,
+                          ref.page_no());
+        }
+      }
     } else {
       data = rec_get_nth_field_instant(rec, offsets, vec_field_no_,
                                        clust_index_, &len);
@@ -250,14 +370,9 @@ class VecBaseRowReader {
     if (ext_heap != nullptr) {
       mem_heap_free(ext_heap);
     }
-
-    pcur.close();
-    mtr_commit(&mtr);
-
-    return vec_ok ? Status::kOk : Status::kInvalidVec;
+    return vec_ok;
   }
 
- private:
   bool bind_tuple(const unsigned char *data, size_t len) {
     if (data == nullptr || tuple_ == nullptr) {
       return false;
@@ -681,7 +796,15 @@ void VecMergeManager::process_task(VecMergeTask task) {
   std::vector<float> xb;
   std::vector<int64_t> ids;
 
-  auto consume_mapping = [&](const vid_pk_mapping_t &mapping) {
+  // Entries surviving the merge, keyed by <primary key, insertion TID>. At most
+  // one version of a primary key created by a given transaction can ever be
+  // visible to a snapshot, so entries sharing a key are interchangeable and the
+  // duplicates a multi-statement transaction leaves behind collapse here.
+  std::unordered_set<std::string> retained;
+  size_t dropped = 0;
+  size_t collapsed = 0;
+
+  auto consume_mapping = [&](const vid_pk_mapping_t &mapping) -> bool {
     const size_t total = mapping.pk_values.size();
     for (size_t i = 0; i < total; ++i) {
       const auto &entry = mapping.pk_values[i];
@@ -693,16 +816,28 @@ void VecMergeManager::process_task(VecMergeTask task) {
       if (map_trx == 0) {
         continue;
       }
-      trx_id_t row_trx = 0;
+
+      std::string dedup_key(reinterpret_cast<const char *>(entry.data()),
+                            entry.size());
+      dedup_key.append(reinterpret_cast<const char *>(&map_trx),
+                       sizeof(map_trx));
+      if (retained.find(dedup_key) != retained.end()) {
+        ++collapsed;
+        continue;
+      }
+
       std::vector<float> vec_values;
-      const auto status =
-          row_reader.read(entry.data(), entry.size(), &row_trx, vec_values);
-      if (status != VecBaseRowReader::Status::kOk) {
+      const auto status = row_reader.resolve_live_version(
+          entry.data(), entry.size(), map_trx, vec_values);
+      if (status == VecBaseRowReader::Status::kError) {
+        // Never guess: abandon the merge rather than drop a live entry.
+        return false;
+      }
+      if (status == VecBaseRowReader::Status::kDrop) {
+        ++dropped;
         continue;
       }
-      if (row_trx != map_trx) {
-        continue;
-      }
+
       if (merged_mapping.key_length == 0) {
         merged_mapping.key_length = entry.size();
       }
@@ -711,11 +846,20 @@ void VecMergeManager::process_task(VecMergeTask task) {
       xb.insert(xb.end(), vec_values.begin(), vec_values.end());
       merged_mapping.pk_values.push_back(entry);
       merged_mapping.trx_ids.push_back(map_trx);
+      retained.insert(std::move(dedup_key));
     }
+    return true;
   };
 
-  consume_mapping(map1);
-  consume_mapping(map2);
+  if (!consume_mapping(map1) || !consume_mapping(map2)) {
+    ib::warn() << "VECMERGE: aborting merge, cannot resolve row versions segs="
+               << seg1_id << "," << seg2_id;
+    return;
+  }
+
+  ib::info() << "VECMERGE: segs=" << seg1_id << "," << seg2_id
+             << " retained=" << ids.size() << " reclaimed=" << dropped
+             << " collapsed=" << collapsed;
 
   std::unique_ptr<IVectorIndex> target;
   switch (ctx->params.backend) {

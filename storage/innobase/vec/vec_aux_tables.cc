@@ -1743,34 +1743,54 @@ bool vec_vid_pk_mapping_load(const std::string& path,
   mapping->pk_values.resize(static_cast<size_t>(entry_count));
   mapping->trx_ids.resize(static_cast<size_t>(entry_count), 0);
 
+  /* Bulk-read the payload and parse it in memory: the per-entry fread
+  variant issued three locked stdio calls per entry, which dominates load
+  time at 10M+ entries. */
+  const size_t payload_bytes =
+      (file_size > static_cast<off_t>(header_bytes))
+          ? static_cast<size_t>(file_size) - header_bytes
+          : 0;
+  std::vector<unsigned char> payload(payload_bytes);
+  size_t got = 0;
+  while (got < payload_bytes) {
+    const size_t n =
+        std::fread(payload.data() + got, 1, payload_bytes - got, fp.get());
+    if (n == 0) {
+      break;
+    }
+    got += n;
+  }
+  if (got != payload_bytes) {
+    mapping->clear();
+    return false;
+  }
+
+  size_t off = 0;
   for (size_t i = 0; i < mapping->pk_values.size(); ++i) {
     uint32_t len = 0;
-    if (std::fread(&len, sizeof(len), 1, fp.get()) != 1) {
+    if (off + sizeof(len) > payload_bytes) {
       mapping->clear();
       return false;
     }
-    if (len == 0) {
-      if (header.version >= 2) {
-        trx_id_t ignored = 0;
-        if (std::fread(&ignored, sizeof(ignored), 1, fp.get()) != 1) {
-          mapping->clear();
-          return false;
-        }
-        mapping->trx_ids[i] = ignored;
-      }
-      continue;
-    }
-    mapping->pk_values[i].resize(len);
-    if (std::fread(mapping->pk_values[i].data(), 1, len, fp.get()) != len) {
-      mapping->clear();
-      return false;
-    }
-    if (header.version >= 2) {
-      trx_id_t trx_id = 0;
-      if (std::fread(&trx_id, sizeof(trx_id), 1, fp.get()) != 1) {
+    std::memcpy(&len, payload.data() + off, sizeof(len));
+    off += sizeof(len);
+    if (len > 0) {
+      if (off + len > payload_bytes) {
         mapping->clear();
         return false;
       }
+      mapping->pk_values[i].assign(payload.data() + off,
+                                   payload.data() + off + len);
+      off += len;
+    }
+    if (header.version >= 2) {
+      trx_id_t trx_id = 0;
+      if (off + sizeof(trx_id) > payload_bytes) {
+        mapping->clear();
+        return false;
+      }
+      std::memcpy(&trx_id, payload.data() + off, sizeof(trx_id));
+      off += sizeof(trx_id);
       mapping->trx_ids[i] = trx_id;
     }
   }

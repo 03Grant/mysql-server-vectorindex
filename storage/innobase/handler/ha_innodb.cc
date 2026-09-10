@@ -66,8 +66,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <iomanip>
+#include <limits>
 #include <memory>
+#include <set>
 #include <shared_mutex>
 #include <string>
 
@@ -11638,29 +11641,64 @@ int ha_innobase::ha_vec_search(const uchar *query, uint32 dim, size_t k,
       result->push_back(std::move(hit));
     }
 
-    // Eagerly run MVCC validation so we know how many rows survive.
-    int pop_err = vec_populate_row_cache(*result);
+    // Eagerly run MVCC validation so we know how many rows survive. The
+    // validation pass also recomputes each survivor's distance against the
+    // vector of its snapshot-visible row version.
+    std::vector<float> recomputed_dist;
+    int pop_err = vec_populate_row_cache(*result, query_vec, &recomputed_dist);
     if (pop_err != 0) return pop_err;
 
-    size_t visible = 0;
-    for (const auto &row : m_vec_row_cache_rows) {
-      if (!row.empty()) ++visible;
+    // Rank survivors by the recomputed distance and collapse duplicate PKs:
+    // a transaction that inserts and then updates the same row leaves two
+    // entries with the same insertion TID, and both pass the TID equality
+    // check. Duplicates share the same visible row, hence the same recomputed
+    // distance, so keeping the first ranked occurrence is exact.
+    const bool rank_min = !(vec_params->metric_tag == VEC_M_IP ||
+                            vec_params->metric_tag == VEC_M_COSINE);
+    std::vector<size_t> ranked;
+    ranked.reserve(result->size());
+    for (size_t i = 0; i < result->size(); ++i) {
+      if (i < m_vec_row_cache_rows.size() &&
+          !m_vec_row_cache_rows[i].empty()) {
+        if (i < recomputed_dist.size() && !std::isnan(recomputed_dist[i])) {
+          (*result)[i].distance = recomputed_dist[i];
+        }
+        ranked.push_back(i);
+      }
     }
+    std::stable_sort(ranked.begin(), ranked.end(), [&](size_t a, size_t b) {
+      const float da = (*result)[a].distance;
+      const float db = (*result)[b].distance;
+      return rank_min ? da < db : da > db;
+    });
+    {
+      std::set<std::vector<uchar>> seen_pks;
+      std::vector<size_t> deduped;
+      deduped.reserve(ranked.size());
+      for (size_t idx : ranked) {
+        if (seen_pks.insert((*result)[idx].pk_entry).second) {
+          deduped.push_back(idx);
+        }
+      }
+      ranked = std::move(deduped);
+    }
+    const size_t visible = ranked.size();
 
     if (visible >= top_k || fetch_k >= kMaxFetchK || result->empty()) {
-      // Compact: keep only the top_k visible hits and their cache rows (no
-      // holes), so ha_vec_fetch_rows reuses this pre-populated cache without
-      // triggering a second round of row_search_for_mysql calls.
+      // Compact: keep only the top_k distinct visible hits, in ranked order,
+      // together with their cache rows (no holes), so ha_vec_fetch_rows
+      // reuses this pre-populated cache without triggering a second round of
+      // row_search_for_mysql calls.
+      const size_t keep = std::min(visible, top_k);
       std::vector<Vec_hit> final_hits;
       std::vector<std::vector<uchar>> compact_cache;
-      final_hits.reserve(std::min(visible, top_k));
-      compact_cache.reserve(std::min(visible, top_k));
+      final_hits.reserve(keep);
+      compact_cache.reserve(keep);
 
-      for (size_t i = 0; i < result->size() && final_hits.size() < top_k; ++i) {
-        if (i < m_vec_row_cache_rows.size() && !m_vec_row_cache_rows[i].empty()) {
-          compact_cache.push_back(std::move(m_vec_row_cache_rows[i]));
-          final_hits.push_back((*result)[i]);
-        }
+      for (size_t r = 0; r < keep; ++r) {
+        const size_t idx = ranked[r];
+        compact_cache.push_back(std::move(m_vec_row_cache_rows[idx]));
+        final_hits.push_back(std::move((*result)[idx]));
       }
       m_vec_row_cache_rows = std::move(compact_cache);
       // m_vec_row_cache_ready and m_vec_row_cache_reclength already set by
@@ -11748,7 +11786,29 @@ static inline bool vec_is_visible(trx_id_t vec_trx_id,
   return vec_trx_id == visible_trx_id;
 }
 
-int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
+/** Distance between the query vector and a row vector, using the same
+conventions as the segment backends (see MutableFlatIndex): squared L2 for
+VEC_M_L2 (smaller is better), inner product for VEC_M_IP / VEC_M_COSINE
+(larger is better; cosine relies on externally normalized vectors). */
+static float vec_row_distance(uint8_t metric_tag, uint32_t dim, const float *q,
+                              const float *v) {
+  float s = 0.0f;
+  if (metric_tag == VEC_M_IP || metric_tag == VEC_M_COSINE) {
+    for (uint32_t i = 0; i < dim; ++i) {
+      s += q[i] * v[i];
+    }
+    return s;
+  }
+  for (uint32_t i = 0; i < dim; ++i) {
+    const float d = q[i] - v[i];
+    s += d * d;
+  }
+  return s;
+}
+
+int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch,
+                                        const float *query,
+                                        std::vector<float> *recomputed_dist) {
   vec_clear_row_cache();
 
   const size_t reclength = (table != nullptr && table->s != nullptr)
@@ -11801,6 +11861,34 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
   THD *thd = ha_thd();
 
   m_vec_row_cache_rows.resize(batch.size());
+
+  /* Resolve the MySQL field of the indexed vector column so the distance can
+  be recomputed against the vector stored in the snapshot-visible row version
+  (not the possibly stale copy materialized in the index entry). */
+  Field *vec_mysql_field = nullptr;
+  const vec_params_t *vparams = vec_index->vec_params;
+  if (query != nullptr && recomputed_dist != nullptr && vparams != nullptr &&
+      vparams->dim > 0) {
+    const char *vec_col_name = vec_index->get_field(0)->name;
+    for (uint fi = 0; fi < table->s->fields; ++fi) {
+      if (my_strcasecmp(system_charset_info, table->field[fi]->field_name,
+                        vec_col_name) == 0) {
+        vec_mysql_field = table->field[fi];
+        break;
+      }
+    }
+    if (vec_mysql_field == nullptr) {
+      ib::warn() << "VECFETCH[c13] vector column '" << vec_col_name
+                 << "' not found in MySQL table definition; keeping index-side "
+                    "distances";
+    }
+  }
+  if (recomputed_dist != nullptr) {
+    recomputed_dist->assign(batch.size(),
+                            std::numeric_limits<float>::quiet_NaN());
+  }
+  std::vector<float> row_vec_buf;
+  String row_vec_str;
 
   auto restore_index_guard = create_scope_guard([&]() {
     m_prebuilt->index = vec_index;
@@ -11873,6 +11961,22 @@ int ha_innobase::vec_populate_row_cache(const std::vector<Vec_hit> &batch) {
                  << hit.segment << " faiss_id=" << hit.faiss_id
                  << " trx_id=" << t_r << " visible_trx_id=" << t_vis;
       continue;
+    }
+
+    /* The TID equality check alone cannot tell apart two entries created by
+    the same transaction for the same PK (insert followed by update): both
+    carry the same insertion TID. The refetched row is the authority, so the
+    ranking distance is recomputed here from the visible version's vector;
+    the caller collapses remaining duplicate PKs. */
+    if (vec_mysql_field != nullptr) {
+      String *val = vec_mysql_field->val_str(&row_vec_str);
+      const size_t expected = vparams->dim * sizeof(float);
+      if (val != nullptr && val->length() == expected) {
+        row_vec_buf.resize(vparams->dim);
+        std::memcpy(row_vec_buf.data(), val->ptr(), expected);
+        (*recomputed_dist)[i] = vec_row_distance(
+            vparams->metric_tag, vparams->dim, query, row_vec_buf.data());
+      }
     }
 
     auto &row = m_vec_row_cache_rows[i];

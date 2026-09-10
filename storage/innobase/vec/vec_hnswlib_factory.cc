@@ -9,12 +9,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <omp.h>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -48,6 +55,229 @@ std::unique_ptr<hnswlib::SpaceInterface<float>> make_space(const vec_params_t& p
     case VEC_M_L2:
     default:
       return std::make_unique<hnswlib::L2Space>(p.dim);
+  }
+}
+
+/* Fast deserializer for HierarchicalNSW, field-for-field equivalent to the
+stock loadIndex() (same file format, produced by the stock saveIndex(); the
+stock loader still reads these files). The stock implementation makes two
+extra passes over the link-list tail with per-element stream reads and seeks
+(each seek invalidating the ifstream buffer) and fills label_lookup_ without
+reserving it; at 10M+ elements that overhead dominates recovery time. Here
+the level0 block and the tail are read with one bulk read each and the tail
+is parsed in memory; the stock integrity pre-scan is subsumed by exact
+bounds checking during the parse. All HierarchicalNSW members are public, so
+this lives entirely in the integration layer: the vendored library is
+unmodified. Expects a default-constructed index (HierarchicalNSW(s)). */
+void vec_fast_hnsw_load(hnswlib::HierarchicalNSW<float>* idx,
+                        hnswlib::SpaceInterface<float>* s,
+                        const std::string& location) {
+  std::ifstream input(location, std::ios::binary);
+  if (!input.is_open())
+    throw std::runtime_error("Cannot open file");
+
+  idx->clear();
+  input.seekg(0, input.end);
+  const std::streampos total_filesize = input.tellg();
+  input.seekg(0, input.beg);
+
+  hnswlib::readBinaryPOD(input, idx->offsetLevel0_);
+  hnswlib::readBinaryPOD(input, idx->max_elements_);
+  hnswlib::readBinaryPOD(input, idx->cur_element_count);
+
+  const size_t cur_element_count = idx->cur_element_count;
+  size_t max_elements = 0;  // no caller-side cap, exactly as our old call site
+  if (max_elements < cur_element_count)
+    max_elements = idx->max_elements_;
+  idx->max_elements_ = max_elements;
+  hnswlib::readBinaryPOD(input, idx->size_data_per_element_);
+  hnswlib::readBinaryPOD(input, idx->label_offset_);
+  hnswlib::readBinaryPOD(input, idx->offsetData_);
+  hnswlib::readBinaryPOD(input, idx->maxlevel_);
+  hnswlib::readBinaryPOD(input, idx->enterpoint_node_);
+
+  hnswlib::readBinaryPOD(input, idx->maxM_);
+  hnswlib::readBinaryPOD(input, idx->maxM0_);
+  hnswlib::readBinaryPOD(input, idx->M_);
+  hnswlib::readBinaryPOD(input, idx->mult_);
+  hnswlib::readBinaryPOD(input, idx->ef_construction_);
+
+  idx->data_size_ = s->get_data_size();
+  idx->fstdistfunc_ = s->get_dist_func();
+  idx->dist_func_param_ = s->get_dist_func_param();
+
+  const auto pos = input.tellg();
+  const size_t level0_bytes =
+      cur_element_count * idx->size_data_per_element_;
+  if (static_cast<size_t>(total_filesize) <
+      static_cast<size_t>(pos) + level0_bytes)
+    throw std::runtime_error("Index seems to be corrupted or unsupported");
+  const size_t tail_bytes = static_cast<size_t>(total_filesize) -
+                            static_cast<size_t>(pos) - level0_bytes;
+  input.close();
+
+  idx->data_level0_memory_ =
+      (char*)malloc(max_elements * idx->size_data_per_element_);
+  if (idx->data_level0_memory_ == nullptr)
+    throw std::runtime_error(
+        "Not enough memory: loadIndex failed to allocate level0");
+
+  idx->size_links_per_element_ =
+      idx->maxM_ * sizeof(hnswlib::tableint) + sizeof(hnswlib::linklistsizeint);
+  idx->size_links_level0_ =
+      idx->maxM0_ * sizeof(hnswlib::tableint) + sizeof(hnswlib::linklistsizeint);
+  std::vector<std::mutex>(max_elements).swap(idx->link_list_locks_);
+  std::vector<std::mutex>(
+      hnswlib::HierarchicalNSW<float>::MAX_LABEL_OPERATION_LOCKS)
+      .swap(idx->label_op_locks_);
+
+  idx->visited_list_pool_.reset(new hnswlib::VisitedListPool(1, max_elements));
+
+  idx->linkLists_ = (char**)malloc(sizeof(void*) * max_elements);
+  if (idx->linkLists_ == nullptr)
+    throw std::runtime_error(
+        "Not enough memory: loadIndex failed to allocate linklists");
+  idx->element_levels_ = std::vector<int>(max_elements);
+  idx->revSize_ = 1.0 / idx->mult_;
+  idx->ef_ = 10;
+  idx->label_lookup_.reserve(cur_element_count);
+
+  /* The level0 block is the bulk of the file (data + level0 links + labels;
+  ~780 B per element). A single sequential read tops out well below the page
+  cache's aggregate bandwidth, so it is read as fixed chunks by a small
+  reader pool via pread. label_lookup_ construction only needs the labels of
+  chunks already in memory, so a builder thread consumes finished chunks
+  concurrently instead of making a separate pass afterwards. */
+  std::unique_ptr<char[]> tail(new char[tail_bytes]);
+  const int fd = ::open(location.c_str(), O_RDONLY);
+  if (fd < 0)
+    throw std::runtime_error("Cannot open file");
+
+  {
+    const size_t n_chunks = 32;
+    const size_t chunk_bytes =
+        ((level0_bytes + n_chunks - 1) / n_chunks + idx->size_data_per_element_ -
+         1) /
+        idx->size_data_per_element_ * idx->size_data_per_element_;
+    const unsigned n_readers =
+        std::min<unsigned>(8, std::max<unsigned>(
+                                  1, std::thread::hardware_concurrency() / 2));
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<bool> chunk_done(n_chunks, false);
+    std::atomic<size_t> next_chunk{0};
+    std::atomic<bool> read_failed{false};
+
+    auto reader_fn = [&]() {
+      for (;;) {
+        const size_t c = next_chunk.fetch_add(1);
+        if (c >= n_chunks || read_failed.load(std::memory_order_relaxed))
+          return;
+        const size_t begin = c * chunk_bytes;
+        if (begin >= level0_bytes) {
+          std::lock_guard<std::mutex> lk(mu);
+          chunk_done[c] = true;
+          cv.notify_all();
+          continue;
+        }
+        const size_t want = std::min(chunk_bytes, level0_bytes - begin);
+        size_t got = 0;
+        while (got < want) {
+          const ssize_t n = ::pread(
+              fd, idx->data_level0_memory_ + begin + got, want - got,
+              static_cast<off_t>(pos) + static_cast<off_t>(begin + got));
+          if (n <= 0) {
+            read_failed.store(true, std::memory_order_relaxed);
+            break;
+          }
+          got += static_cast<size_t>(n);
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        chunk_done[c] = true;
+        cv.notify_all();
+      }
+    };
+
+    /* Builder: insert labels of chunk c as soon as chunk c is resident. */
+    std::thread builder([&]() {
+      const size_t elems_per_chunk = chunk_bytes / idx->size_data_per_element_;
+      for (size_t c = 0; c < n_chunks; ++c) {
+        {
+          std::unique_lock<std::mutex> lk(mu);
+          cv.wait(lk, [&]() {
+            return chunk_done[c] || read_failed.load(std::memory_order_relaxed);
+          });
+        }
+        if (read_failed.load(std::memory_order_relaxed)) return;
+        const size_t first = c * elems_per_chunk;
+        const size_t last =
+            std::min(cur_element_count, first + elems_per_chunk);
+        for (size_t i = first; i < last; ++i) {
+          idx->label_lookup_[idx->getExternalLabel(i)] = i;
+        }
+      }
+    });
+
+    std::vector<std::thread> readers;
+    readers.reserve(n_readers);
+    for (unsigned r = 0; r < n_readers; ++r) readers.emplace_back(reader_fn);
+    for (auto& t : readers) t.join();
+    builder.join();
+
+    if (read_failed.load(std::memory_order_relaxed)) {
+      ::close(fd);
+      throw std::runtime_error("Index seems to be corrupted or unsupported");
+    }
+  }
+
+  /* Link-list tail: one bulk read, parsed in memory. */
+  {
+    size_t got = 0;
+    while (got < tail_bytes) {
+      const ssize_t n = ::pread(
+          fd, tail.get() + got, tail_bytes - got,
+          static_cast<off_t>(pos) + static_cast<off_t>(level0_bytes + got));
+      if (n <= 0) {
+        ::close(fd);
+        throw std::runtime_error("Index seems to be corrupted or unsupported");
+      }
+      got += static_cast<size_t>(n);
+    }
+  }
+  ::close(fd);
+
+  size_t tail_off = 0;
+  for (size_t i = 0; i < cur_element_count; i++) {
+    unsigned int linkListSize;
+    if (tail_off + sizeof(linkListSize) > tail_bytes)
+      throw std::runtime_error("Index seems to be corrupted or unsupported");
+    std::memcpy(&linkListSize, tail.get() + tail_off, sizeof(linkListSize));
+    tail_off += sizeof(linkListSize);
+    if (linkListSize == 0) {
+      idx->element_levels_[i] = 0;
+      idx->linkLists_[i] = nullptr;
+    } else {
+      if (tail_off + linkListSize > tail_bytes)
+        throw std::runtime_error("Index seems to be corrupted or unsupported");
+      idx->element_levels_[i] = linkListSize / idx->size_links_per_element_;
+      idx->linkLists_[i] = (char*)malloc(linkListSize);
+      if (idx->linkLists_[i] == nullptr)
+        throw std::runtime_error(
+            "Not enough memory: loadIndex failed to allocate linklist");
+      std::memcpy(idx->linkLists_[i], tail.get() + tail_off, linkListSize);
+      tail_off += linkListSize;
+    }
+  }
+  // the tail must be consumed exactly (stock check: tellg == total_filesize)
+  if (tail_off != tail_bytes)
+    throw std::runtime_error("Index seems to be corrupted or unsupported");
+
+  for (size_t i = 0; i < cur_element_count; i++) {
+    if (idx->isMarkedDeleted(i)) {
+      idx->num_deleted_ += 1;
+      if (idx->allow_replace_deleted_) idx->deleted_elements.insert(i);
+    }
   }
 }
 
@@ -235,7 +465,10 @@ class HnswlibVectorIndex : public IVectorIndex {
   void load(const std::string& path) override {
     // Recreate index over existing space.
     if (kind_ == IndexKind::Hnsw) {
-      hnsw_index_ = std::make_unique<hnswlib::HierarchicalNSW<float>>(space_.get(), path);
+      // Same file format as the stock loader; see vec_fast_hnsw_load.
+      auto idx = std::make_unique<hnswlib::HierarchicalNSW<float>>(space_.get());
+      vec_fast_hnsw_load(idx.get(), space_.get(), path);
+      hnsw_index_ = std::move(idx);
     } else {
       bf_index_ = std::make_unique<hnswlib::BruteforceSearch<float>>(space_.get(), path);
     }

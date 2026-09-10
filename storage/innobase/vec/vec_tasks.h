@@ -13,6 +13,7 @@
 #include "dict0types.h"
 
 struct dict_index_t;
+struct dict_table_t;
 struct trx_t;
 struct vec_index_ctx_t;
 struct vec_index_segment_t;
@@ -68,6 +69,13 @@ bool vec_load_aux_cache_for_segment(dict_index_t* vec_index,
 
 /* Schedule a background bootstrap load from vec metadata on startup. */
 void vec_schedule_bootstrap_load(dict_index_t* index);
+
+/* Block until no rotation/flush task is pending or running for any vector
+index of the given table. Called at the end of the DDL ingestion scan so the
+initial segment build reaches its Committed manifest state before the DDL
+statement returns: a crash after ADD VECINDEX completes can then never lose
+the base segment, and a crash before this point aborts the DDL entirely. */
+void vec_wait_table_builds_idle(dict_table_t* table);
 
 /* Install a native DiskANN immutable segment built directly from streamed DDL
    rows, then create a fresh empty mutable delta segment. */

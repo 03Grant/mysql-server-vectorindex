@@ -78,6 +78,11 @@ struct vec_index_segment_t {
   std::string         index_file_name;    // persisted filename (immutable segments)
   std::string         vecindex_id;        // segment id as string (max 256 bytes)
   bool                immutable{false};   // immutable segments are persisted to disk
+  // Birth segment ids whose entries were re-ingested into this (mutable)
+  // segment during crash recovery because their own flush never committed.
+  // Their manifest entries are retired (Tombstone) only once this segment's
+  // flush commits, i.e. once the adopted entries are durable again.
+  std::vector<uint64_t> adopted_seg_ids;
 };
 
 // Segments are reference-counted so an immutable version snapshot and the
@@ -150,7 +155,7 @@ struct vec_index_ctx_t {
 
 
 
-  bool                       build_in_progress{false};
+  std::atomic<bool>          build_in_progress{false};
   std::atomic<bool>          is_rotation_pending{false};
   std::atomic<bool>          needs_aux_refresh{false};  // request user THD to refresh aux cache
   std::atomic<VecBootstrapState> bootstrap_state{VecBootstrapState::NOT_STARTED};
